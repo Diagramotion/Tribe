@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tribe-runtime"
+version = "0.1.0"
+description = "Local-first event and agent runtime for Tribe"
+requires-python = ">=3.11"
+dependencies = ["keyring>=25.6", "tzdata>=2024.1; platform_system == 'Windows'"]
+
+[project.optional-dependencies]
+ai = [
+    "pydantic-ai-harness[skills]==0.61.0",
+    "pydantic-ai-slim[anthropic,cerebras,cohere,duckduckgo,google,groq,mcp,mistral,openai,openrouter,web-fetch,xai]==2.61.0",
+]
+desktop = ["pyinstaller>=6.10,<7"]
+
+[project.scripts]
+tribe-runtime = "tribe_runtime.server:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.setuptools.package-data]
+tribe_runtime = [
+    "builtin_skills/*/SKILL.md",
+    "builtin_skills/*/examples/*.html",
+]

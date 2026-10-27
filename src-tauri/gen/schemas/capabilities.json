@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Core window permissions for Tribe local desktop","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open",{"identifier":"shell:allow-spawn","allow":[{"name":"binaries/tribe-runtime","sidecar":true}]}]}}

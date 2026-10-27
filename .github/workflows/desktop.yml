@@ -1,0 +1,63 @@
+name: Desktop builds
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: all
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: npm ci
+      - run: python -m pip install uv
+      - run: uv sync --project runtime --extra ai --extra desktop
+      - name: Runtime invariants
+        run: uv run --project runtime python -m unittest discover -s runtime/tests
+      - name: Sites packaging checks
+        run: npm run test:sites
+      - name: UI projection tests
+        run: npm run test:ui
+      - run: npm run tauri -- build --bundles ${{ matrix.bundles }} --target ${{ matrix.target }}
+      - name: Verify desktop bundle and app lifecycle
+        run: python scripts/verify-desktop-bundles.py --target ${{ matrix.target }}
+      - name: Native shell tests (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          SWIFT_BIN="$(xcrun --find swift)"
+          SWIFT_TOOLCHAIN="${SWIFT_BIN%/usr/bin/swift}"
+          SWIFT_RUNTIME="$SWIFT_TOOLCHAIN/usr/lib/swift-5.5/macosx"
+          test -f "$SWIFT_RUNTIME/libswift_Concurrency.dylib"
+          DYLD_LIBRARY_PATH="$SWIFT_RUNTIME${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+      - name: Native shell tests (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+      - name: Packaged runtime smoke check
+        run: uv run --project runtime python scripts/smoke-runtime.py --target ${{ matrix.target }} --agent-dir agents
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tribe-${{ matrix.target }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/**
