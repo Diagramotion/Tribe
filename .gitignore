@@ -1,0 +1,13 @@
+node_modules/
+dist/
+__pycache__/
+*.py[cod]
+.venv/
+build/
+runtime/*.egg-info/
+src-tauri/target/
+src-tauri/binaries/tribe-runtime-*
+src-tauri/frameworks/
+.env
+.env.*
+!.env.example
