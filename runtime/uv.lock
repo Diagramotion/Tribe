@@ -3023,6 +3023,20 @@ wheels = [
 ]
 
 [[package]]
+name = "smriti-mcp"
+version = "0.1.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "mcp" },
+    { name = "pydantic" },
+    { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/30/d1/8c42a1ea4264a39379c9005056b2ec550bc0bce63a207e19c1f60947fb92/smriti_mcp-0.1.5.tar.gz", hash = "sha256:8410a6641bd318438d5d21b775aa9662343dd2bb7110786fb1e115dfd48eefcb", size = 37166, upload-time = "2026-10-21T07:58:43.096Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e9/6a/caea9777b6748b6389c087bbd025be48f2ede5eba297d805fe70bd2c720f/smriti_mcp-0.1.5-py3-none-any.whl", hash = "sha256:7159bdaf784e53854c08c2e7077a316b4dbd54faa25b3d39b0f8d30af7b51062", size = 29903, upload-time = "2026-10-21T07:58:41.35Z" },
+]
+
+[[package]]
 name = "sniffio"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3208,6 +3222,8 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "keyring" },
+    { name = "pyyaml" },
+    { name = "smriti-mcp" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
 
@@ -3226,6 +3242,8 @@ requires-dist = [
     { name = "pydantic-ai-harness", extras = ["skills"], marker = "extra == 'ai'", specifier = "==0.61.0" },
     { name = "pydantic-ai-slim", extras = ["anthropic", "cerebras", "cohere", "duckduckgo", "google", "groq", "mcp", "mistral", "openai", "openrouter", "web-fetch", "xai"], marker = "extra == 'ai'", specifier = "==2.61.0" },
     { name = "pyinstaller", marker = "extra == 'desktop'", specifier = ">=6.10,<7" },
+    { name = "pyyaml", specifier = ">=6,<7" },
+    { name = "smriti-mcp", specifier = ">=0.1.5,<0.2" },
     { name = "tzdata", marker = "sys_platform == 'win32'", specifier = ">=2024.1" },
 ]
 provides-extras = ["ai", "desktop"]

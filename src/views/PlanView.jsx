@@ -1,5 +1,5 @@
 import {
-  ArrowSquareOut, CaretRight, ListChecks,
+  ArrowSquareOut, CaretRight, ListChecks, PencilSimple, Plus,
 } from "@phosphor-icons/react";
 import { summariseTeamWork } from "../domain/plan.js";
 import { agentStatusLabel } from "../domain/labels.js";
@@ -23,7 +23,7 @@ export function PlanView({ workItems, agents, project, mission, agentConfigured,
           {hasDistinctMissionGoal && <details className="plan-mission-context"><summary><CaretRight size={13} />View original chat request</summary><p>{mission.goal}</p></details>}
         </div>
         <div className="plan-heading-actions">
-          <button className="button button--quiet" onClick={onEditProjectGoal} type="button">{hasProjectGoal ? "Edit goal" : "Set goal"}</button>
+          <button aria-label={hasProjectGoal ? "Edit project goal" : "Set project goal"} className="icon-button" onClick={() => onEditProjectGoal()} title={hasProjectGoal ? "Edit goal" : "Set goal"} type="button">{hasProjectGoal ? <PencilSimple size={15} /> : <Plus size={15} />}</button>
           <span className="plan-updated"><ListChecks size={15} /> Agents maintain this plan</span>
         </div>
       </div>

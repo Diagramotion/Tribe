@@ -29,9 +29,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .canvas import comment_publications, document_publications, validate_content, visible_message
 from .credentials import provider_for_model
+from .tool_activity import node_test_run_evidence
 
-SCHEMA_VERSION = 29
-DEFAULT_AGENT_RUN_TOKEN_LIMIT = 128_000
+SCHEMA_VERSION = 35
+MAX_AGENT_RETRY_WINDOW_SECONDS = 24 * 60 * 60
+DEFAULT_AGENT_RUN_TOKEN_LIMIT: int | None = None
 TERMINAL_AGENT_RUN_STATUSES = {"completed", "failed", "interrupted"}
 
 # Store input validation remains ValueError-based so HTTP routes return 422 responses.
@@ -540,10 +542,30 @@ class MissionStore:
                     input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
                     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
                     cache_write_tokens INTEGER NOT NULL DEFAULT 0, cost_usd TEXT,
+                    retry_at TEXT,
+                    retry_from_trigger INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(agent_id, mission_id, trigger_sequence)
                 );
+                CREATE TABLE IF NOT EXISTS agent_request_usage (
+                    request_key TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL, mission_id TEXT NOT NULL,
+                    trigger_sequence INTEGER NOT NULL, model TEXT,
+                    context_message_count INTEGER,
+                    compaction_receipt_count INTEGER NOT NULL DEFAULT 0,
+                    pruned_result_count INTEGER NOT NULL DEFAULT 0,
+                    pruned_token_estimate INTEGER NOT NULL DEFAULT 0,
+                    context_pruning_enabled INTEGER NOT NULL DEFAULT 0,
+                    tool_calls INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost_usd TEXT, created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS agent_request_usage_run
+                    ON agent_request_usage(agent_id, mission_id, trigger_sequence, created_at);
                 CREATE TABLE IF NOT EXISTS isolated_workspaces (
                     mission_id TEXT NOT NULL, agent_id TEXT NOT NULL, repository TEXT NOT NULL,
                     path TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -603,7 +625,7 @@ class MissionStore:
                     mission_id TEXT NOT NULL REFERENCES missions(id), title TEXT NOT NULL,
                     content TEXT NOT NULL, proposed_by TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
                     source_event_sequence INTEGER, created_at TEXT NOT NULL,
-                    reviewed_by TEXT, reviewed_at TEXT
+                    reviewed_by TEXT, reviewed_at TEXT, memory_id TEXT
                 );
                 CREATE INDEX IF NOT EXISTS knowledge_proposals_project
                     ON knowledge_proposals(project_id,status,created_at DESC);
@@ -670,6 +692,9 @@ class MissionStore:
                     ON scheduled_runs(schedule_id, started_at DESC, id DESC);
                 """)
                 mission_columns = {row[1] for row in db.execute("PRAGMA table_info(missions)")}
+                proposal_columns = {row[1] for row in db.execute("PRAGMA table_info(knowledge_proposals)")}
+                if "memory_id" not in proposal_columns:
+                    db.execute("ALTER TABLE knowledge_proposals ADD COLUMN memory_id TEXT")
                 if "background" not in mission_columns:
                     db.execute("ALTER TABLE missions ADD COLUMN background INTEGER NOT NULL DEFAULT 0")
                 if "archived_at" not in mission_columns:
@@ -695,6 +720,9 @@ class MissionStore:
                     ("cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
                     ("cache_write_tokens", "INTEGER NOT NULL DEFAULT 0"),
                     ("cost_usd", "TEXT"),
+                    ("retry_at", "TEXT"),
+                    ("retry_deadline_at", "TEXT"),
+                    ("retry_from_trigger", "INTEGER NOT NULL DEFAULT 0"),
                 ):
                     if column not in run_columns:
                         db.execute(f"ALTER TABLE agent_event_runs ADD COLUMN {column} {definition}")
@@ -733,6 +761,35 @@ class MissionStore:
                     db.execute("ALTER TABLE project_usage_budgets ADD COLUMN max_run_cost_usd TEXT")
                 if "max_run_tokens" not in usage_budget_columns:
                     db.execute("ALTER TABLE project_usage_budgets ADD COLUMN max_run_tokens INTEGER")
+                db.execute("""CREATE TABLE IF NOT EXISTS agent_request_usage (
+                    request_key TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL, mission_id TEXT NOT NULL,
+                    trigger_sequence INTEGER NOT NULL, model TEXT,
+                    context_message_count INTEGER,
+                    compaction_receipt_count INTEGER NOT NULL DEFAULT 0,
+                    pruned_result_count INTEGER NOT NULL DEFAULT 0,
+                    pruned_token_estimate INTEGER NOT NULL DEFAULT 0,
+                    context_pruning_enabled INTEGER NOT NULL DEFAULT 0,
+                    tool_calls INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost_usd TEXT, created_at TEXT NOT NULL
+                )""")
+                db.execute("""CREATE INDEX IF NOT EXISTS agent_request_usage_run
+                    ON agent_request_usage(agent_id, mission_id, trigger_sequence, created_at)""")
+                request_usage_columns = {row[1] for row in db.execute("PRAGMA table_info(agent_request_usage)")}
+                if "compaction_receipt_count" not in request_usage_columns:
+                    db.execute(
+                        "ALTER TABLE agent_request_usage ADD COLUMN compaction_receipt_count INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "pruned_result_count" not in request_usage_columns:
+                    db.execute("ALTER TABLE agent_request_usage ADD COLUMN pruned_result_count INTEGER NOT NULL DEFAULT 0")
+                if "pruned_token_estimate" not in request_usage_columns:
+                    db.execute("ALTER TABLE agent_request_usage ADD COLUMN pruned_token_estimate INTEGER NOT NULL DEFAULT 0")
+                if "context_pruning_enabled" not in request_usage_columns:
+                    db.execute("ALTER TABLE agent_request_usage ADD COLUMN context_pruning_enabled INTEGER NOT NULL DEFAULT 0")
                 deletion_columns = {
                     row[1] for row in db.execute("PRAGMA table_info(repository_file_deletions)")
                 }
@@ -848,7 +905,7 @@ class MissionStore:
             mission = next((item for item in missions if item["id"] == mission_id), None) if mission_id else None
             if select_default_mission:
                 mission = mission or next((item for item in missions if not item.get("archived_at") and item["status"] == "active" and not item.get("background")), None) or next((item for item in missions if not item.get("archived_at") and item["status"] == "active"), None) or next((item for item in missions if not item.get("archived_at")), None)
-            if mission and json.loads(mission.get("recipe_snapshot") or "{}").get("id") == "goal-driven-sdlc":
+            if mission and mission.get("recipe_id"):
                 mission["workflow_context"] = self._workflow_context(db, mission["id"])
             cursor = db.execute("SELECT COALESCE(MAX(sequence), 0) FROM events WHERE mission_id = ?", (mission["id"],)).fetchone()[0] if mission else 0
             events, has_more_events = self._events_before(db, mission["id"], cursor + 1, 200) if mission else ([], False)
@@ -1270,7 +1327,7 @@ class MissionStore:
                 "SELECT 1 FROM interactions WHERE mission_id=? AND status='pending' LIMIT 1", (mission_id,)
             ).fetchone()
             running_agent = db.execute(
-                "SELECT 1 FROM agent_event_runs WHERE mission_id=? AND status='running' LIMIT 1", (mission_id,)
+                "SELECT 1 FROM agent_event_runs WHERE mission_id=? AND status IN ('running','cancelling','retrying') LIMIT 1", (mission_id,)
             ).fetchone()
             running_command = db.execute(
                 "SELECT 1 FROM background_runs WHERE mission_id=? AND status='running' LIMIT 1", (mission_id,)
@@ -1318,7 +1375,7 @@ class MissionStore:
                 "SELECT 1 FROM interactions WHERE mission_id=? AND status='pending' LIMIT 1", (mission_id,)
             ).fetchone()
             running_agent = db.execute(
-                "SELECT 1 FROM agent_event_runs WHERE mission_id=? AND status IN ('running','cancelling') LIMIT 1",
+                "SELECT 1 FROM agent_event_runs WHERE mission_id=? AND status IN ('running','cancelling','retrying') LIMIT 1",
                 (mission_id,),
             ).fetchone()
             running_command = db.execute(
@@ -1461,7 +1518,7 @@ class MissionStore:
                 placeholders = ",".join("?" for _ in mission_ids)
                 unfinished = any(db.execute(query, tuple(mission_ids)).fetchone() for query in (
                     f"SELECT 1 FROM interactions WHERE mission_id IN ({placeholders}) AND status='pending' LIMIT 1",
-                    f"SELECT 1 FROM agent_event_runs WHERE mission_id IN ({placeholders}) AND status IN ('running','cancelling') LIMIT 1",
+                    f"SELECT 1 FROM agent_event_runs WHERE mission_id IN ({placeholders}) AND status IN ('running','cancelling','retrying') LIMIT 1",
                     f"SELECT 1 FROM background_runs WHERE mission_id IN ({placeholders}) AND status='running' LIMIT 1",
                     f"SELECT 1 FROM scheduled_runs WHERE mission_id IN ({placeholders}) AND status IN ('running','paused','blocked') LIMIT 1",
                     f"SELECT 1 FROM isolated_workspaces WHERE mission_id IN ({placeholders}) LIMIT 1",
@@ -1810,12 +1867,10 @@ class MissionStore:
             return [row[0] for row in db.execute("SELECT mission_id FROM scheduled_runs WHERE status='running'")]
 
     def record_review_checkpoint(self, mission_id: str, reviewer_id: str, disposition: str,
-                                 summary: str, verification_event_id: str,
+                                 summary: str, verification_event_id: str | None = None,
                                  findings: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         summary = summary.strip() if isinstance(summary, str) else ""
         findings = findings or []
-        if reviewer_id != "reviewer":
-            raise PermissionError("only the independent reviewer may record a review checkpoint")
         if not isinstance(disposition, str) or disposition not in {"approved", "changes_requested"}:
             raise ValueError("review_disposition_must_be_approved_or_changes_requested")
         if not summary or len(summary) > 2000:
@@ -1850,64 +1905,35 @@ class MissionStore:
             if mission["status"] != "active":
                 db.rollback()
                 raise ValueError("mission_must_be_active_to_record_review")
-            workflow = json.loads(mission["recipe_snapshot"] or "{}")
-            if workflow.get("id") != "goal-driven-sdlc":
-                db.rollback()
-                raise ValueError("review_checkpoints_are_only_available_for_goal_driven_sdlc")
-            if not self._current_plan_checkpoint(db, mission_id):
-                db.rollback()
-                raise ValueError("goal_driven_sdlc_requires_a_finalized_plan_before_review")
             latest_change = db.execute(
                 "SELECT id,sequence FROM events WHERE mission_id=? "
                 "AND event_type IN ('repo.file.changed','repo.worktree.integrated') "
                 "ORDER BY sequence DESC LIMIT 1", (mission_id,),
             ).fetchone()
-            latest_test = db.execute(
+            test_query = (
                 "SELECT id,sequence,json_extract(payload,'$.exitCode') AS exit_code "
                 "FROM events WHERE mission_id=? AND event_type='repo.test_run.completed' "
-                "ORDER BY sequence DESC LIMIT 1", (mission_id,),
-            ).fetchone()
-            if not latest_test or latest_test["exit_code"] != 0:
+                "AND json_extract(payload,'$.exitCode')=0 "
+            )
+            test_params: tuple[Any, ...] = (mission_id,)
+            if verification_event_id is not None:
+                test_query += "AND id=? "
+                test_params += (verification_event_id,)
+            else:
+                test_query += "ORDER BY sequence DESC LIMIT 1"
+            latest_test = db.execute(test_query, test_params).fetchone()
+            if verification_event_id is not None and not latest_test:
                 db.rollback()
-                raise ValueError("review_requires_latest_test_run_to_pass")
-            if latest_test["id"] != verification_event_id:
-                db.rollback()
-                raise ValueError("review_must_reference_the_latest_successful_test_run")
-            if latest_change and latest_test["sequence"] <= latest_change["sequence"]:
-                db.rollback()
-                raise ValueError("review_verification_must_follow_latest_change")
-            unfinished_work = db.execute(
-                "SELECT COUNT(*) FROM work_items WHERE mission_id=? AND status!='done'",
-                (mission_id,),
-            ).fetchone()[0]
-            if unfinished_work:
-                db.rollback()
-                raise ValueError("goal_driven_sdlc_review_requires_all_plan_work_items_done")
+                raise ValueError("review_verification_must_reference_a_successful_test_run")
             event = self._append(db, "review.checkpoint.recorded", reviewer_id, mission_id, {
                 "disposition": disposition,
                 "summary": summary,
                 "changeEventId": latest_change["id"] if latest_change else None,
-                "verificationEventId": latest_test["id"],
+                "verificationEventId": latest_test["id"] if latest_test else None,
                 "findings": normalised_findings,
             })
-            work_items = []
-            if disposition == "changes_requested":
-                for finding in normalised_findings:
-                    item = {
-                        "id": str(uuid.uuid4()), "mission_id": mission_id,
-                        "title": f"Address review finding in {finding['file']}"[:500],
-                        "detail": f"{finding['severity'].upper()} · {finding['file']}\n{finding['issue']}",
-                        "status": "ready", "owner": None, "lease_until": None,
-                        "created_at": now(), "updated_at": now(),
-                    }
-                    db.execute("INSERT INTO work_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", tuple(item.values()))
-                    item = self._work_item(
-                        db, db.execute("SELECT * FROM work_items WHERE id=?", (item["id"],)).fetchone()
-                    )
-                    work_items.append(item)
-                    self._append(db, "plan.item.created", reviewer_id, mission_id, {"workItem": item})
             db.commit()
-            return {"event": event, "workItems": work_items}
+            return {"event": event, "workItems": []}
 
     def complete_mission(self, mission_id: str, reviewer_id: str, summary: str,
                          acceptance_evidence: list[str] | None = None,
@@ -1917,24 +1943,28 @@ class MissionStore:
         legacy_evidence = [item.strip() for item in (acceptance_evidence or [])
                            if isinstance(item, str) and item.strip()]
         if not summary or len(summary) > 5000:
-            raise ValueError("completion_requires_a_summary_and_1_to_20_acceptance_evidence_items")
+            raise ValueError("completion_requires_a_summary_of_at_most_5000_characters")
         if acceptance_checks is None:
             legacy_refs = [item.strip() for item in (evidence_refs or [])
                            if isinstance(item, str) and item.strip()]
-            checks = [{"criterion": criterion, "evidence_refs": legacy_refs}
-                      for criterion in legacy_evidence]
+            checks = ([{"criterion": criterion, "evidence_refs": legacy_refs}
+                       for criterion in legacy_evidence]
+                      if legacy_evidence else ([{"criterion": "Supporting evidence", "evidence_refs": legacy_refs}]
+                                               if legacy_refs else []))
         else:
             checks = acceptance_checks
-        if not 1 <= len(checks) <= 20:
-            raise ValueError("completion_requires_1_to_20_acceptance_checks")
+        if len(checks) > 20:
+            raise ValueError("completion_supports_at_most_20_acceptance_checks")
         normalised_checks: list[dict[str, Any]] = []
         for check in checks:
             if not isinstance(check, dict):
                 raise ValueError("acceptance_checks_must_map_each_criterion_to_evidence")  # noqa: TRY004
             criterion = check.get("criterion")
-            refs = check.get("evidence_refs")
+            refs = check.get("evidence_refs", [])
             if not isinstance(criterion, str) or not criterion.strip() or len(criterion.strip()) > 2000:
                 raise ValueError("each_acceptance_check_needs_a_concise_criterion")
+            if refs is None:
+                refs = []
             if not isinstance(refs, list):
                 raise ValueError("each_acceptance_check_needs_evidence_references")  # noqa: TRY004
             references_for_check = list(dict.fromkeys(
@@ -1949,11 +1979,6 @@ class MissionStore:
         evidence = [item["criterion"] for item in normalised_checks]
         if any(len(item) > 2000 for item in evidence):
             raise ValueError("acceptance_evidence_items_must_be_at_most_2000_characters")
-        references = list(dict.fromkeys(
-            reference for check in normalised_checks for reference in check["evidence_refs"]
-        ))
-        if len(references) > 20:
-            raise ValueError("completion_supports_at_most_20_unique_evidence_references")
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             mission = db.execute("SELECT * FROM missions WHERE id = ?", (mission_id,)).fetchone()
@@ -1963,20 +1988,6 @@ class MissionStore:
             if mission["status"] != "active":
                 db.rollback()
                 raise ValueError("mission_must_be_active_to_complete")
-            tasks = db.execute(
-                "SELECT COUNT(*) AS total, SUM(CASE WHEN status != 'done' THEN 1 ELSE 0 END) AS unfinished "
-                "FROM work_items WHERE mission_id = ?", (mission_id,),
-            ).fetchone()
-            if not tasks["total"] or tasks["unfinished"]:
-                db.rollback()
-                raise ValueError("all_mission_work_items_must_be_done_before_completion")
-            review = db.execute(
-                "SELECT 1 FROM work_items WHERE mission_id = ? AND owner = ? AND status = 'done' LIMIT 1",
-                (mission_id, reviewer_id),
-            ).fetchone()
-            if not review:
-                db.rollback()
-                raise ValueError("independent_reviewer_must_complete_a_work_item_before_mission_completion")
             pending = db.execute(
                 "SELECT 1 FROM interactions WHERE mission_id = ? AND status = 'pending' LIMIT 1",
                 (mission_id,),
@@ -1984,9 +1995,21 @@ class MissionStore:
             if pending:
                 db.rollback()
                 raise ValueError("resolve_pending_user_requests_before_mission_completion")
-            if any(not check["evidence_refs"] for check in normalised_checks):
+            active_work = db.execute(
+                """SELECT id, title, owner FROM work_items
+                   WHERE mission_id = ? AND status = 'claimed' AND lease_until >= ?
+                   ORDER BY created_at LIMIT 1""",
+                (mission_id, now()),
+            ).fetchone()
+            if active_work:
                 db.rollback()
-                raise ValueError("each_acceptance_check_needs_1_to_10_valid_evidence_references")
+                raise ValueError("mission_has_work_in_progress")
+            references = list(dict.fromkeys(
+                reference for check in normalised_checks for reference in check["evidence_refs"]
+            ))
+            if len(references) > 20:
+                db.rollback()
+                raise ValueError("completion_supports_at_most_20_unique_evidence_references")
             verified = []
             verified_by_id: dict[str, dict[str, Any]] = {}
             for reference in references:
@@ -2027,75 +2050,6 @@ class MissionStore:
                 "criterion": check["criterion"],
                 "evidence": [verified_by_id[reference] for reference in check["evidence_refs"]],
             } for check in normalised_checks]
-            workflow = json.loads(mission["recipe_snapshot"] or "{}")
-            if workflow.get("id") == "goal-driven-sdlc":
-                plan_checkpoint = self._current_plan_checkpoint(db, mission_id)
-                if not plan_checkpoint:
-                    db.rollback()
-                    raise ValueError("goal_driven_sdlc_requires_a_finalized_plan")
-                finalized_plan = json.loads(plan_checkpoint["payload"])
-                plan_criteria = finalized_plan.get("acceptanceCriteria", [])
-                finalized_criteria = [
-                    item["criterion"] if isinstance(item, dict) else item
-                    for item in plan_criteria
-                ]
-                submitted_criteria = [check["criterion"] for check in normalised_checks]
-                if submitted_criteria != finalized_criteria:
-                    db.rollback()
-                    raise ValueError("completion_checks_must_match_the_finalized_plan_criteria")
-                task_mapping = {
-                    item["criterion"]: item.get("workItems", [])
-                    for item in plan_criteria if isinstance(item, dict)
-                }
-                for check in mapped_checks:
-                    if check["criterion"] in task_mapping:
-                        check["planItems"] = task_mapping[check["criterion"]]
-                latest_change = db.execute(
-                    "SELECT id,sequence FROM events WHERE mission_id = ? "
-                    "AND event_type IN ('repo.file.changed', 'repo.worktree.integrated') "
-                    "ORDER BY sequence DESC LIMIT 1",
-                    (mission_id,),
-                ).fetchone()
-                latest_test = db.execute(
-                    "SELECT id,sequence,json_extract(payload,'$.exitCode') AS exit_code "
-                    "FROM events WHERE mission_id=? AND event_type='repo.test_run.completed' "
-                    "ORDER BY sequence DESC LIMIT 1", (mission_id,),
-                ).fetchone()
-                if not latest_test or latest_test["exit_code"] != 0:
-                    db.rollback()
-                    raise ValueError("goal_driven_sdlc_requires_latest_test_run_to_pass")
-                if latest_change is not None:
-                    test_evidence = [item for item in verified if item["type"] == "test_run"]
-                    if not test_evidence or latest_test["id"] not in {item["id"] for item in test_evidence}:
-                        db.rollback()
-                        raise ValueError("goal_driven_sdlc_requires_latest_successful_test_run_after_latest_change")
-                    if latest_test["sequence"] <= latest_change["sequence"]:
-                        db.rollback()
-                        raise ValueError("goal_driven_sdlc_verification_must_follow_latest_change")
-                elif not any(item["id"] == latest_test["id"] for item in verified):
-                    db.rollback()
-                    raise ValueError("goal_driven_sdlc_completion_must_cite_latest_successful_test_run")
-                checkpoint = db.execute(
-                    "SELECT sequence FROM events WHERE mission_id=? AND event_type='review.checkpoint.recorded' "
-                    "AND json_extract(payload,'$.disposition')='approved' "
-                    "AND json_extract(payload,'$.verificationEventId')=? "
-                    "AND json_extract(payload,'$.changeEventId') IS ? "
-                    "ORDER BY sequence DESC LIMIT 1",
-                    (mission_id, latest_test["id"], latest_change["id"] if latest_change else None),
-                ).fetchone()
-                if not checkpoint or checkpoint["sequence"] <= latest_test["sequence"]:
-                    db.rollback()
-                    raise ValueError("goal_driven_sdlc_requires_approved_review_checkpoint_for_latest_verification")
-                reviewer_completion = db.execute(
-                    "SELECT MAX(e.sequence) FROM events e "
-                    "JOIN work_items w ON w.id = json_extract(e.payload, '$.workItem.id') "
-                    "WHERE e.mission_id = ? AND e.event_type = 'plan.item.completed' "
-                    "AND w.owner = ? AND w.status = 'done'",
-                    (mission_id, reviewer_id),
-                ).fetchone()[0]
-                if reviewer_completion is None or reviewer_completion <= latest_test["sequence"]:
-                    db.rollback()
-                    raise ValueError("goal_driven_sdlc_independent_review_must_follow_latest_verification")
             db.execute("UPDATE missions SET status = 'completed' WHERE id = ?", (mission_id,))
             event = self._append(db, "mission.completed", reviewer_id, mission_id, {
                 "summary": summary, "acceptanceEvidence": evidence,
@@ -2170,9 +2124,181 @@ class MissionStore:
             if not row:
                 return None
             mission = dict(row)
-            if json.loads(mission.get("recipe_snapshot") or "{}").get("id") == "goal-driven-sdlc":
+            if mission.get("recipe_id"):
                 mission["workflow_context"] = self._workflow_context(db, mission_id)
             return mission
+
+    def select_mission_workflow(self, mission_id: str, actor_id: str,
+                                workflow: dict[str, Any]) -> dict[str, Any]:
+        """Attach one workflow to an Auto chat without overriding an existing choice."""
+        workflow_id = str(workflow.get("id", "")).strip()
+        version = workflow.get("version")
+        if (not workflow_id or not isinstance(version, int) or isinstance(version, bool)
+                or version < 1 or not (str(workflow.get("instructions", "")).strip()
+                    or any(isinstance(stage, dict) and str(stage.get("guide", "")).strip()
+                           for stage in workflow.get("stages", [])))):
+            raise ValueError("workflow_snapshot_invalid")
+        snapshot = json.dumps(workflow, ensure_ascii=False)
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            mission = db.execute(
+                "SELECT status,recipe_id,recipe_version,recipe_snapshot FROM missions WHERE id=?",
+                (mission_id,),
+            ).fetchone()
+            if not mission:
+                db.rollback()
+                raise ValueError("mission_not_found")
+            if mission["status"] != "active":
+                db.rollback()
+                raise ValueError("workflow_selection_requires_active_chat")
+            if mission["recipe_id"]:
+                existing = json.loads(mission["recipe_snapshot"] or "{}")
+                db.rollback()
+                if mission["recipe_id"] == workflow_id:
+                    return {"ok": True, "selected": False, "workflow": existing}
+                return {
+                    "ok": False, "error": "a_workflow_is_already_selected_for_this_chat",
+                    "workflow": existing,
+                }
+            db.execute(
+                "UPDATE missions SET recipe_id=?,recipe_version=?,recipe_snapshot=? WHERE id=?",
+                (workflow_id, version, snapshot, mission_id),
+            )
+            event = self._append(db, "mission.workflow.selected", actor_id, mission_id, {
+                "workflow": workflow, "selectedBy": "agent",
+            })
+            db.commit()
+            return {"ok": True, "selected": True, "workflow": workflow, "event": event}
+
+    def mission_workflow_state(self, mission_id: str) -> dict[str, Any]:
+        with self._connect() as db:
+            mission = db.execute(
+                "SELECT recipe_snapshot FROM missions WHERE id=?", (mission_id,),
+            ).fetchone()
+            if not mission:
+                raise ValueError("mission_not_found")
+            try:
+                workflow = json.loads(mission["recipe_snapshot"] or "null")
+            except (TypeError, ValueError):
+                workflow = None
+            if not isinstance(workflow, dict):
+                return {"workflow": None, "revision": 0, "state": {}}
+            row = db.execute(
+                "SELECT payload FROM events WHERE mission_id=? AND event_type='workflow.state.updated' "
+                "ORDER BY sequence DESC LIMIT 1", (mission_id,),
+            ).fetchone()
+            if row:
+                payload = json.loads(row["payload"])
+                return {"workflow": workflow, "revision": payload["revision"],
+                        "state": payload["state"]}
+            legacy = db.execute(
+                "SELECT payload FROM events WHERE mission_id=? AND event_type='workflow.stage.changed' "
+                "ORDER BY sequence DESC LIMIT 1", (mission_id,),
+            ).fetchone()
+            state = {}
+            if legacy:
+                old = json.loads(legacy["payload"])
+                state["stage_id"] = old.get("stageId")
+            return {"workflow": workflow, "revision": 0, "state": state}
+
+    def update_mission_workflow_state(self, mission_id: str, actor_id: str,
+                                      state: dict[str, Any], expected_revision: int) -> dict[str, Any]:
+        if not isinstance(expected_revision, int) or isinstance(expected_revision, bool) or expected_revision < 0:
+            raise ValueError("workflow_state_revision_invalid")
+        if not isinstance(state, dict) or set(state) - {"stage_id", "values"}:
+            raise ValueError("workflow_state_shape_invalid")
+        stage_id = state.get("stage_id")
+        values = state.get("values", {})
+        if stage_id is not None and (not isinstance(stage_id, str) or len(stage_id) > 64):
+            raise ValueError("workflow_state_stage_invalid")
+        if not isinstance(values, dict):
+            raise ValueError("workflow_state_values_must_be_an_object")
+        try:
+            encoded_state = json.dumps({"stage_id": stage_id, "values": values}, ensure_ascii=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError("workflow_state_must_be_json_serializable") from error
+        if len(encoded_state.encode("utf-8")) > 16_000:
+            raise ValueError("workflow_state_too_large")
+        timestamp = now()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT status,recipe_snapshot FROM missions WHERE id=?", (mission_id,),
+            ).fetchone()
+            if not row:
+                db.rollback()
+                raise ValueError("mission_not_found")
+            if row["status"] != "active":
+                db.rollback()
+                raise ValueError("workflow_state_requires_active_chat")
+            try:
+                workflow = json.loads(row["recipe_snapshot"] or "null")
+            except (TypeError, ValueError):
+                workflow = None
+            if not isinstance(workflow, dict):
+                db.rollback()
+                raise ValueError("workflow_not_activated")
+            if stage_id is not None and not any(
+                isinstance(stage, dict) and stage.get("id") == stage_id
+                for stage in workflow.get("stages", [])
+            ):
+                db.rollback()
+                raise ValueError("workflow_stage_not_found")
+            previous = db.execute(
+                "SELECT payload FROM events WHERE mission_id=? AND event_type='workflow.state.updated' "
+                "ORDER BY sequence DESC LIMIT 1", (mission_id,),
+            ).fetchone()
+            current_revision = json.loads(previous["payload"])["revision"] if previous else 0
+            if current_revision != expected_revision:
+                db.rollback()
+                return {"ok": False, "error": "workflow_state_revision_conflict",
+                        "revision": current_revision}
+            revision = current_revision + 1
+            normalized_state = {"stage_id": stage_id, "values": values}
+            event = self._append(db, "workflow.state.updated", actor_id, mission_id, {
+                "revision": revision, "state": normalized_state, "updatedAt": timestamp,
+            })
+            db.commit()
+            return {"ok": True, "workflow": workflow, "revision": revision,
+                    "state": normalized_state, "event": event}
+
+    def set_mission_workflow_stage(self, mission_id: str, actor_id: str,
+                                   stage_id: str, reason: str = "") -> dict[str, Any]:
+        """Persist the active stage only when it belongs to this chat's workflow snapshot."""
+        stage_id = stage_id.strip() if isinstance(stage_id, str) else ""
+        reason = reason.strip() if isinstance(reason, str) else ""
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT status,recipe_snapshot FROM missions WHERE id=?", (mission_id,),
+            ).fetchone()
+            if not row:
+                db.rollback()
+                raise ValueError("mission_not_found")
+            if row["status"] != "active":
+                db.rollback()
+                raise ValueError("workflow_stage_requires_active_chat")
+            try:
+                workflow = json.loads(row["recipe_snapshot"] or "{}")
+            except (TypeError, ValueError):
+                workflow = {}
+            stage = next((item for item in workflow.get("stages", [])
+                          if isinstance(item, dict) and item.get("id") == stage_id), None)
+            if not stage:
+                db.rollback()
+                raise ValueError("workflow_stage_not_in_selected_workflow")
+            prior = db.execute(
+                "SELECT payload FROM events WHERE mission_id=? AND event_type='workflow.stage.changed' "
+                "ORDER BY sequence DESC LIMIT 1", (mission_id,),
+            ).fetchone()
+            if prior and json.loads(prior["payload"]).get("stageId") == stage_id:
+                db.rollback()
+                return {"ok": True, "changed": False, "stage": stage}
+            event = self._append(db, "workflow.stage.changed", actor_id, mission_id, {
+                "stageId": stage_id, "title": stage["title"], "reason": reason[:500],
+            })
+            db.commit()
+            return {"ok": True, "changed": True, "stage": stage, "event": event}
 
     def set_mission_model_preferences(
         self, mission_id: str, model: str | None, effort: str | None,
@@ -2216,7 +2342,14 @@ class MissionStore:
         with self._connect() as db:
             if not db.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone():
                 raise ValueError("project_not_found")
-            filters = ["m.project_id = ?"]
+            # Command output belongs to Runs and working-tree changes belong to Git Changes.
+            # Keep these operational records out of the user-facing artifact library.
+            filters = [
+                "m.project_id = ?",
+                "a.name NOT LIKE 'test-results-%'",
+                "a.name NOT LIKE 'run_command-output-%'",
+                "(a.name NOT LIKE '%.diff' OR a.name LIKE '%.deletion.diff')",
+            ]
             parameters: list[Any] = [project_id]
             if query:
                 filters.append("instr(lower(a.name || ' ' || a.media_type || ' ' || a.created_by || ' ' || m.title), lower(?)) > 0")
@@ -2225,8 +2358,8 @@ class MissionStore:
                 filters.append("(a.created_at < ? OR (a.created_at = ? AND a.id < ?))")
                 parameters.extend((before, before, before_id))
             where = " AND ".join(filters)
-            total_filters = filters[:1 + bool(query)]
-            total_parameters = parameters[:len(total_filters)]
+            total_filters = filters[:4 + bool(query)]
+            total_parameters = parameters[:1 + bool(query)]
             total = db.execute(
                 "SELECT COUNT(*) FROM artifacts a JOIN missions m ON m.id = a.mission_id "
                 f"WHERE {' AND '.join(total_filters)}", total_parameters,
@@ -2416,7 +2549,7 @@ class MissionStore:
             blockers = []
             if db.execute("SELECT 1 FROM missions WHERE status='active' AND archived_at IS NULL LIMIT 1").fetchone():
                 blockers.append("active_missions")
-            if db.execute("SELECT 1 FROM agent_event_runs WHERE status IN ('running','cancelling') LIMIT 1").fetchone():
+            if db.execute("SELECT 1 FROM agent_event_runs WHERE status IN ('running','cancelling','retrying') LIMIT 1").fetchone():
                 blockers.append("running_agents")
             if db.execute("SELECT 1 FROM background_runs WHERE status='running' LIMIT 1").fetchone():
                 blockers.append("running_commands")
@@ -2773,31 +2906,30 @@ class MissionStore:
                 raise ValueError("knowledge_proposal_missing_or_already_reviewed")
             timestamp = now()
             status = "accepted" if decision == "accept" else "dismissed"
-            db.execute(
-                "UPDATE knowledge_proposals SET status=?,reviewed_by=?,reviewed_at=? WHERE id=?",
-                (status, actor_id, timestamp, proposal_id),
-            )
-            entry = None
+            existing = None
             if decision == "accept":
                 existing = db.execute(
                     "SELECT id,created_at FROM project_knowledge WHERE project_id=? AND title=?",
                     (row["project_id"], row["title"]),
                 ).fetchone()
-                entry_id = existing["id"] if existing else str(uuid.uuid4())
+            memory_id = (existing["id"] if existing else row["id"]) if decision == "accept" else None
+            db.execute(
+                "UPDATE knowledge_proposals SET status=?,reviewed_by=?,reviewed_at=?,memory_id=? WHERE id=?",
+                (status, actor_id, timestamp, memory_id, proposal_id),
+            )
+            entry = None
+            if decision == "accept":
+                entry_id = memory_id
                 created_at = existing["created_at"] if existing and existing["created_at"] else timestamp
-                db.execute(
-                    """INSERT INTO project_knowledge(
-                           id,project_id,title,content,created_by,updated_at,source_mission_id,
-                           source_event_sequence,created_at,updated_by,status
-                       ) VALUES (?,?,?,?,?,?,?,?,?,?, 'active')
-                       ON CONFLICT(project_id,title) DO UPDATE SET content=excluded.content,
-                           updated_at=excluded.updated_at,source_mission_id=excluded.source_mission_id,
-                           source_event_sequence=excluded.source_event_sequence,
-                           updated_by=excluded.updated_by,status='active'""",
-                    (entry_id, row["project_id"], row["title"], row["content"], row["proposed_by"],
-                     timestamp, row["mission_id"], row["source_event_sequence"], created_at, actor_id),
-                )
-                entry = dict(db.execute("SELECT * FROM project_knowledge WHERE id=?", (entry_id,)).fetchone())
+                entry = {
+                    "id": entry_id, "project_id": row["project_id"],
+                    "title": row["title"], "content": row["content"],
+                    "created_by": row["proposed_by"], "updated_by": actor_id,
+                    "created_at": created_at, "updated_at": timestamp,
+                    "source_mission_id": row["mission_id"],
+                    "source_event_sequence": row["source_event_sequence"],
+                    "status": "active",
+                }
             proposal = dict(db.execute(
                 """SELECT p.*,m.title AS source_mission_title FROM knowledge_proposals p
                    JOIN missions m ON m.id=p.mission_id WHERE p.id=?""", (proposal_id,),
@@ -2865,6 +2997,51 @@ class MissionStore:
             ).fetchone()
             return dict(row) if row else None
 
+    def agent_request_usage_for_run(
+        self, agent_id: str, mission_id: str, trigger_sequence: int,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            return [dict(row) for row in db.execute(
+                """SELECT * FROM agent_request_usage
+                   WHERE agent_id=? AND mission_id=? AND trigger_sequence=?
+                   ORDER BY created_at,request_key""",
+                (agent_id, mission_id, trigger_sequence),
+            )]
+
+    def agent_request_usage_for_mission(self, mission_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Return request-level diagnostics for a mission without exposing message contents."""
+        safe_limit = max(1, min(500, int(limit)))
+        with self._connect() as db:
+            return [dict(row) for row in db.execute(
+                """SELECT request_key,agent_id,trigger_sequence,model,context_message_count,compaction_receipt_count,
+                          pruned_result_count,pruned_token_estimate,context_pruning_enabled,
+                          tool_calls,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,
+                          cost_usd,created_at
+                   FROM (SELECT * FROM agent_request_usage WHERE mission_id=?
+                         ORDER BY created_at DESC,agent_id DESC,trigger_sequence DESC,request_key DESC LIMIT ?)
+                   ORDER BY created_at,agent_id,trigger_sequence,request_key""",
+                (mission_id, safe_limit),
+            )]
+
+    def context_pruning_summary(self) -> dict[str, dict[str, int]]:
+        """Compare provider-reported usage for requests with the experiment on and off."""
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT context_pruning_enabled,COUNT(*) requests,
+                          SUM(input_tokens) input_tokens,SUM(output_tokens) output_tokens,
+                          SUM(pruned_result_count) pruned_results,
+                          SUM(pruned_token_estimate) estimated_tokens_removed
+                   FROM agent_request_usage GROUP BY context_pruning_enabled"""
+            ).fetchall()
+        return {
+            "enabled" if row["context_pruning_enabled"] else "disabled": {
+                key: int(row[key] or 0) for key in (
+                    "requests", "input_tokens", "output_tokens", "pruned_results", "estimated_tokens_removed",
+                )
+            }
+            for row in rows
+        }
+
     @classmethod
     def _interrupt_agent_run(cls, db: sqlite3.Connection, row: sqlite3.Row,
                              reason: str, timestamp: str) -> bool:
@@ -2896,9 +3073,11 @@ class MissionStore:
                 started_calls[tool_call_id] = payload
             else:
                 completed_calls.add(tool_call_id)
+        unsettled_tool_effect = False
         for tool_call_id, payload in started_calls.items():
             if tool_call_id in completed_calls:
                 continue
+            unsettled_tool_effect = True
             cls._append(db, "agent.tool.interrupted", agent_id, mission_id, {
                 "toolName": payload.get("toolName", ""),
                 "toolCallId": tool_call_id,
@@ -2911,13 +3090,14 @@ class MissionStore:
         cls._append(db, "agent.run.interrupted", agent_id, mission_id, {
             "triggerSequence": trigger, "workItemId": row["work_item_id"], "error": reason,
             "cancelledByUser": row["status"] == "cancelling",
+            "failureKind": "unknown_side_effect" if unsettled_tool_effect else "unknown",
         })
         cls._append(db, "agent.activity", agent_id, mission_id, {
             "status": "Needs attention", "triggerSequence": trigger,
             "detail": "Run interrupted; check for partial repository or tool changes before continuing.",
         })
         db.execute(
-            """UPDATE agent_event_runs SET status='interrupted',error=?,updated_at=?
+            """UPDATE agent_event_runs SET status='interrupted',error=?,retry_at=NULL,updated_at=?
                WHERE agent_id=? AND mission_id=? AND trigger_sequence=?""",
             (reason, timestamp, agent_id, mission_id, trigger),
         )
@@ -2965,10 +3145,10 @@ class MissionStore:
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT status FROM agent_event_runs WHERE agent_id=? AND mission_id=? AND trigger_sequence=?",
+                "SELECT * FROM agent_event_runs WHERE agent_id=? AND mission_id=? AND trigger_sequence=?",
                 (agent_id, mission_id, trigger_sequence),
             ).fetchone()
-            if not row or row["status"] != "running":
+            if not row or row["status"] not in {"running", "retrying"}:
                 db.rollback()
                 return False
             db.execute(
@@ -2982,26 +3162,290 @@ class MissionStore:
                 "status": "Stopping", "triggerSequence": trigger_sequence,
                 "detail": "Finishing cancellation and checking for partial side effects.",
             })
+            if row["status"] == "retrying":
+                updated = db.execute(
+                    "SELECT * FROM agent_event_runs WHERE agent_id=? AND mission_id=? AND trigger_sequence=?",
+                    (agent_id, mission_id, trigger_sequence),
+                ).fetchone()
+                self._interrupt_agent_run(
+                    db, updated,
+                    "This run was stopped by you before its scheduled retry.", timestamp,
+                )
             db.commit()
             return True
 
-    def recover_interrupted_agent_runs(self) -> int:
-        """Fail closed on abandoned runs, except approvals with a resumable frontier."""
+    def stoppable_agent_event_run(self, agent_id: str, mission_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT * FROM agent_event_runs WHERE agent_id=? AND mission_id=?
+                   AND status IN ('running','retrying') ORDER BY updated_at DESC LIMIT 1""",
+                (agent_id, mission_id),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def agent_runs_requiring_recovery(self) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM agent_event_runs WHERE status IN ('running','cancelling') ORDER BY created_at"
+            )]
+
+    def reconcile_completed_repository_writes(
+        self, agent_id: str, mission_id: str, trigger_sequence: int, started_at: str,
+    ) -> int:
+        """Settle writes whose durable intent matches the repository's current state."""
+        try:
+            repository = self.project_repository(mission_id)
+        except (OSError, ValueError):
+            return 0
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                """SELECT event_type,payload FROM events WHERE mission_id=? AND actor_id=?
+                   AND created_at>=? AND event_type IN
+                   ('agent.tool.started','agent.tool.completed','agent.tool.interrupted',
+                    'repo.file.write.started','repo.file.changed') ORDER BY sequence""",
+                (mission_id, agent_id, started_at),
+            ).fetchall()
+            writes_started: set[str] = set()
+            writes_completed: set[str] = set()
+            write_intents: dict[str, dict[str, Any]] = {}
+            started_calls: dict[str, dict[str, Any]] = {}
+            settled_calls: set[str] = set()
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                event_trigger = payload.get("triggerSequence")
+                if event_trigger is not None and event_trigger != trigger_sequence:
+                    continue
+                call_id = payload.get("toolCallId")
+                if not isinstance(call_id, str) or not call_id:
+                    continue
+                if row["event_type"] == "repo.file.write.started":
+                    writes_started.add(call_id)
+                    write_intents[call_id] = payload
+                elif row["event_type"] == "repo.file.changed":
+                    writes_completed.add(call_id)
+                elif row["event_type"] == "agent.tool.started":
+                    started_calls[call_id] = payload
+                else:
+                    settled_calls.add(call_id)
+            timestamp = now()
+            for call_id in writes_started - writes_completed:
+                intent = write_intents[call_id]
+                relative = intent.get("path")
+                expected_hash = intent.get("expectedSha256") or intent.get("sha256")
+                if not isinstance(relative, str) or not relative:
+                    continue
+                try:
+                    target = (repository / relative).resolve()
+                    if target == repository or not target.is_relative_to(repository):
+                        continue
+                    operation = intent.get("operation")
+                    if operation == "create_directory" and target.is_dir():
+                        kind = "directory"
+                        actual_hash = None
+                    else:
+                        if (not isinstance(expected_hash, str) or len(expected_hash) != 64
+                                or not target.is_file()
+                                or target.stat().st_size > 1_000_000
+                                or _sha256_file(target) != expected_hash):
+                            continue
+                        kind = None
+                        actual_hash = expected_hash
+                except OSError:
+                    continue
+                self._append(db, "repo.file.changed", agent_id, mission_id, {
+                    "path": relative,
+                    "change": intent.get("change") or "updated",
+                    "kind": kind,
+                    "sha256": actual_hash,
+                    "toolCallId": call_id,
+                    "triggerSequence": trigger_sequence,
+                    "workItemId": intent.get("workItemId"),
+                    "source": "reconciled_after_interruption",
+                })
+                writes_completed.add(call_id)
+            reconcilable = (writes_started & writes_completed & set(started_calls)) - settled_calls
+            for call_id in reconcilable:
+                payload = started_calls[call_id]
+                self._append(db, "agent.tool.completed", agent_id, mission_id, {
+                    "toolName": payload.get("toolName", ""), "toolCallId": call_id,
+                    "triggerSequence": trigger_sequence, "outcome": "reconciled",
+                    "summary": payload.get("summary", ""),
+                    "activityLabels": payload.get("activityLabels"),
+                    "workItemId": payload.get("workItemId"),
+                    "reconciledAt": timestamp,
+                })
+            db.commit()
+            return len(reconcilable)
+
+    def agent_run_has_unresolved_tool_calls(self, agent_id: str, mission_id: str,
+                                            trigger_sequence: int, started_at: str) -> bool:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT event_type,payload FROM events WHERE mission_id=? AND actor_id=?
+                   AND created_at>=? AND event_type IN
+                   ('agent.tool.started','agent.tool.completed','agent.tool.interrupted')
+                   ORDER BY sequence""",
+                (mission_id, agent_id, started_at),
+            ).fetchall()
+        started: set[str] = set()
+        settled: set[str] = set()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            event_trigger = payload.get("triggerSequence")
+            if event_trigger is not None and event_trigger != trigger_sequence:
+                continue
+            call_id = payload.get("toolCallId")
+            if not isinstance(call_id, str) or not call_id:
+                if row["event_type"] == "agent.tool.started":
+                    return True
+                continue
+            if row["event_type"] == "agent.tool.started":
+                started.add(call_id)
+            else:
+                settled.add(call_id)
+        return bool(started - settled)
+
+    def agent_run_has_tool_activity(self, agent_id: str, mission_id: str,
+                                    trigger_sequence: int, started_at: str) -> bool:
+        """Return whether replaying this run from its trigger could repeat a tool effect."""
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT payload FROM events WHERE mission_id=? AND actor_id=?
+                   AND created_at>=? AND event_type IN
+                   ('agent.tool.started','agent.tool.completed','agent.tool.interrupted')
+                   ORDER BY sequence""",
+                (mission_id, agent_id, started_at),
+            ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                return True
+            # Legacy rows without a trigger are ambiguous. Fail closed rather than
+            # replaying a possibly side-effecting call from an older run.
+            event_trigger = payload.get("triggerSequence")
+            if event_trigger is None or event_trigger == trigger_sequence:
+                return True
+        return False
+
+    def recover_interrupted_agent_runs(
+        self, resumable_runs: set[tuple[str, str, int]] | None = None,
+        replayable_runs: set[tuple[str, str, int]] | None = None,
+    ) -> int:
+        """Resume safe checkpoints or restart runs that stopped before any tool call."""
         timestamp = now()
         recovered = 0
+        resumable_runs = resumable_runs or set()
+        replayable_runs = replayable_runs or set()
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
                 "SELECT * FROM agent_event_runs WHERE status IN ('running','cancelling') ORDER BY created_at"
             ).fetchall()
             for row in rows:
-                pending_approval = db.execute(
-                    """SELECT 1 FROM deferred_tool_approvals d
+                deferred = db.execute(
+                    """SELECT d.interaction_id,d.status,i.status AS interaction_status
+                       FROM deferred_tool_approvals d JOIN interactions i ON i.id=d.interaction_id
                        WHERE d.agent_id=? AND d.mission_id=? AND d.trigger_sequence=?
-                         AND d.status IN ('pending','consumed') LIMIT 1""",
+                         AND d.status IN ('pending','consumed') ORDER BY d.created_at LIMIT 1""",
                     (row["agent_id"], row["mission_id"], row["trigger_sequence"]),
                 ).fetchone()
-                if pending_approval:
+                if deferred and deferred["status"] == "consumed":
+                    db.execute(
+                        "UPDATE deferred_tool_approvals SET status='unknown_after_crash',updated_at=? WHERE interaction_id=?",
+                        (timestamp, deferred["interaction_id"]),
+                    )
+                    reason = (
+                        "The approved action was interrupted after its one-time approval was consumed. "
+                        "Its outcome is unknown, so Tribe stopped automatic replay."
+                    )
+                    recovered += int(self._interrupt_agent_run(db, row, reason, timestamp))
+                    continue
+                if deferred:
+                    # The original trigger must not be claimed as a fresh run while
+                    # its deferred approval frontier is waiting. Leave the consumer
+                    # positioned at that event so the resolution event can resume it.
+                    self._save_agent_offset(
+                        db, row["agent_id"], row["mission_id"], row["trigger_sequence"], timestamp,
+                    )
+                    continue
+                recovery_key = (row["agent_id"], row["mission_id"], row["trigger_sequence"])
+                resumed_checkpoint = row["status"] == "running" and recovery_key in resumable_runs
+                replayed_from_trigger = row["status"] == "running" and recovery_key in replayable_runs
+                if resumed_checkpoint or replayed_from_trigger:
+                    # A model request may have reached the provider before the
+                    # process died. Keep its reservation as unknown rather than
+                    # releasing budget and allowing an unaccounted replay.
+                    db.execute(
+                        """UPDATE usage_reservations SET status='unknown',updated_at=?
+                           WHERE agent_id=? AND mission_id=? AND trigger_sequence=? AND status='reserved'""",
+                        (timestamp, *recovery_key),
+                    )
+                    try:
+                        deadline = datetime.fromisoformat(row["created_at"]) + timedelta(
+                            seconds=MAX_AGENT_RETRY_WINDOW_SECONDS,
+                        )
+                    except (TypeError, ValueError):
+                        deadline = datetime.now(UTC)
+                    if deadline <= datetime.now(UTC):
+                        reason = "The automatic recovery window expired. Send a new message to continue."
+                        db.execute(
+                            """UPDATE agent_event_runs SET status='failed',error=?,retry_at=NULL,
+                               retry_deadline_at=?,updated_at=? WHERE agent_id=? AND mission_id=?
+                               AND trigger_sequence=?""",
+                            (reason, deadline.isoformat(), timestamp, *recovery_key),
+                        )
+                        self._append(db, "agent.run.failed", row["agent_id"], row["mission_id"], {
+                            "triggerSequence": row["trigger_sequence"], "attempts": row["attempts"],
+                            "error": reason,
+                        })
+                        self._append(db, "agent.activity", row["agent_id"], row["mission_id"], {
+                            "status": "Needs attention", "triggerSequence": row["trigger_sequence"],
+                            "detail": "The automatic recovery window expired.",
+                        })
+                        self._save_agent_offset(
+                            db, row["agent_id"], row["mission_id"], row["trigger_sequence"], timestamp,
+                        )
+                        recovered += 1
+                        continue
+                    db.execute(
+                        """UPDATE agent_event_runs SET status='retrying',retry_at=?,
+                           retry_deadline_at=?,error=?,updated_at=? WHERE agent_id=? AND mission_id=?
+                           AND trigger_sequence=? AND status='running'""",
+                        (timestamp, deadline.isoformat(),
+                         ("Resuming from a complete saved checkpoint after runtime restart."
+                          if resumed_checkpoint else
+                          "Restarting the original request because no tool call had started before the runtime stopped."), timestamp,
+                         *recovery_key),
+                    )
+                    self._rewind_agent_offset(
+                        db, row["agent_id"], row["mission_id"], row["trigger_sequence"] - 1, timestamp,
+                    )
+                    if replayed_from_trigger:
+                        db.execute(
+                            """UPDATE agent_event_runs SET retry_from_trigger=1 WHERE agent_id=?
+                               AND mission_id=? AND trigger_sequence=?""",
+                            recovery_key,
+                        )
+                    self._append(db, "agent.run.retrying", row["agent_id"], row["mission_id"], {
+                        "triggerSequence": row["trigger_sequence"], "attempt": row["attempts"] + 1,
+                        "maxAttempts": 24, "retryDelaySeconds": 0,
+                        "retryAt": timestamp, "recoveredCheckpoint": resumed_checkpoint,
+                        "replayedFromTrigger": replayed_from_trigger,
+                    })
+                    self._append(db, "agent.activity", row["agent_id"], row["mission_id"], {
+                        "status": "Retry scheduled", "triggerSequence": row["trigger_sequence"],
+                        "detail": ("Resuming from saved progress." if resumed_checkpoint else
+                                   "Restarting this turn. The runtime stopped before any tool call began."),
+                    })
+                    recovered += 1
                     continue
                 reason = (
                     "The runtime stopped before this agent run committed. Its tool side effects may have an "
@@ -3021,8 +3465,76 @@ class MissionStore:
                 (agent_id, mission_id, trigger_sequence),
             ).fetchone()
             if row:
-                db.commit()
                 result = dict(row)
+                retry_at = result.get("retry_at")
+                retry_deadline_at = result.get("retry_deadline_at")
+                if result["status"] == "retrying":
+                    if not isinstance(retry_deadline_at, str):
+                        try:
+                            started_at = datetime.fromisoformat(result["created_at"])
+                            retry_deadline_at = (
+                                started_at + timedelta(seconds=MAX_AGENT_RETRY_WINDOW_SECONDS)
+                            ).isoformat()
+                        except (TypeError, ValueError):
+                            retry_deadline_at = datetime.now(UTC).isoformat()
+                        db.execute(
+                            """UPDATE agent_event_runs SET retry_deadline_at=? WHERE agent_id=?
+                               AND mission_id=? AND trigger_sequence=? AND status='retrying'""",
+                            (retry_deadline_at, agent_id, mission_id, trigger_sequence),
+                        )
+                    try:
+                        expired = datetime.fromisoformat(retry_deadline_at) <= datetime.now(UTC)
+                    except (TypeError, ValueError):
+                        expired = True
+                    if expired:
+                        error = "The automatic provider retry window expired. Send a new message to continue."
+                        db.execute(
+                            """UPDATE agent_event_runs SET status='failed',error=?,retry_at=NULL,
+                               updated_at=? WHERE agent_id=? AND mission_id=? AND trigger_sequence=?
+                               AND status='retrying'""",
+                            (error, timestamp, agent_id, mission_id, trigger_sequence),
+                        )
+                        self._append(db, "agent.run.failed", agent_id, mission_id, {
+                            "triggerSequence": trigger_sequence, "attempts": result["attempts"],
+                            "error": error,
+                        })
+                        self._append(db, "agent.activity", agent_id, mission_id, {
+                            "status": "Needs attention", "triggerSequence": trigger_sequence,
+                            "detail": "The automatic retry window expired.",
+                        })
+                        self._save_agent_offset(db, agent_id, mission_id, trigger_sequence, timestamp)
+                        result = dict(db.execute(
+                            "SELECT * FROM agent_event_runs WHERE agent_id=? AND mission_id=? AND trigger_sequence=?",
+                            (agent_id, mission_id, trigger_sequence),
+                        ).fetchone())
+                        db.commit()
+                        result["claimed"] = False
+                        return result
+                due = False
+                if result["status"] == "retrying" and isinstance(retry_at, str):
+                    try:
+                        due = datetime.fromisoformat(retry_at) <= datetime.now(UTC)
+                    except (TypeError, ValueError):
+                        due = True
+                if due:
+                    replay_from_trigger = bool(result.get("retry_from_trigger"))
+                    db.execute(
+                        """UPDATE agent_event_runs SET status='running',attempts=attempts+1,
+                           retry_from_trigger=0,
+                           retry_at=NULL,updated_at=? WHERE agent_id=? AND mission_id=?
+                           AND trigger_sequence=? AND status='retrying'""",
+                        (timestamp, agent_id, mission_id, trigger_sequence),
+                    )
+                    result = dict(db.execute(
+                        "SELECT * FROM agent_event_runs WHERE agent_id=? AND mission_id=? AND trigger_sequence=?",
+                        (agent_id, mission_id, trigger_sequence),
+                    ).fetchone())
+                    db.commit()
+                    result["claimed"] = True
+                    result["resume_checkpoint"] = not replay_from_trigger
+                    result["replay_from_trigger"] = replay_from_trigger
+                    return result
+                db.commit()
                 result["claimed"] = False
                 return result
             db.execute(
@@ -3039,6 +3551,84 @@ class MissionStore:
             db.commit()
             updated["claimed"] = True
             return updated
+
+    def schedule_agent_event_retry(self, agent_id: str, mission_id: str, trigger_sequence: int,
+                                   attempts: int, max_attempts: int, error: str,
+                                   delay_seconds: float, usage_model: str | None = None,
+                                   usage: dict[str, int | str | None] | None = None,
+                                   failure_kind: str = "transient_provider") -> str | None:
+        """Persist a bounded provider retry for a run with no published side effects."""
+        timestamp = now()
+        retry_at = (datetime.now(UTC) + timedelta(seconds=max(0.0, delay_seconds))).isoformat()
+        safe_error = error[:2000]
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM agent_event_runs WHERE agent_id=? AND mission_id=? AND trigger_sequence=?",
+                (agent_id, mission_id, trigger_sequence),
+            ).fetchone()
+            if not row:
+                db.rollback()
+                raise ValueError("agent_event_run_not_found")
+            if row["status"] == "cancelling":
+                self._interrupt_agent_run(
+                    db, row,
+                    "This run was stopped by you. Its in-flight side effects may have an unknown outcome. "
+                    "Inspect the repository and tool history before asking the agent to continue.",
+                    timestamp,
+                )
+                db.commit()
+                return None
+            if row["status"] != "running":
+                db.commit()
+                return None
+            deadline = row["retry_deadline_at"]
+            if deadline is None:
+                try:
+                    started_at = datetime.fromisoformat(row["created_at"])
+                    deadline = (started_at + timedelta(seconds=MAX_AGENT_RETRY_WINDOW_SECONDS)).isoformat()
+                except (TypeError, ValueError):
+                    deadline = (datetime.now(UTC) + timedelta(seconds=MAX_AGENT_RETRY_WINDOW_SECONDS)).isoformat()
+            if datetime.fromisoformat(retry_at) > datetime.fromisoformat(deadline):
+                db.commit()
+                return None
+            usage_values = {
+                key: max(0, value) if isinstance(value, int) and not isinstance(value, bool) else 0
+                for key, value in (usage or {}).items() if key != "cost_usd"
+            }
+            cost = Decimal(row["cost_usd"] or "0")
+            try:
+                cost += Decimal(str((usage or {}).get("cost_usd") or 0))
+            except (InvalidOperation, TypeError, ValueError):
+                pass
+            db.execute(
+                """UPDATE agent_event_runs SET status='retrying',attempts=?,error=?,retry_at=?,
+                   retry_deadline_at=?,usage_model=COALESCE(?,usage_model),requests=requests+?,
+                   tool_calls=tool_calls+?,input_tokens=input_tokens+?,output_tokens=output_tokens+?,
+                   cache_read_tokens=cache_read_tokens+?,cache_write_tokens=cache_write_tokens+?,
+                   cost_usd=?,updated_at=?
+                   WHERE agent_id=? AND mission_id=? AND trigger_sequence=?""",
+                (attempts, safe_error, retry_at, deadline, usage_model,
+                 usage_values.get("requests", 0), usage_values.get("tool_calls", 0),
+                 usage_values.get("input_tokens", 0), usage_values.get("output_tokens", 0),
+                 usage_values.get("cache_read_tokens", 0), usage_values.get("cache_write_tokens", 0),
+                 format(cost, "f") if cost else None, timestamp, agent_id, mission_id, trigger_sequence),
+            )
+            self._append(db, "agent.run.retrying", agent_id, mission_id, {
+                "triggerSequence": trigger_sequence,
+                "attempt": attempts + 1,
+                "maxAttempts": max_attempts,
+                "retryDelaySeconds": max(0, round(delay_seconds)),
+                "retryAt": retry_at,
+                "error": safe_error,
+                "failureKind": failure_kind,
+            })
+            self._append(db, "agent.activity", agent_id, mission_id, {
+                "status": "Retry scheduled", "triggerSequence": trigger_sequence,
+                "detail": "Temporary provider issue. Tribe will retry automatically.",
+            })
+            db.commit()
+            return retry_at
 
     def interrupt_dead_agent_worker(self, agent_id: str, mission_id: str) -> int:
         """Quarantine abandoned runs before a replacement role consumer starts."""
@@ -3071,12 +3661,102 @@ class MissionStore:
             (agent_id, mission_id, sequence, timestamp),
         )
 
+    @staticmethod
+    def _rewind_agent_offset(db: sqlite3.Connection, agent_id: str, mission_id: str,
+                             sequence: int, timestamp: str) -> None:
+        """Make a recovered trigger visible to its consumer without skipping older work."""
+        current = db.execute(
+            "SELECT sequence FROM agent_offsets WHERE agent_id=? AND mission_id=?",
+            (agent_id, mission_id),
+        ).fetchone()
+        rewind_to = min(int(current[0]), sequence) if current else 0
+        db.execute(
+            """INSERT INTO agent_offsets VALUES (?, ?, ?, ?)
+               ON CONFLICT(agent_id, mission_id) DO UPDATE SET
+               sequence=excluded.sequence,updated_at=excluded.updated_at""",
+            (agent_id, mission_id, rewind_to, timestamp),
+        )
+
+    def record_agent_request_usage(
+        self, agent_id: str, mission_id: str, trigger_sequence: int, request_key: str,
+        model: str, usage: dict[str, int | str | None], context_message_count: int | None = None,
+        compaction_receipt_count: int = 0, pruning_metrics: tuple[int, int, bool] = (0, 0, False),
+    ) -> bool:
+        """Persist one completed provider response before the agent advances to its next step."""
+        if not request_key:
+            request_key = str(uuid.uuid4())
+        safe_context_count = (
+            max(0, context_message_count)
+            if isinstance(context_message_count, int) and not isinstance(context_message_count, bool)
+            else None
+        )
+        safe_receipt_count = (
+            max(0, compaction_receipt_count)
+            if isinstance(compaction_receipt_count, int) and not isinstance(compaction_receipt_count, bool)
+            else 0
+        )
+        values = {
+            key: max(0, value) if isinstance(value, int) and not isinstance(value, bool) else 0
+            for key, value in usage.items() if key != "cost_usd"
+        }
+        try:
+            cost = Decimal(str(usage.get("cost_usd")))
+            if not cost.is_finite() or cost < 0:
+                cost = None
+        except (InvalidOperation, TypeError, ValueError):
+            cost = None
+        timestamp = now()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            run_row = db.execute(
+                """SELECT status,cost_usd FROM agent_event_runs
+                   WHERE agent_id=? AND mission_id=? AND trigger_sequence=?""",
+                (agent_id, mission_id, trigger_sequence),
+            ).fetchone()
+            if not run_row or run_row["status"] not in {"running", "cancelling", "retrying"}:
+                db.commit()
+                return False
+            inserted = db.execute(
+                """INSERT OR IGNORE INTO agent_request_usage(
+                       request_key,agent_id,mission_id,trigger_sequence,model,context_message_count,compaction_receipt_count,
+                       pruned_result_count,pruned_token_estimate,context_pruning_enabled,
+                       tool_calls,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,
+                       cost_usd,created_at
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (request_key, agent_id, mission_id, trigger_sequence, model, safe_context_count, safe_receipt_count,
+                 max(0, pruning_metrics[0]), max(0, pruning_metrics[1]), int(bool(pruning_metrics[2])),
+                 values.get("tool_calls", 0), values.get("input_tokens", 0),
+                 values.get("output_tokens", 0), values.get("cache_read_tokens", 0),
+                 values.get("cache_write_tokens", 0), format(cost, "f") if cost is not None else None,
+                 timestamp),
+            ).rowcount
+            if not inserted:
+                db.commit()
+                return False
+            total_cost = Decimal(run_row["cost_usd"] or "0") + (cost or Decimal(0))
+            db.execute(
+                """UPDATE agent_event_runs SET usage_model=COALESCE(?,usage_model),
+                   requests=requests+1,tool_calls=tool_calls+?,input_tokens=input_tokens+?,
+                   output_tokens=output_tokens+?,cache_read_tokens=cache_read_tokens+?,
+                   cache_write_tokens=cache_write_tokens+?,cost_usd=?,updated_at=?
+                   WHERE agent_id=? AND mission_id=? AND trigger_sequence=?
+                     AND status IN ('running','cancelling','retrying')""",
+                (model, values.get("tool_calls", 0), values.get("input_tokens", 0),
+                 values.get("output_tokens", 0), values.get("cache_read_tokens", 0),
+                 values.get("cache_write_tokens", 0),
+                 format(total_cost, "f") if total_cost else None, timestamp,
+                 agent_id, mission_id, trigger_sequence),
+            )
+            db.commit()
+        return True
+
     def complete_agent_event(self, agent_id: str, mission_id: str, trigger_sequence: int,
                              output_text: str, work_item_id: str | None,
                              usage_model: str | None = None,
                              usage: dict[str, int | str | None] | None = None,
                              usage_attempt: int | None = None,
-                             interactive_artifact_ids: tuple[str, ...] = ()) -> None:
+                             interactive_artifact_ids: tuple[str, ...] = (),
+                             publish_output: bool = True) -> None:
         timestamp = now()
         usage_reported = usage is not None
         raw_usage = usage or {}
@@ -3112,7 +3792,18 @@ class MissionStore:
                 )
                 db.commit()
                 return
-            if output_text and output_text.lower() not in {"no-op", "no action", "no useful action is needed."}:
+            usage_keys = ("requests", "tool_calls", "input_tokens", "output_tokens",
+                          "cache_read_tokens", "cache_write_tokens")
+            prior_usage = {key: int(row[key] or 0) for key in usage_keys}
+            for key in usage_keys:
+                usage_values[key] = usage_values.get(key, 0) + prior_usage[key]
+            prior_cost = Decimal(row["cost_usd"] or "0")
+            if prior_cost:
+                cost_usd = format(prior_cost + Decimal(cost_usd or "0"), "f")
+            usage_reported = usage_reported or any(prior_usage.values()) or bool(prior_cost)
+            usage_model = usage_model or row["usage_model"]
+            if (publish_output and output_text
+                    and output_text.lower() not in {"no-op", "no action", "no useful action is needed."}):
                 try:
                     started_at = datetime.fromisoformat(row["created_at"])
                     finished_at = datetime.fromisoformat(timestamp)
@@ -3134,6 +3825,7 @@ class MissionStore:
                             valid_interactive_ids.append(artifact_id)
                 self._append(db, "agent.message.created", agent_id, mission_id, {
                     "text": output_text, "recipient": None,
+                    "channelAudience": "conversation",
                     "triggerSequence": trigger_sequence, "workItemId": work_item_id,
                     "durationMs": duration_ms,
                     "inputTokens": usage_values.get("input_tokens") if usage_reported else None,
@@ -3152,7 +3844,8 @@ class MissionStore:
                 """UPDATE agent_event_runs SET status = 'completed', output_text = ?,
                    work_item_id = ?, error = NULL, usage_model = ?, requests = ?,
                    tool_calls = ?, input_tokens = ?, output_tokens = ?,
-                   cache_read_tokens = ?, cache_write_tokens = ?, cost_usd = ?, updated_at = ?
+                   cache_read_tokens = ?, cache_write_tokens = ?, cost_usd = ?,
+                   retry_at = NULL, updated_at = ?
                    WHERE agent_id = ? AND mission_id = ? AND trigger_sequence = ?""",
                 (output_text, work_item_id, usage_model,
                  usage_values.get("requests", 0), usage_values.get("tool_calls", 0),
@@ -3185,27 +3878,27 @@ class MissionStore:
                           COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,
                           COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens
                    FROM agent_event_runs runs JOIN missions ON missions.id=runs.mission_id
-                   WHERE missions.project_id=? AND runs.status='completed'""", (project_id,)
+                   WHERE missions.project_id=? AND runs.status IN ('running','completed','failed','interrupted','retrying')""", (project_id,)
             ).fetchone()
             by_model = [dict(row) for row in db.execute(
                 """SELECT usage_model AS model, COALESCE(SUM(requests),0) AS requests,
                           COALESCE(SUM(input_tokens),0) AS input_tokens,
                           COALESCE(SUM(output_tokens),0) AS output_tokens
                    FROM agent_event_runs runs JOIN missions ON missions.id=runs.mission_id
-                   WHERE missions.project_id=? AND runs.status='completed' AND usage_model IS NOT NULL
+                   WHERE missions.project_id=? AND runs.status IN ('running','completed','failed','interrupted','retrying') AND usage_model IS NOT NULL
                    GROUP BY usage_model ORDER BY usage_model""", (project_id,)
             )]
             by_agent = [dict(row) for row in db.execute(
                 """SELECT agent_id AS agent, COUNT(*) AS runs, COALESCE(SUM(input_tokens),0) AS input_tokens,
                           COALESCE(SUM(output_tokens),0) AS output_tokens
                    FROM agent_event_runs runs JOIN missions ON missions.id=runs.mission_id
-                   WHERE missions.project_id=? AND runs.status='completed'
+                   WHERE missions.project_id=? AND runs.status IN ('running','completed','failed','interrupted','retrying')
                    GROUP BY agent_id ORDER BY agent_id""", (project_id,)
             )]
             cost_rows = db.execute(
                 """SELECT usage_model, agent_id, cost_usd FROM agent_event_runs runs
                    JOIN missions ON missions.id=runs.mission_id
-                   WHERE missions.project_id=? AND runs.status='completed'""", (project_id,)
+                   WHERE missions.project_id=? AND runs.status IN ('running','completed','failed','interrupted','retrying')""", (project_id,)
             ).fetchall()
             total_cost = Decimal(0)
             priced_runs = 0
@@ -3644,7 +4337,7 @@ class MissionStore:
             return int(row[0]) if row and row[0] is not None else None
 
     def reserve_agent_usage(self, agent_id: str, mission_id: str, trigger_sequence: int,
-                            attempt: int, default_limit: int = DEFAULT_AGENT_RUN_TOKEN_LIMIT) -> int | None:
+                            attempt: int, default_limit: int | None = DEFAULT_AGENT_RUN_TOKEN_LIMIT) -> int | None:
         timestamp = now()
         period = timestamp[:7]
         period_start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
@@ -3682,7 +4375,8 @@ class MissionStore:
                        WHERE project_id=? AND period=? AND status IN ('reserved','unknown')""",
                     (project_id, period),
                 ).fetchone()[0]
-                token_limit = min(token_limit, int(budget[0]) - int(used) - int(reserved))
+                monthly_remaining = int(budget[0]) - int(used) - int(reserved)
+                token_limit = monthly_remaining if token_limit is None else min(token_limit, monthly_remaining)
                 if token_limit <= 0:
                     db.commit()
                     return None
@@ -3692,10 +4386,12 @@ class MissionStore:
                     reserved_tokens,status,created_at,updated_at)
                    VALUES (?,?,?,?,?,?,?,?,'reserved',?,?)""",
                 (str(uuid.uuid4()), project_id, mission_id, agent_id, trigger_sequence,
-                 attempt, period, token_limit, timestamp, timestamp),
+                 attempt, period, token_limit if token_limit is not None else 0, timestamp, timestamp),
             )
             db.commit()
-            return token_limit
+            # Keep an explicit reservation row without imposing a per-run ceiling.
+            # Monthly-budget reservations still store their remaining allowance.
+            return token_limit if token_limit is not None else 0
 
     def usage_token_limit_for_run(self, agent_id: str, mission_id: str,
                                   trigger_sequence: int) -> int | None:
@@ -3706,7 +4402,7 @@ class MissionStore:
                    ORDER BY attempt DESC LIMIT 1""",
                 (agent_id, mission_id, trigger_sequence),
             ).fetchone()
-            return int(row[0]) if row else None
+            return int(row[0]) if row and int(row[0]) > 0 else None
 
     def mark_usage_reservation_unknown(self, agent_id: str, mission_id: str,
                                        trigger_sequence: int, attempt: int) -> None:
@@ -3737,7 +4433,10 @@ class MissionStore:
             return cursor.rowcount
 
     def fail_agent_event(self, agent_id: str, mission_id: str, trigger_sequence: int,
-                         attempts: int, error: str, usage_attempt: int | None = None) -> None:
+                         attempts: int, error: str, usage_attempt: int | None = None,
+                         usage_model: str | None = None,
+                         usage: dict[str, int | str | None] | None = None,
+                         failure_kind: str = "unknown") -> None:
         timestamp = now()
         safe_error = error[:2000]
         with self._lock, self._connect() as db:
@@ -3763,14 +4462,32 @@ class MissionStore:
                 return
             self._append(db, "agent.run.failed", agent_id, mission_id, {
                 "triggerSequence": trigger_sequence, "attempts": attempts, "error": safe_error,
+                "failureKind": failure_kind,
             })
             self._append(db, "agent.activity", agent_id, mission_id, {
                 "status": "Needs attention", "triggerSequence": trigger_sequence,
             })
+            usage_values = {
+                key: max(0, value) if isinstance(value, int) and not isinstance(value, bool) else 0
+                for key, value in (usage or {}).items() if key != "cost_usd"
+            }
+            cost = Decimal(row["cost_usd"] or "0")
+            try:
+                cost += Decimal(str((usage or {}).get("cost_usd") or 0))
+            except (InvalidOperation, TypeError, ValueError):
+                pass
             db.execute(
-                """UPDATE agent_event_runs SET status = 'failed', error = ?, updated_at = ?
+                """UPDATE agent_event_runs SET status = 'failed', attempts=?, error = ?,
+                   retry_at=NULL,usage_model=COALESCE(?,usage_model),requests=requests+?,
+                   tool_calls=tool_calls+?,input_tokens=input_tokens+?,output_tokens=output_tokens+?,
+                   cache_read_tokens=cache_read_tokens+?,cache_write_tokens=cache_write_tokens+?,
+                   cost_usd=?,updated_at=?
                    WHERE agent_id = ? AND mission_id = ? AND trigger_sequence = ?""",
-                (safe_error, timestamp, agent_id, mission_id, trigger_sequence),
+                (attempts, safe_error, usage_model, usage_values.get("requests", 0),
+                 usage_values.get("tool_calls", 0), usage_values.get("input_tokens", 0),
+                 usage_values.get("output_tokens", 0), usage_values.get("cache_read_tokens", 0),
+                 usage_values.get("cache_write_tokens", 0), format(cost, "f") if cost else None,
+                 timestamp, agent_id, mission_id, trigger_sequence),
             )
             if usage_attempt is not None:
                 db.execute(
@@ -3838,19 +4555,6 @@ class MissionStore:
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             timestamp = now()
-            scope = db.execute(
-                "SELECT mission_id FROM work_items WHERE id = ?", (work_item_id,),
-            ).fetchone()
-            if scope:
-                mission = db.execute(
-                    "SELECT recipe_id FROM missions WHERE id = ?", (scope["mission_id"],),
-                ).fetchone()
-                if (mission and mission["recipe_id"] == "goal-driven-sdlc"
-                        and not self._current_plan_checkpoint(db, scope["mission_id"])):
-                    db.rollback()
-                    raise PermissionError(
-                        "goal-driven SDLC work cannot be completed while the finalized plan is stale"
-                    )
             row = db.execute(
                 "SELECT * FROM work_items WHERE id = ? AND owner = ? AND status = 'claimed' AND lease_until >= ?",
                 (work_item_id, agent_id, timestamp),
@@ -3865,6 +4569,41 @@ class MissionStore:
             self._auto_block_mission_for_user_request(db, item["mission_id"], agent_id)
             db.commit()
             return item
+
+    def record_harness_node_test_result(
+        self, mission_id: str, agent_id: str, trigger_sequence: int,
+        tool_call_id: str, command: str, output: object, work_item_id: str | None,
+        source_tool_event_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Promote a complete Harness Node TAP result into durable verification history."""
+        evidence = node_test_run_evidence(command, output)
+        if evidence is None:
+            return None
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                "SELECT id,sequence,event_type,actor_id,payload,created_at FROM events "
+                "WHERE mission_id=? AND event_type='repo.test_run.completed' "
+                "AND json_extract(payload,'$.sourceToolCallId')=? LIMIT 1",
+                (mission_id, tool_call_id),
+            ).fetchone()
+            if existing:
+                db.commit()
+                return dict(existing)
+            event = self._append(db, "repo.test_run.completed", agent_id, mission_id, {
+                "runId": f"harness:{tool_call_id}",
+                **evidence,
+                "cancelled": False,
+                "timedOut": False,
+                "workItemId": work_item_id,
+                "toolCallId": tool_call_id,
+                "source": "pydantic_ai_harness",
+                "sourceToolCallId": tool_call_id,
+                "sourceToolEventId": source_tool_event_id,
+                "triggerSequence": trigger_sequence,
+            })
+            db.commit()
+            return event
 
     def approval(self, interaction_id: str) -> dict[str, Any] | None:
         with self._connect() as db:
@@ -3888,6 +4627,59 @@ class MissionStore:
         for row in result:
             row["tool_arguments"] = json.loads(row["tool_arguments"])
         return result
+
+    def resume_resolved_deferred_tool_approval(self, interaction_id: str) -> int | None:
+        """Rewind a crashed approval continuation to its original trigger when safe."""
+        timestamp = now()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT d.*,i.status AS interaction_status,i.resolution,r.status AS run_status
+                   FROM deferred_tool_approvals d JOIN interactions i ON i.id=d.interaction_id
+                   JOIN agent_event_runs r ON r.agent_id=d.agent_id AND r.mission_id=d.mission_id
+                     AND r.trigger_sequence=d.trigger_sequence
+                   WHERE d.interaction_id=?""",
+                (interaction_id,),
+            ).fetchone()
+            if (not row or row["interaction_status"] != "resolved"
+                    or row["run_status"] != "running"):
+                db.commit()
+                return None
+            recovery_key = (row["agent_id"], row["mission_id"], row["trigger_sequence"])
+            if row["status"] == "consumed":
+                db.execute(
+                    "UPDATE deferred_tool_approvals SET status='unknown_after_crash',updated_at=? WHERE interaction_id=?",
+                    (timestamp, interaction_id),
+                )
+                run = db.execute(
+                    "SELECT * FROM agent_event_runs WHERE agent_id=? AND mission_id=? AND trigger_sequence=?",
+                    recovery_key,
+                ).fetchone()
+                self._interrupt_agent_run(
+                    db, run,
+                    "The approved action was interrupted after its one-time approval was consumed. "
+                    "Its outcome is unknown, so Tribe stopped automatic replay.", timestamp,
+                )
+                db.commit()
+                return None
+            if row["status"] != "pending":
+                db.commit()
+                return None
+            db.execute(
+                """UPDATE agent_event_runs SET status='retrying',retry_at=?,error=?,updated_at=?
+                   WHERE agent_id=? AND mission_id=? AND trigger_sequence=? AND status='running'""",
+                (timestamp, "Resuming the saved approval decision after interruption.", timestamp, *recovery_key),
+            )
+            # This is an explicit replay of one already-authorised tool frontier;
+            # ordinary consumer offsets remain monotonic everywhere else.
+            db.execute(
+                """INSERT INTO agent_offsets VALUES (?,?,?,?)
+                   ON CONFLICT(agent_id,mission_id) DO UPDATE SET
+                   sequence=excluded.sequence,updated_at=excluded.updated_at""",
+                (row["agent_id"], row["mission_id"], max(0, row["trigger_sequence"] - 1), timestamp),
+            )
+            db.commit()
+            return int(row["trigger_sequence"])
 
     def update_deferred_tool_approval(self, interaction_id: str, status: str) -> None:
         if status not in {"pending", "approved", "denied", "consumed", "unknown_after_crash"}:
@@ -4251,7 +5043,7 @@ class MissionStore:
         } for row in rows]
 
     @staticmethod
-    def _events_before(db: sqlite3.Connection, mission_id: str, before: int,
+    def _events_before(db: sqlite3.Connection, mission_id: str, before: float,
                        limit: int) -> tuple[list[dict[str, Any]], bool]:
         page_size = min(max(limit, 1), 500)
         rows = list(db.execute(
@@ -4260,11 +5052,73 @@ class MissionStore:
         ))
         has_more = len(rows) > page_size
         rows = list(reversed(rows[:page_size]))
-        return ([{
+        events = [{
             "id": row["id"], "sequence": row["sequence"], "missionId": row["mission_id"],
             "type": row["event_type"], "actorId": row["actor_id"],
             "payload": json.loads(row["payload"]), "createdAt": row["created_at"],
-        } for row in rows], has_more)
+        } for row in rows]
+        if events:
+            events.extend(MissionStore._completed_agent_turn_events(
+                db, mission_id, events[0]["sequence"], events[-1]["sequence"],
+            ))
+            events.sort(key=lambda event: event["sequence"])
+        return events, has_more
+
+    @staticmethod
+    def _completed_agent_turn_events(db: sqlite3.Connection, mission_id: str,
+                                     first_sequence: float, last_sequence: float) -> list[dict[str, Any]]:
+        """Project completed turn replies suppressed by older runtimes into history pages."""
+        rows = db.execute(
+            """SELECT r.agent_id,r.trigger_sequence,r.output_text,r.work_item_id,r.created_at,
+                      r.updated_at,r.input_tokens,r.output_tokens,w.title,
+                      COALESCE((SELECT MAX(e.sequence) FROM events e
+                                WHERE e.mission_id=r.mission_id AND e.actor_id=r.agent_id
+                                  AND json_extract(e.payload,'$.triggerSequence')=r.trigger_sequence),
+                               r.trigger_sequence) AS completed_sequence
+               FROM agent_event_runs r LEFT JOIN work_items w
+                 ON w.id=r.work_item_id AND w.mission_id=r.mission_id
+               WHERE r.mission_id=? AND r.status='completed'
+                 AND trim(r.output_text)<>''
+                 AND lower(trim(r.output_text)) NOT IN ('no-op','no action','no useful action is needed.')
+                 AND COALESCE((SELECT json_extract(e.payload,'$.channelAudience')
+                               FROM events e WHERE e.mission_id=r.mission_id
+                                 AND e.event_type='agent.message.created' AND e.actor_id=r.agent_id
+                                 AND json_extract(e.payload,'$.triggerSequence')=r.trigger_sequence
+                                 AND json_extract(e.payload,'$.recipient') IS NULL
+                                 AND json_extract(e.payload,'$.toolCallId') IS NULL
+                               ORDER BY e.sequence DESC LIMIT 1),'')!='conversation'""",
+            (mission_id,),
+        ).fetchall()
+        projected = []
+        for row in rows:
+            sequence = float(row["completed_sequence"]) + 0.5
+            if sequence < first_sequence or sequence > last_sequence:
+                continue
+            try:
+                duration_ms = max(0, round((
+                    datetime.fromisoformat(row["updated_at"])
+                    - datetime.fromisoformat(row["created_at"])
+                ).total_seconds() * 1000))
+            except (TypeError, ValueError):
+                duration_ms = None
+            projected.append({
+                "id": f"completed-agent-turn:{mission_id}:{row['agent_id']}:{row['trigger_sequence']}",
+                "sequence": sequence,
+                "missionId": mission_id,
+                "type": "agent.message.created",
+                "actorId": row["agent_id"],
+                "payload": {
+                    "text": row["output_text"], "recipient": None,
+                    "channelAudience": "conversation", "triggerSequence": row["trigger_sequence"],
+                    "workItemId": row["work_item_id"], "workItemTitle": row["title"],
+                    "durationMs": duration_ms,
+                    "inputTokens": row["input_tokens"] or None,
+                    "outputTokens": row["output_tokens"] or None,
+                    "historyProjection": True,
+                },
+                "createdAt": row["updated_at"],
+            })
+        return projected
 
     def events_before(self, mission_id: str, before: int, limit: int = 200) -> tuple[list[dict[str, Any]], bool]:
         with self._connect() as db:
@@ -4282,6 +5136,103 @@ class MissionStore:
                 "SELECT 1 FROM events WHERE mission_id=? AND sequence>? AND actor_id=? LIMIT 1",
                 (mission_id, sequence, actor_id),
             ).fetchone() is not None
+
+    def has_unexpected_agent_effect_after(self, mission_id: str, sequence: int,
+                                          actor_id: str) -> bool:
+        """Ignore only tool effects with a durable, known-safe completion.
+
+        Completed test commands have a durable result, repository writes have an
+        exact matching change event, and explicitly configured read-only MCP calls
+        cannot mutate external state. Other side effects remain fail-closed.
+        """
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT event_type,payload FROM events WHERE mission_id=? AND sequence>? AND actor_id=? ORDER BY sequence",
+                (mission_id, sequence, actor_id),
+            ).fetchall()
+        completed_runs = set()
+        completed_test_calls = set()
+        completed_post_updates = set()
+        started_read_only_mcp_calls = set()
+        completed_tool_calls = set()
+        started_writes = set()
+        completed_writes = set()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                continue
+            if row["event_type"] == "repo.file.write.started":
+                call_id = payload.get("toolCallId")
+                if isinstance(call_id, str) and call_id:
+                    started_writes.add(call_id)
+            elif row["event_type"] == "repo.file.changed":
+                call_id = payload.get("toolCallId")
+                if isinstance(call_id, str) and call_id:
+                    completed_writes.add(call_id)
+            elif row["event_type"] == "agent.tool.started":
+                call_id = payload.get("toolCallId")
+                if isinstance(call_id, str) and call_id and payload.get("mcpReadOnly") is True:
+                    started_read_only_mcp_calls.add(call_id)
+            elif row["event_type"] in {"agent.tool.completed", "agent.tool.interrupted"}:
+                call_id = payload.get("toolCallId")
+                if isinstance(call_id, str) and call_id:
+                    completed_tool_calls.add(call_id)
+                    if row["event_type"] == "agent.tool.completed" and payload.get("toolName") == "post_update":
+                        completed_post_updates.add(call_id)
+            if row["event_type"] == "repo.test_run.completed":
+                try:
+                    run_id = payload.get("runId")
+                    tool_call_id = payload.get("toolCallId")
+                except AttributeError:
+                    run_id = tool_call_id = None
+                if run_id:
+                    completed_runs.add(run_id)
+                if isinstance(tool_call_id, str) and tool_call_id:
+                    completed_test_calls.add(tool_call_id)
+        for row in rows:
+            if row["event_type"] == "repo.test_run.completed":
+                continue
+            if row["event_type"] == "agent.message.created":
+                try:
+                    tool_call_id = json.loads(row["payload"]).get("toolCallId")
+                except (TypeError, ValueError):
+                    tool_call_id = None
+                if tool_call_id in completed_post_updates:
+                    continue
+            if row["event_type"] in {"repo.file.write.started", "repo.file.changed"}:
+                try:
+                    tool_call_id = json.loads(row["payload"]).get("toolCallId")
+                except (TypeError, ValueError):
+                    tool_call_id = None
+                if tool_call_id in (started_writes & completed_writes):
+                    continue
+            if row["event_type"] in {"agent.tool.started", "agent.tool.completed", "agent.tool.interrupted"}:
+                try:
+                    tool_call_id = json.loads(row["payload"]).get("toolCallId")
+                except (TypeError, ValueError):
+                    tool_call_id = None
+                if (tool_call_id in completed_test_calls
+                        or tool_call_id in completed_post_updates
+                        or tool_call_id in (started_writes & completed_writes)
+                        or tool_call_id in (started_read_only_mcp_calls & completed_tool_calls)):
+                    continue
+            if row["event_type"] == "repo.test_run.started":
+                try:
+                    run_id = json.loads(row["payload"]).get("runId")
+                except (TypeError, ValueError):
+                    run_id = None
+                if run_id and run_id in completed_runs:
+                    continue
+            if row["event_type"] == "artifact.created":
+                try:
+                    artifact = json.loads(row["payload"]).get("artifact", {})
+                except (TypeError, ValueError):
+                    artifact = {}
+                if str(artifact.get("name", "")).startswith("test-results-"):
+                    continue
+            return True
+        return False
 
     def events_after_page(self, mission_id: str, sequence: int,
                           limit: int = 200) -> tuple[list[dict[str, Any]], bool]:
@@ -4319,6 +5270,45 @@ class MissionStore:
             (mission_id,),
         ).fetchone()[0]
         return checkpoint if changed is None or checkpoint["sequence"] > changed else None
+
+    def has_current_plan_checkpoint(self, mission_id: str) -> bool:
+        """Whether goal-driven work is released against the latest plan state."""
+        with self._connect() as db:
+            return self._current_plan_checkpoint(db, mission_id) is not None
+
+    def agent_verification_context(self, mission_id: str, limit: int = 8) -> dict[str, Any]:
+        """Return compact, current review evidence without scanning channel history."""
+        bounded_limit = max(1, min(int(limit), 20))
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT id,sequence,actor_id,payload FROM events "
+                "WHERE mission_id=? AND event_type='repo.test_run.completed' "
+                "ORDER BY sequence DESC LIMIT ?", (mission_id, bounded_limit),
+            ).fetchall()
+            test_runs = []
+            for row in reversed(rows):
+                payload = json.loads(row["payload"])
+                test_runs.append({
+                    "event_id": row["id"], "sequence": row["sequence"],
+                    "actor": row["actor_id"], "run_id": payload.get("runId"),
+                    "argv": payload.get("argv", []), "exit_code": payload.get("exitCode"),
+                    "test_count": payload.get("testCount"), "passed": payload.get("passed"),
+                    "failed": payload.get("failed"), "work_item_id": payload.get("workItemId"),
+                    "stdout_tail": str(payload.get("stdout", ""))[-1800:],
+                })
+            checkpoint = self._current_plan_checkpoint(db, mission_id)
+            acceptance_criteria = []
+            if checkpoint:
+                acceptance_criteria = [
+                    item.get("criterion") for item in json.loads(checkpoint["payload"]).get(
+                        "acceptanceCriteria", [],
+                    ) if isinstance(item, dict) and isinstance(item.get("criterion"), str)
+                ]
+            return {
+                "test_runs": test_runs,
+                "acceptance_criteria": acceptance_criteria,
+                "plan_checkpoint_sequence": checkpoint["sequence"] if checkpoint else None,
+            }
 
     @staticmethod
     def _workflow_context(db: sqlite3.Connection, mission_id: str) -> dict[str, Any]:
@@ -4372,6 +5362,24 @@ class MissionStore:
                 "verificationEventId": payload.get("verificationEventId"),
                 "changeEventId": payload.get("changeEventId"),
             }
+        stage_row = db.execute(
+            "SELECT id,sequence,payload FROM events WHERE mission_id=? "
+            "AND event_type='workflow.stage.changed' ORDER BY sequence DESC LIMIT 1", (mission_id,),
+        ).fetchone()
+        stage = None
+        if stage_row:
+            payload = json.loads(stage_row["payload"])
+            stage = {"id": stage_row["id"], "sequence": stage_row["sequence"],
+                     "stageId": payload.get("stageId"), "title": payload.get("title", "")}
+        state_row = db.execute(
+            "SELECT id,sequence,payload FROM events WHERE mission_id=? "
+            "AND event_type='workflow.state.updated' ORDER BY sequence DESC LIMIT 1", (mission_id,),
+        ).fetchone()
+        state = None
+        if state_row:
+            payload = json.loads(state_row["payload"])
+            state = {"id": state_row["id"], "sequence": state_row["sequence"],
+                     "revision": payload.get("revision"), "state": payload.get("state", {})}
         return {
             "discovery": discovery,
             "planFinalizedSequence": plan["sequence"] if plan else None,
@@ -4380,13 +5388,13 @@ class MissionStore:
             "latestTest": dict(latest_test) if latest_test else None,
             "latestSuccessfulTest": dict(verification) if verification else None,
             "latestReview": review,
+            "stage": stage,
+            "state": state,
         }
 
     def complete_discovery(self, mission_id: str, planner_id: str, summary: str,
                            evidence_paths: list[str]) -> dict[str, Any]:
         """Record the planner's repository findings before the first v7 SDLC plan."""
-        if planner_id != "planner":
-            raise PermissionError("only the planner may complete discovery")
         if not isinstance(summary, str) or not 30 <= len(summary.strip()) <= 4000:
             raise ValueError("discovery_summary_must_be_30_to_4000_characters")
         if not isinstance(evidence_paths, list) or len(evidence_paths) > 20:
@@ -4439,14 +5447,11 @@ class MissionStore:
             event = self._append(db, "sdlc.discovery.completed", planner_id, mission_id, {
                 "summary": summary.strip(), "evidence": evidence,
             })
-            self._release_claims_for_stale_plan(db, mission_id, planner_id)
             db.commit()
             return event
 
     def finalize_plan(self, mission_id: str, planner_id: str,
                       acceptance_criteria: list[dict[str, Any]]) -> dict[str, Any]:
-        if planner_id != "planner":
-            raise PermissionError("only the planner may finalize the mission plan")
         if not isinstance(acceptance_criteria, list) or not 1 <= len(acceptance_criteria) <= 20:
             raise ValueError("plan_requires_1_to_20_acceptance_criteria")
         criteria: list[dict[str, Any]] = []
@@ -4473,21 +5478,18 @@ class MissionStore:
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             mission = db.execute(
-                "SELECT status,recipe_id,recipe_version FROM missions WHERE id=?", (mission_id,),
+                "SELECT status FROM missions WHERE id=?", (mission_id,),
             ).fetchone()
             if not mission:
                 db.rollback()
                 raise ValueError("mission_not_found")
-            if mission["status"] != "active" or mission["recipe_id"] != "goal-driven-sdlc":
+            if mission["status"] != "active":
                 db.rollback()
-                raise ValueError("only_active_goal_driven_sdlc_missions_can_finalize_a_plan")
+                raise ValueError("only_active_missions_can_finalize_a_plan")
             discovery = db.execute(
                 "SELECT id,sequence FROM events WHERE mission_id=? AND event_type='sdlc.discovery.completed' "
                 "ORDER BY sequence DESC LIMIT 1", (mission_id,),
             ).fetchone()
-            if mission["recipe_version"] >= 7 and discovery is None:
-                db.rollback()
-                raise ValueError("discovery_checkpoint_required_before_plan_finalization")
             item_ids = [row[0] for row in db.execute(
                 "SELECT id FROM work_items WHERE mission_id=? ORDER BY created_at,id", (mission_id,),
             )]
@@ -4509,79 +5511,146 @@ class MissionStore:
                     {"id": work_item_id, "title": items[work_item_id]["title"]}
                     for work_item_id in item.pop("workItemIds")
                 ]
-            event = self._append(db, "plan.finalized", planner_id, mission_id, {
+            payload = {
                 "acceptanceCriteria": criteria,
                 "workItemIds": item_ids,
                 "discoveryEventId": discovery["id"] if discovery else None,
-            })
+            }
+            previous = db.execute(
+                """SELECT id,sequence,actor_id,payload,created_at FROM events
+                   WHERE mission_id=? AND event_type='plan.finalized'
+                   ORDER BY sequence DESC LIMIT 1""",
+                (mission_id,),
+            ).fetchone()
+            if previous:
+                try:
+                    previous_payload = json.loads(previous["payload"])
+                except (TypeError, json.JSONDecodeError):
+                    previous_payload = None
+                if previous_payload == payload:
+                    db.commit()
+                    return {
+                        "id": previous["id"], "missionId": mission_id,
+                        "type": "plan.finalized", "actorId": previous["actor_id"],
+                        "payload": previous_payload, "createdAt": previous["created_at"],
+                        "sequence": previous["sequence"],
+                    }
+            event = self._append(db, "plan.finalized", planner_id, mission_id, payload)
             db.commit()
             return event
 
     def create_work_item(self, mission_id: str, title: str, detail: str = "",
                          actor_id: str = "user", depends_on: list[str] | None = None) -> dict[str, Any]:
-        title, detail = title.strip(), detail.strip()
-        if not title or len(title) > 500 or len(detail) > 5000:
-            raise ValueError("work item title must be 1 to 500 characters and detail at most 5000")
-        if depends_on is not None and any(not isinstance(item, str) for item in depends_on):
-            raise ValueError("work item dependencies must be task IDs")
-        dependency_ids = list(dict.fromkeys(depends_on or []))
-        if len(dependency_ids) > 50:
-            raise ValueError("work item dependencies must contain at most 50 task IDs")
-        item = {"id": str(uuid.uuid4()), "mission_id": mission_id, "title": title,
-                "detail": detail, "status": "ready", "owner": None, "lease_until": None,
-                "created_at": now(), "updated_at": now()}
+        item = self.create_work_items(mission_id, [{
+            "title": title, "detail": detail, "depends_on": depends_on or [],
+        }], actor_id)[0]
+        return {key: value for key, value in item.items() if key != "key"}
+
+    def create_work_items(self, mission_id: str, items: list[dict[str, Any]],
+                          actor_id: str = "user") -> list[dict[str, Any]]:
+        """Create a plan batch atomically; dependencies may name a batch key or existing task ID."""
+        if not isinstance(items, list) or not 1 <= len(items) <= 50:
+            raise ValueError("a plan batch must contain 1 to 50 work items")
+        normalised: list[dict[str, Any]] = []
+        keys: set[str] = set()
+        for index, raw in enumerate(items, start=1):
+            if not isinstance(raw, dict):
+                raise ValueError("each work item must be an object")
+            title = raw.get("title")
+            detail = raw.get("detail", "")
+            key = raw.get("key") or f"task-{index}"
+            depends_on = raw.get("depends_on", [])
+            if not isinstance(title, str) or not isinstance(detail, str):
+                raise ValueError("work item title and detail must be text")
+            title, detail, key = title.strip(), detail.strip(), str(key).strip()
+            if not title or len(title) > 500 or len(detail) > 5000:
+                raise ValueError("work item title must be 1 to 500 characters and detail at most 5000")
+            if not key or len(key) > 80 or key in keys:
+                raise ValueError("work item keys must be unique and 1 to 80 characters")
+            if not isinstance(depends_on, list) or any(not isinstance(dep, str) for dep in depends_on):
+                raise ValueError("work item dependencies must be task keys or IDs")
+            dependency_refs = list(dict.fromkeys(dep.strip() for dep in depends_on))
+            if len(dependency_refs) > 50 or key in dependency_refs:
+                raise ValueError("work item dependencies must contain at most 50 other tasks")
+            keys.add(key)
+            normalised.append({"key": key, "id": str(uuid.uuid4()), "title": title,
+                               "detail": detail, "dependency_refs": dependency_refs,
+                               "created_at": now()})
+        key_to_id = {item["key"]: item["id"] for item in normalised}
+        # A batch must be acyclic before any task or event is written.
+        pending = {item["key"]: {dep for dep in item["dependency_refs"] if dep in keys}
+                   for item in normalised}
+        resolved: set[str] = set()
+        while pending:
+            ready = {key for key, deps in pending.items() if deps <= resolved}
+            if not ready:
+                raise ValueError("work item dependencies cannot contain a cycle")
+            resolved.update(ready)
+            pending = {key: deps for key, deps in pending.items() if key not in ready}
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if dependency_ids:
-                placeholders = ",".join("?" for _ in dependency_ids)
+            external_dependencies = {dep for item in normalised for dep in item["dependency_refs"]
+                                     if dep not in key_to_id}
+            if external_dependencies:
+                placeholders = ",".join("?" for _ in external_dependencies)
                 found = {row["id"] for row in db.execute(
                     f"SELECT id FROM work_items WHERE mission_id = ? AND id IN ({placeholders})",
-                    (mission_id, *dependency_ids),
+                    (mission_id, *sorted(external_dependencies)),
                 )}
-                if found != set(dependency_ids):
+                if found != external_dependencies:
                     db.rollback()
-                    raise ValueError("work item dependencies must belong to this mission")
-            db.execute("INSERT INTO work_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", tuple(item.values()))
-            db.executemany("INSERT INTO work_item_dependencies VALUES (?, ?)",
-                           [(item["id"], dependency) for dependency in dependency_ids])
-            item = self._work_item(db, db.execute("SELECT * FROM work_items WHERE id = ?", (item["id"],)).fetchone())
-            self._append(db, "plan.item.created", actor_id, mission_id, {"workItem": item})
-            self._release_claims_for_stale_plan(db, mission_id, actor_id)
+                    raise ValueError("work item dependencies must belong to this mission or batch")
+            for spec in normalised:
+                timestamp = spec["created_at"]
+                item = {"id": spec["id"], "mission_id": mission_id, "title": spec["title"],
+                        "detail": spec["detail"], "status": "ready", "owner": None,
+                        "lease_until": None, "created_at": timestamp, "updated_at": timestamp}
+                db.execute("INSERT INTO work_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", tuple(item.values()))
+            created = []
+            for spec in normalised:
+                dependencies = [key_to_id.get(dep, dep) for dep in spec["dependency_refs"]]
+                db.executemany("INSERT INTO work_item_dependencies VALUES (?, ?)",
+                               [(spec["id"], dependency) for dependency in dependencies])
+                item = self._work_item(db, db.execute(
+                    "SELECT * FROM work_items WHERE id = ?", (spec["id"],),
+                ).fetchone())
+                created.append({**item, "key": spec["key"]})
+                self._append(db, "plan.item.created", actor_id, mission_id, {"workItem": item})
             self._auto_block_mission_for_user_request(db, mission_id, actor_id)
             db.commit()
-        return item
+        return created
 
     def work_items(self, mission_id: str) -> list[dict[str, Any]]:
         with self._connect() as db:
             return [self._work_item(db, row) for row in db.execute(
                 "SELECT * FROM work_items WHERE mission_id = ? ORDER BY created_at, id", (mission_id,))]
 
-    @classmethod
-    def _release_claims_for_stale_plan(cls, db: sqlite3.Connection, mission_id: str,
-                                       actor_id: str) -> None:
-        mission = db.execute(
-            "SELECT recipe_id FROM missions WHERE id = ?", (mission_id,),
-        ).fetchone()
-        if (not mission or mission["recipe_id"] != "goal-driven-sdlc"
-                or cls._current_plan_checkpoint(db, mission_id)):
-            return
-        claims = db.execute(
-            "SELECT * FROM work_items WHERE mission_id=? AND status='claimed' ORDER BY created_at,id",
-            (mission_id,),
-        ).fetchall()
-        for claim in claims:
-            timestamp = now()
+    def release_work_claim(self, mission_id: str, agent_id: str, work_item_id: str,
+                           reason: str) -> dict[str, Any] | None:
+        reason = reason.strip()
+        if not reason or len(reason) > 1000:
+            raise ValueError("claim_release_reason_must_be_1_to_1000_characters")
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM work_items WHERE id=? AND mission_id=? AND owner=? AND status='claimed'",
+                (work_item_id, mission_id, agent_id),
+            ).fetchone()
+            if not row:
+                db.rollback()
+                return None
             db.execute(
                 "UPDATE work_items SET status='ready',owner=NULL,lease_until=NULL,updated_at=? WHERE id=?",
-                (timestamp, claim["id"]),
+                (now(), work_item_id),
             )
-            item = cls._work_item(
-                db, db.execute("SELECT * FROM work_items WHERE id=?", (claim["id"],)).fetchone(),
-            )
-            cls._append(db, "plan.item.updated", actor_id, mission_id, {
-                "workItem": item,
-                "reason": "plan changed; claim released until the planner finalises the updated plan",
+            item = self._work_item(db, db.execute(
+                "SELECT * FROM work_items WHERE id=?", (work_item_id,),
+            ).fetchone())
+            self._append(db, "plan.item.released", agent_id, mission_id, {
+                "workItem": item, "reason": reason,
             })
+            db.commit()
+            return item
 
     def revise_work_item(self, mission_id: str, work_item_id: str, agent_id: str,
                          title: str, detail: str) -> dict[str, Any]:
@@ -4612,7 +5681,6 @@ class MissionStore:
             )
             item = self._work_item(db, db.execute("SELECT * FROM work_items WHERE id = ?", (work_item_id,)).fetchone())
             self._append(db, "plan.item.updated", agent_id, mission_id, {"workItem": item})
-            self._release_claims_for_stale_plan(db, mission_id, agent_id)
             db.commit()
             return item
 
@@ -4620,18 +5688,10 @@ class MissionStore:
                    work_item_id: str | None = None) -> dict[str, Any] | None:
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            mission = db.execute(
-                "SELECT recipe_id FROM missions WHERE id = ?", (mission_id,),
-            ).fetchone()
+            mission = db.execute("SELECT id FROM missions WHERE id = ?", (mission_id,)).fetchone()
             if not mission:
                 db.rollback()
                 raise ValueError("mission_not_found")
-            if (mission["recipe_id"] == "goal-driven-sdlc"
-                    and not self._current_plan_checkpoint(db, mission_id)):
-                db.rollback()
-                raise PermissionError(
-                    "goal-driven SDLC work can only be claimed from a current finalized plan"
-                )
             timestamp = now()
             active = db.execute(
                 "SELECT * FROM work_items WHERE mission_id = ? AND owner = ? AND status = 'claimed' AND lease_until >= ? ORDER BY created_at LIMIT 1",
@@ -4690,27 +5750,8 @@ class MissionStore:
             return row[0] if row else None
 
     def require_work_claim(self, mission_id: str, agent_id: str, work_item_id: str | None) -> None:
-        """Enforce plan ownership before repository actions in the goal-driven workflow."""
-        with self._connect() as db:
-            mission = db.execute(
-                "SELECT recipe_id FROM missions WHERE id = ?", (mission_id,)
-            ).fetchone()
-            if not mission:
-                raise ValueError("mission_not_found")
-            if mission["recipe_id"] != "goal-driven-sdlc":
-                return
-            if not self._current_plan_checkpoint(db, mission_id):
-                raise PermissionError("goal-driven SDLC repository actions require a current finalized plan")
-            if not work_item_id:
-                raise PermissionError("goal-driven SDLC repository actions require a claimed plan item")
-            claim = db.execute(
-                """SELECT 1 FROM work_items
-                   WHERE id = ? AND mission_id = ? AND owner = ? AND status = 'claimed'
-                     AND lease_until >= ?""",
-                (work_item_id, mission_id, agent_id, now()),
-            ).fetchone()
-            if not claim:
-                raise PermissionError("goal-driven SDLC repository actions require your live plan-item claim")
+        """Repository access is granted by the agent profile, not workflow or plan state."""
+        return None
 
     def create_interaction(self, mission_id: str, interaction_type: str, title: str,
                            details: str, target: str | None, requested_by: str,
@@ -5468,7 +6509,9 @@ class MissionStore:
         visible = visible_message(text) or (
             "Shared a document." if documents else "Added a document comment."
         )
-        payload = {"text": visible, "recipient": recipient, **(metadata or {})}
+        payload = {"text": visible, "recipient": recipient,
+                   "channelAudience": "conversation" if recipient else "activity",
+                   **(metadata or {})}
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             event = self._append(db, "agent.message.created", agent_id, mission_id, payload)

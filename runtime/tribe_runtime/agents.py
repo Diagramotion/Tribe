@@ -10,10 +10,21 @@ from pathlib import Path
 from typing import Protocol
 
 from .credentials import provider_for_model
+from .capabilities import (
+    CAPABILITY_BY_ID, LEGACY_CAPABILITY_GRANTS, TOOL_NAMES,
+    capabilities_for_grants, tools_for_capabilities,
+)
 from .store import MissionStore
 
 
-@dataclass(frozen=True)
+TOOL_PERMISSION_NAMES = (
+    (TOOL_NAMES - {"update_state"}) | frozenset(f"capability:{name}" for name in CAPABILITY_BY_ID)
+    | frozenset(LEGACY_CAPABILITY_GRANTS)
+)
+RETIRED_TOOL_GRANTS = frozenset({"complete_discovery", "finalize_plan", "record_review_checkpoint"})
+
+
+@dataclass(frozen=True, init=False)
 class AgentDefinition:
     id: str
     name: str
@@ -23,10 +34,34 @@ class AgentDefinition:
     model: str = ""
     repository_access: str = "workspace_write"
     effort: str = ""
+    capabilities: tuple[str, ...] = ()
+
+    def __init__(self, id: str, name: str, role: str, instructions: str, source: str,
+                 model: str = "", repository_access: str = "workspace_write",
+                 effort: str = "", capabilities: tuple[str, ...] = (), *,
+                 tool_permissions: tuple[str, ...] | None = None):
+        # Read legacy profile integrations during migration; persist and expose only bundles.
+        grants = tuple(capabilities) + tuple(tool_permissions or ())
+        object.__setattr__(self, "id", id)
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "role", role)
+        object.__setattr__(self, "instructions", instructions)
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "model", model)
+        object.__setattr__(self, "repository_access", repository_access)
+        object.__setattr__(self, "effort", effort)
+        object.__setattr__(self, "capabilities", grants)
+        self.__post_init__()
+
+    @property
+    def tool_permissions(self) -> tuple[str, ...]:
+        """Resolved grants retained for runtime integrations and legacy API clients."""
+        return tools_for_capabilities(self.capabilities)
 
     def __post_init__(self) -> None:
         if self.repository_access not in {"read_only", "workspace_write"}:
             raise ValueError("repository_access must be read_only or workspace_write")
+        object.__setattr__(self, "capabilities", capabilities_for_grants(self.capabilities))
 
 
 @dataclass(frozen=True)
@@ -66,7 +101,14 @@ def discover_agents(directory: Path) -> list[AgentDefinition]:
             if key in fields:
                 raise ValueError(f"{path}: duplicate front matter field {key!r}")
             scalar = value.strip()
-            if scalar.startswith('"'):
+            if scalar.startswith("["):
+                try:
+                    scalar = json.loads(scalar)
+                except json.JSONDecodeError as error:
+                    raise ValueError(f"{path}: invalid JSON list for {key!r}") from error
+                if not isinstance(scalar, list) or any(not isinstance(value, str) for value in scalar):
+                    raise ValueError(f"{path}: {key!r} must be a list of strings")
+            elif scalar.startswith('"'):
                 try:
                     scalar = json.loads(scalar)
                 except json.JSONDecodeError as error:
@@ -106,10 +148,24 @@ def discover_agents(directory: Path) -> list[AgentDefinition]:
         repository_access = fields.get("repository_access", "workspace_write").strip()
         if repository_access not in {"read_only", "workspace_write"}:
             raise ValueError(f"{path}: repository_access must be read_only or workspace_write")
+        capabilities = fields.get("capabilities")
+        if capabilities is None:
+            capabilities = fields.get("tool_permissions", [])
+        if capabilities is not None:
+            unknown_tools = {
+                tool for tool in capabilities
+                if tool not in TOOL_PERMISSION_NAMES and tool not in CAPABILITY_BY_ID
+                and tool not in RETIRED_TOOL_GRANTS and not re.fullmatch(
+                    r"(?:mcp:[a-z0-9_-]+\.[a-zA-Z0-9_.-]+|mcp-service:[a-z0-9_-]+)", tool,
+                )
+            }
+            if unknown_tools:
+                raise ValueError(f"{path}: unknown capability or legacy tool grant(s): {', '.join(sorted(unknown_tools))}")
+            capabilities = capabilities_for_grants(tuple(capabilities))
         identifiers.add(identifier)
         agents.append(
             AgentDefinition(identifier, fields["name"], fields["role"], instructions, path.name,
-                            model, repository_access, effort)
+                            model, repository_access, effort, capabilities)
         )
     return agents
 
@@ -131,7 +187,9 @@ def load_agent_definitions(*directories: Path) -> list[AgentDefinition]:
 def _render_agent_definition(agent_id: str, name: str, role: str,
                              instructions: str, model: str = "",
                              repository_access: str = "workspace_write",
-                             effort: str = "") -> tuple[str, str, str, str, str, str, str]:
+                             effort: str = "",
+                             tool_permissions: list[str] | tuple[str, ...] | None = None
+                             ) -> tuple[str, str, str, str, str, str, str, tuple[str, ...] | None]:
     values = {"id": agent_id.strip(), "name": name.strip(), "role": role.strip()}
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,49}", values["id"]):
         raise ValueError(
@@ -158,6 +216,22 @@ def _render_agent_definition(agent_id: str, name: str, role: str,
     effort = effort.strip().lower()
     if effort and effort not in {"minimal", "low", "medium", "high", "xhigh", "max"}:
         raise ValueError("effort must be minimal, low, medium, high, xhigh or max")
+    if tool_permissions is None:
+        tool_permissions = ()
+    if not isinstance(tool_permissions, (list, tuple)) or any(
+        not isinstance(item, str) for item in tool_permissions
+    ):
+        raise ValueError("tool_permissions must be a list of tool names")
+    unknown_tools = {
+        tool for tool in tool_permissions
+        if tool not in TOOL_PERMISSION_NAMES and tool not in CAPABILITY_BY_ID
+        and tool not in RETIRED_TOOL_GRANTS and not re.fullmatch(
+            r"(?:mcp:[a-z0-9_-]+\.[a-zA-Z0-9_.-]+|mcp-service:[a-z0-9_-]+)", tool,
+        )
+    }
+    if unknown_tools:
+        raise ValueError(f"unknown capability or legacy tool grant(s): {', '.join(sorted(unknown_tools))}")
+    capabilities = capabilities_for_grants(tuple(tool_permissions))
     content = (
         "---\n"
         f"id: {values['id']}\n"
@@ -169,17 +243,21 @@ def _render_agent_definition(agent_id: str, name: str, role: str,
         content += f"model: {json.dumps(model, ensure_ascii=False)}\n"
     if effort:
         content += f"effort: {effort}\n"
+    if capabilities is not None:
+        content += f"capabilities: {json.dumps(list(capabilities), ensure_ascii=False)}\n"
     content += f"---\n\n{instructions}\n"
-    return values["id"], values["name"], values["role"], model, repository_access, effort, content
+    return (values["id"], values["name"], values["role"], model, repository_access,
+            effort, content, capabilities)
 
 
 def write_agent_definition(directory: Path, agent_id: str, name: str, role: str,
                            instructions: str, model: str = "",
                            repository_access: str = "workspace_write",
-                           effort: str = "") -> AgentDefinition:
+                           effort: str = "",
+                           tool_permissions: list[str] | tuple[str, ...] | None = None) -> AgentDefinition:
     """Persist one user-owned role as a Markdown file without overwriting existing roles."""
-    identifier, name, role, model, repository_access, content = _render_agent_definition(
-        agent_id, name, role, instructions, model, repository_access, effort
+    identifier, name, role, model, repository_access, effort, content, capabilities = _render_agent_definition(
+        agent_id, name, role, instructions, model, repository_access, effort, tool_permissions
     )
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{identifier}.md"
@@ -199,10 +277,11 @@ def write_agent_definition(directory: Path, agent_id: str, name: str, role: str,
 def update_agent_definition(directory: Path, agent_id: str, name: str, role: str,
                             instructions: str, model: str = "",
                             repository_access: str = "workspace_write",
-                            effort: str = "") -> AgentDefinition:
+                            effort: str = "",
+                            tool_permissions: list[str] | tuple[str, ...] | None = None) -> AgentDefinition:
     """Atomically replace the Markdown file for an existing user-owned role."""
-    identifier, name, role, model, repository_access, content = _render_agent_definition(
-        agent_id, name, role, instructions, model, repository_access, effort
+    identifier, name, role, model, repository_access, effort, content, capabilities = _render_agent_definition(
+        agent_id, name, role, instructions, model, repository_access, effort, tool_permissions
     )
     if identifier != agent_id:
         raise ValueError("agent id cannot be changed")
@@ -216,7 +295,8 @@ def update_agent_definition(directory: Path, agent_id: str, name: str, role: str
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
-    return AgentDefinition(identifier, name, role, instructions.strip(), "user", model, repository_access, effort)
+    return AgentDefinition(identifier, name, role, instructions.strip(), "user", model, repository_access,
+                           effort, capabilities)
 
 
 def archive_agent_definition(directory: Path, agent_id: str) -> Path:

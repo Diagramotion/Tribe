@@ -150,6 +150,9 @@ export const runtime = {
     method: "POST", body: JSON.stringify({}),
   }),
   getSettings: () => request("/api/settings"),
+  setContextPruning: (enabled) => request("/api/settings/context-pruning", {
+    method: "PUT", body: JSON.stringify({ enabled }),
+  }),
   getModelCatalog: () => request("/api/models"),
   getProviders: () => request("/api/providers"),
   setProviderEnabled: (provider, enabled) => request("/api/providers/enabled", {
@@ -343,6 +346,7 @@ export const runtime = {
     method: "PUT", body: JSON.stringify({ executables }),
   }),
   listCommands: (missionId) => request(`/api/commands?mission=${encodeURIComponent(missionId)}`),
+  listAgentRequests: (missionId) => request(`/api/agent-requests?mission=${encodeURIComponent(missionId)}`),
   startCommand: (missionId, command) => request("/api/commands", {
     method: "POST", body: JSON.stringify({ missionId, command }),
   }),

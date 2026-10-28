@@ -34,6 +34,7 @@ _path_locks: dict[Path, _PathLockEntry] = {}
 _IGNORED = {".git", ".tribe", ".venv", "venv", "node_modules", "dist", "build", "target"}
 _TEST_COMMANDS = {
     ("pytest",), ("python", "-m", "pytest"), ("python3", "-m", "pytest"),
+    ("node", "--test"),
     ("npm", "test"), ("npm", "run", "test"), ("pnpm", "test"), ("pnpm", "run", "test"),
     ("yarn", "test"), ("cargo", "test"), ("go", "test"), ("dotnet", "test"),
 }
@@ -479,7 +480,10 @@ class WorkspaceTools:
                             return results
         return results
 
-    def write_file(self, relative_path: str, content: str) -> dict[str, str]:
+    def write_file(
+        self, relative_path: str, content: str, *, tool_call_id: str | None = None,
+        trigger_sequence: int | None = None,
+    ) -> dict[str, str]:
         self._require_work_claim()
         path = self.resolve(relative_path)
         if len(content.encode("utf-8")) > 1_000_000:
@@ -492,8 +496,11 @@ class WorkspaceTools:
             if previous == encoded:
                 return {"path": path.relative_to(self.root).as_posix(), "change": "unchanged"}
             relative = path.relative_to(self.root).as_posix()
+            change = "created" if not previous else "updated"
             self.store.append("repo.file.write.started", self.agent_id, self.mission_id,
-                              {"path": relative, "sha256": hashlib.sha256(encoded).hexdigest(),
+                              {"path": relative, "change": change,
+                               "sha256": hashlib.sha256(encoded).hexdigest(),
+                               "toolCallId": tool_call_id, "triggerSequence": trigger_sequence,
                                "workItemId": self.work_item_id})
             temporary_name = None
             try:
@@ -506,23 +513,14 @@ class WorkspaceTools:
             finally:
                 if temporary_name and Path(temporary_name).exists():
                     Path(temporary_name).unlink()
-            change = "created" if not previous else "updated"
             self.store.append("repo.file.changed", self.agent_id, self.mission_id, {
                 "path": relative, "change": change,
                 "previousSha256": hashlib.sha256(previous).hexdigest() if previous else None,
                 "sha256": hashlib.sha256(encoded).hexdigest(),
+                "toolCallId": tool_call_id,
+                "triggerSequence": trigger_sequence,
                 "workItemId": self.work_item_id,
             })
-            try:
-                previous_text = previous.decode("utf-8") if previous else ""
-                current_text = encoded.decode("utf-8")
-                diff = "".join(difflib.unified_diff(previous_text.splitlines(keepends=True),
-                    current_text.splitlines(keepends=True), fromfile=f"a/{relative}", tofile=f"b/{relative}"))
-                if diff:
-                    self.store.add_artifact(self.mission_id, f"{Path(relative).name}.diff", "text/x-diff",
-                                            self.agent_id, diff.encode("utf-8"))
-            except UnicodeDecodeError:
-                pass
             return {"path": relative, "change": change}
 
     def delete_file(self, relative_path: str, approval_id: str) -> str:
@@ -588,6 +586,7 @@ class WorkspaceTools:
     def run_tests(
         self, argv: list[str], timeout: int = 120,
         is_cancelled: Callable[[], bool] | None = None,
+        tool_call_id: str | None = None,
     ) -> dict[str, object]:
         self._require_work_claim()
         if not argv or len(argv) > 16 or any(not isinstance(arg, str) or len(arg) > 500 for arg in argv):
@@ -597,7 +596,8 @@ class WorkspaceTools:
             raise PermissionError("command is outside the approved test-command set")
         run_id = str(uuid.uuid4())
         self.store.append("repo.test_run.started", self.agent_id, self.mission_id,
-                          {"runId": run_id, "argv": argv, "workItemId": self.work_item_id})
+                          {"runId": run_id, "argv": argv, "workItemId": self.work_item_id,
+                           "toolCallId": tool_call_id})
         environment = {
             name: value for name, value in os.environ.items()
             if not set(name.upper().replace("-", "_").split("_")).intersection(_SENSITIVE_ENV_COMPONENTS)
@@ -612,10 +612,8 @@ class WorkspaceTools:
             "runId": run_id, "argv": argv, "exitCode": completed["exit_code"],
             "stdout": completed["stdout"], "stderr": completed["stderr"],
             "cancelled": completed["cancelled"], "timedOut": completed["timed_out"],
-            "workItemId": self.work_item_id,
+            "workItemId": self.work_item_id, "toolCallId": tool_call_id,
         }
-        self.store.append("repo.test_run.completed", self.agent_id, self.mission_id, result)
-        report = f"Command: {' '.join(argv)}\nExit code: {result['exitCode']}\n\nSTDOUT\n{result['stdout']}\n\nSTDERR\n{result['stderr']}"
-        self.store.add_artifact(self.mission_id, f"test-results-{hashlib.sha256(report.encode()).hexdigest()[:10]}.txt",
-                                "text/plain", self.agent_id, report.encode("utf-8"))
+        completion_event = self.store.append("repo.test_run.completed", self.agent_id, self.mission_id, result)
+        result["verificationEventId"] = completion_event["id"]
         return result

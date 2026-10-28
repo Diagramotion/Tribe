@@ -39,6 +39,11 @@ def _assert_harness_workspace_is_current(tool_name: str, run_root: Path, current
         )
 
 
+def _compaction_keep_tokens(context_window: int | None) -> int:
+    """Retain a recent working set without overwhelming small model windows."""
+    return max(1_000, int(context_window * 0.2)) if context_window else 32_000
+
+
 def build_capabilities(
     workspace: WorkspaceTools, skills: SkillCatalog, trigger_sequence: int = 0,
     approved_tool_call_ids: set[str] | None = None,
@@ -48,6 +53,11 @@ def build_capabilities(
     web_access: dict[str, object] | None = None,
     repository_access: str = "workspace_write",
     selected_skill_ids: list[str] | None = None,
+    model_context_window: int | None = None,
+    model_max_output_tokens: int | None = None,
+    tool_permissions: tuple[str, ...] | None = None,
+    after_model_response=None,
+    context_pruning_enabled: bool = False,
 ) -> list[object]:
     """Compose bounded repository tools and portable skills for a run.
 
@@ -68,8 +78,9 @@ def build_capabilities(
         )
         from pydantic_ai.workspaces import LocalWorkspaceBackend
         from pydantic_ai_harness import FileSystem, Shell, Skills
-        from pydantic_ai_harness.compaction import SlidingWindowCompaction
+        from pydantic_ai_harness.compaction import SummarizingCompaction
         from pydantic_ai_harness.step_persistence import SqliteStepStore, StepPersistence
+        from .context_pruning import ContextPruning
     except ImportError as error:
         raise RuntimeError(
             "Install tribe-runtime[ai] to enable Pydantic AI Harness capabilities: "
@@ -248,15 +259,49 @@ def build_capabilities(
                 await asyncio.sleep(0.25)
         return requests.build_results(approvals=decisions)
 
-    capabilities: list[object] = [SlidingWindowCompaction(max_messages=80, keep_messages=60)]
+    context_window = (
+        model_context_window
+        if isinstance(model_context_window, int) and not isinstance(model_context_window, bool)
+        and model_context_window > 1
+        else None
+    )
+    # Summarize older turns before the selected model's context is exhausted, while
+    # retaining a recent working set. The summary call inherits the active model and
+    # is included in the run's usage accounting.
+    keep_tokens = _compaction_keep_tokens(context_window)
+    summary_model_settings = (
+        {"max_tokens": model_max_output_tokens}
+        if isinstance(model_max_output_tokens, int) and not isinstance(model_max_output_tokens, bool)
+        and model_max_output_tokens > 0
+        else None
+    )
+    capabilities: list[object] = [SummarizingCompaction(
+        model_settings=summary_model_settings,
+        max_fraction=0.75,
+        context_window=context_window,
+        fallback_context_window=200_000,
+        keep_tokens=keep_tokens,
+        keep_messages=20,
+        keep_user_messages=True,
+        incremental=True,
+        receipts=True,
+    )]
     native_local_workspace = _supports_native_local_workspace()
     if native_local_workspace:
         # Pydantic AI resolves the run workspace before model execution; unlike its
         # tools, this capability must be eager.
         capabilities.insert(0, LocalWorkspace(root))
     if repository_access != "read_only" and native_local_workspace:
-        capabilities.extend([
-            FileSystem(
+        granted_tools = set(tool_permissions or ())
+        filesystem_names = {
+            "read_file", "write_file", "edit_file", "list_directory", "search_files",
+            "find_files", "create_directory", "file_info",
+        }
+        shell_names = {"run_command", "start_command", "check_command", "stop_command"}
+        filesystem_tools = sorted(filesystem_names & granted_tools)
+        shell_tools = sorted(shell_names & granted_tools)
+        if filesystem_tools:
+            capabilities.append(FileSystem(
                 root_dir=root,
                 denied_patterns=[
                     ".git", "**/.git", "**/.git/**", ".tribe", "**/.tribe", "**/.tribe/**",
@@ -265,14 +310,16 @@ def build_capabilities(
                 ],
                 content_hashes=True,
                 id="tribe_filesystem",
+                tools=filesystem_tools,
                 defer_loading=True,
-            ),
+            ))
+        if shell_tools:
             # This is an accident-prevention allowlist, not a security boundary. High-risk
             # operations remain exposed through Tribe's exact-action approval tools.
-            Shell(allowed_commands=["pytest", "npm", "pnpm", "yarn", "cargo", "go", "dotnet"],
-                  id="tribe_shell",
-                  defer_loading=True),
-        ])
+            capabilities.append(Shell(
+                allowed_commands=["pytest", "node", "npm", "pnpm", "yarn", "cargo", "go", "dotnet"],
+                id="tribe_shell", tools=shell_tools, defer_loading=True,
+            ))
     capabilities.extend([
         StepPersistence(
             # Harness owns its run/checkpoint schema; keep it in a sibling database so
@@ -286,16 +333,19 @@ def build_capabilities(
             },
             capture_frontier=True,
         ),
-        Hooks(before_tool_execute=require_action_approval),
+        Hooks(before_model_request=ContextPruning().before_model_request if context_pruning_enabled else None,
+              before_tool_execute=require_action_approval,
+              after_model_request=after_model_response),
         HandleDeferredToolCalls(resolve_action_approvals),
     ])
 
     native_skill_roots = skills.native_skill_roots
     native_skill_names = getattr(skills, "native_skill_names", frozenset())
     selected_ids = set(selected_skill_ids or [])
+    list_skills = getattr(skills, "list", None)
     selected_names = {
-        item["name"] for item in skills.list()
-        if item["id"] in selected_ids
+        item["name"] for item in (list_skills() if callable(list_skills) else [])
+        if item.get("id") in selected_ids
     }
     selected_native_names = native_skill_names.intersection(selected_names)
     if native_local_workspace and native_skill_roots and selected_native_names:
@@ -318,12 +368,13 @@ def build_capabilities(
                 )
             )
 
-    if web_access and web_access.get("enabled") is True:
+    granted_tools = set(tool_permissions or ())
+    if web_access and web_access.get("enabled") is True and "duckduckgo_search" in granted_tools:
         capabilities.append(WebSearch(
             native=False, local="duckduckgo", id="tribe_web_search", defer_loading=True,
         ))
         allowed_domains = web_access.get("allowedDomains")
-        if isinstance(allowed_domains, list) and allowed_domains:
+        if isinstance(allowed_domains, list) and allowed_domains and "web_fetch" in granted_tools:
             capabilities.append(WebFetch(
                 native=False, local=True,
                 allowed_domains=[domain for domain in allowed_domains if isinstance(domain, str)],

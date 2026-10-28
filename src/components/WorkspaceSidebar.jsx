@@ -21,7 +21,7 @@ export function IconButton({ label, className = "", children, ...props }) {
   );
 }
 
-export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onSelectMission, onCreateProject, onCreateMission, onOpenProjectSettings, onArchiveMission, onRestoreMission, onDeleteMission, onDeleteProject, project, mission, projects, gitEnabled = false, gitChangeCount = 0 }) {
+export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onSelectMission, onCreateProject, onCreateMission, onOpenProjectSettings, onArchiveMission, onRestoreMission, onDeleteMission, onDeleteProject, project, mission, projects }) {
   const [expandedProjects, setExpandedProjects] = useState(() => new Set(project?.id ? [project.id] : []));
   const [expandedArchived, setExpandedArchived] = useState(new Set());
   const [projectQuery, setProjectQuery] = useState("");
@@ -30,7 +30,7 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
     if (openMenu?.key === key) { setOpenMenu(null); return; }
     const rect = event.currentTarget.getBoundingClientRect();
     const width = 220;
-    setOpenMenu({ key, left: Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8)), top: Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - 190)) });
+    setOpenMenu({ key, trigger: event.currentTarget, left: Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8)), top: Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - 190)) });
   }
   useEffect(() => {
     if (project?.id) setExpandedProjects((current) => new Set(current).add(project.id));
@@ -52,10 +52,6 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
       window.removeEventListener("scroll", dismissMenu, true);
     };
   }, []);
-  const projectItems = [
-    { label: "Repository", icon: FolderSimple, tab: "Code" },
-    ...(gitEnabled ? [{ label: "Git changes", icon: GitBranch, tab: "Git", count: gitChangeCount }] : []),
-  ];
   const workspaceItems = [
     { label: "Skills", icon: Sparkle, tab: "Skills" },
     { label: "Workflows", icon: GitBranch, tab: "Recipes" },
@@ -76,30 +72,30 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
         <div className="project-explorer-list">
           {visibleProjects.map((item) => <div className="explorer-project" key={item.id}>
             <div className={`explorer-project-row ${project.id === item.id ? "explorer-project-row--selected" : ""}`}>
+              <button aria-label={`${expandedProjects.has(item.id) ? "Collapse" : "Expand"} ${item.name}`} aria-expanded={expandedProjects.has(item.id)} className="explorer-disclosure" onClick={() => setExpandedProjects((current) => { const next = new Set(current); next.has(item.id) ? next.delete(item.id) : next.add(item.id); return next; })} type="button">{expandedProjects.has(item.id) ? <FolderOpen size={15} /> : <FolderSimple size={15} />}</button>
               <button aria-current={project.id === item.id ? "page" : undefined} className={`explorer-project-button ${project.id === item.id ? "explorer-project-button--selected" : ""}`} onClick={() => onSelectProject(item)} title={item.repository} type="button"><span>{item.name}</span><small>{item.missions?.length ?? 0}</small></button>
               <div className="explorer-menu-wrap">
                 <button aria-expanded={openMenu?.key === `project-${item.id}`} aria-label={`More actions for ${item.name}`} className="explorer-menu-trigger" onClick={(event) => toggleMenu(`project-${item.id}`, event)} title={`More actions for ${item.name}`} type="button"><DotsThree size={17} weight="bold" /></button>
                 {openMenu?.key === `project-${item.id}` && createPortal(<div className="explorer-context-menu" role="menu" style={{ left: openMenu.left, top: openMenu.top }}>
                   <button onClick={() => { setOpenMenu(null); onCreateMission(item); }} role="menuitem" type="button"><ChatCircleDots size={15} />New chat</button>
                   <button onClick={() => { setOpenMenu(null); onSelectProject(item); onNavigate("Mission"); }} role="menuitem" type="button"><FolderSimple size={15} />Open project</button>
-                  <button onClick={() => { setOpenMenu(null); onOpenProjectSettings?.(item); }} role="menuitem" type="button"><Gear size={15} />Project settings</button>
-                  {item.repository && <button onClick={() => { setOpenMenu(null); onSelectProject(item); onNavigate("Code"); }} role="menuitem" type="button"><GitBranch size={15} />Open repository</button>}
+                  <button onClick={() => { setOpenMenu(null); onOpenProjectSettings?.(item, openMenu?.trigger); }} role="menuitem" type="button"><Gear size={15} />Project settings</button>
+                  {item.repository && <button onClick={() => { setOpenMenu(null); onSelectProject(item); onNavigate("Code"); }} role="menuitem" type="button"><FolderSimple size={15} />Open repository</button>}
                   <div className="explorer-context-menu-divider" />
                   <button className="explorer-context-menu-danger" onClick={() => { setOpenMenu(null); onDeleteProject(item.id); }} role="menuitem" type="button"><Trash size={15} />Delete project</button>
                 </div>, document.body)}
               </div>
-              <button aria-label={`${expandedProjects.has(item.id) ? "Collapse" : "Expand"} ${item.name}`} aria-expanded={expandedProjects.has(item.id)} className="explorer-disclosure" onClick={() => setExpandedProjects((current) => { const next = new Set(current); next.has(item.id) ? next.delete(item.id) : next.add(item.id); return next; })} type="button">{expandedProjects.has(item.id) ? <FolderOpen size={15} /> : <FolderSimple size={15} />}</button>
             </div>
             {expandedProjects.has(item.id) && <div className="explorer-missions">
               {(item.missions ?? []).filter((session) => !session.archived_at).map((session) => {
                 const statusLabel = missionStatusLabel(session.status);
                 const displayTitle = compactChatTitle(session.title);
                 return <div className="explorer-chat-row" key={session.id}>
-                <button aria-current={mission?.id === session.id ? "page" : undefined} aria-label={`Open chat: ${displayTitle} · ${statusLabel}`} className={`explorer-mission ${mission?.id === session.id ? "explorer-mission--selected" : ""}`} onClick={() => onSelectMission(session.id)} title={`${session.title} · ${statusLabel}`} type="button"><i aria-hidden="true" className={`explorer-mission-dot explorer-mission-dot--${session.status}`} /><span>{displayTitle}</span></button>
+                <button aria-current={mission?.id === session.id ? "page" : undefined} aria-label={`Open chat: ${displayTitle} · ${statusLabel}`} className={`explorer-mission ${mission?.id === session.id ? "explorer-mission--selected" : ""}`} onClick={() => onSelectMission(session.id, item)} title={`${session.title} · ${statusLabel}`} type="button"><i aria-hidden="true" className={`explorer-mission-dot explorer-mission-dot--${session.status}`} /><span>{displayTitle}</span></button>
                 <div className="explorer-menu-wrap">
                   <button aria-expanded={openMenu?.key === `chat-${session.id}`} aria-label={`More actions for ${displayTitle}`} className="explorer-menu-trigger" onClick={(event) => toggleMenu(`chat-${session.id}`, event)} title={`More actions for ${displayTitle}`} type="button"><DotsThree size={17} weight="bold" /></button>
                   {openMenu?.key === `chat-${session.id}` && createPortal(<div className="explorer-context-menu" role="menu" style={{ left: openMenu.left, top: openMenu.top }}>
-                    <button onClick={() => { setOpenMenu(null); onSelectMission(session.id); }} role="menuitem" type="button"><ChatCircleDots size={15} />Open chat</button>
+                    <button onClick={() => { setOpenMenu(null); onSelectMission(session.id, item); }} role="menuitem" type="button"><ChatCircleDots size={15} />Open chat</button>
                     <button onClick={() => { setOpenMenu(null); onCreateMission(item); }} role="menuitem" type="button"><Plus size={15} />New chat in {item.name}</button>
                     <button onClick={() => { setOpenMenu(null); onArchiveMission(session.id); }} role="menuitem" type="button"><ClockCounterClockwise size={15} />{session.status === "active" ? "Pause and archive chat" : "Archive chat"}</button>
                     <button className="explorer-context-menu-danger" onClick={() => { setOpenMenu(null); onDeleteMission(session.id); }} role="menuitem" type="button"><Trash size={15} />Delete permanently</button>
@@ -110,7 +106,7 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
               {(item.missions ?? []).some((session) => session.archived_at) && <>
                 <button aria-expanded={expandedArchived.has(item.id)} className="explorer-archived-toggle" onClick={() => setExpandedArchived((current) => { const next = new Set(current); next.has(item.id) ? next.delete(item.id) : next.add(item.id); return next; })} type="button">{expandedArchived.has(item.id) ? <CaretDown size={13} /> : <CaretRight size={13} />} Archived chats <small>{item.missions.filter((session) => session.archived_at).length}</small></button>
                 {expandedArchived.has(item.id) && (item.missions ?? []).filter((session) => session.archived_at).map((session) => <div className="explorer-chat-row" key={session.id}>
-                  <button aria-current={mission?.id === session.id ? "page" : undefined} aria-label={`Open archived chat: ${compactChatTitle(session.title)}`} className={`explorer-mission explorer-mission--archived ${mission?.id === session.id ? "explorer-mission--selected" : ""}`} onClick={() => onSelectMission(session.id)} title={`${session.title} · Archived`} type="button"><i className="explorer-mission-dot explorer-mission-dot--archived" /><span>{compactChatTitle(session.title)}</span></button>
+                  <button aria-current={mission?.id === session.id ? "page" : undefined} aria-label={`Open archived chat: ${compactChatTitle(session.title)}`} className={`explorer-mission explorer-mission--archived ${mission?.id === session.id ? "explorer-mission--selected" : ""}`} onClick={() => onSelectMission(session.id, item)} title={`${session.title} · Archived`} type="button"><i className="explorer-mission-dot explorer-mission-dot--archived" /><span>{compactChatTitle(session.title)}</span></button>
                   <div className="explorer-menu-wrap"><button aria-expanded={openMenu?.key === `chat-${session.id}`} aria-label={`More actions for ${session.title}`} className="explorer-menu-trigger" onClick={(event) => toggleMenu(`chat-${session.id}`, event)} title={`More actions for ${session.title}`} type="button"><DotsThree size={17} weight="bold" /></button>
                     {openMenu?.key === `chat-${session.id}` && createPortal(<div className="explorer-context-menu" role="menu" style={{ left: openMenu.left, top: openMenu.top }}>
                       <button onClick={() => { setOpenMenu(null); onCreateMission(item); }} role="menuitem" type="button"><Plus size={15} />New chat in {item.name}</button>
@@ -122,7 +118,7 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
               </>}
             </div>}
           </div>)}
-          {projects.length === 0 && <div className="explorer-empty"><strong>No projects yet</strong><span>Add a Git repository to create a project and start a chat.</span><button className="button button--quiet" onClick={onCreateProject} type="button"><Plus size={13} /> Add project</button></div>}
+          {projects.length === 0 && <div className="explorer-empty"><strong>No projects yet</strong><span>Add a Git repository to create a project and start a chat.</span></div>}
           {projects.length > 0 && visibleProjects.length === 0 && <p className="explorer-empty">No projects match “{projectQuery}”.</p>}
         </div>
       </section>}
@@ -131,23 +127,6 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
         {collapsed && <div aria-label="Quick actions" className="sidebar-nav-group sidebar-nav-group--quick" role="group">
           <button aria-label={project.id ? "New chat" : "Choose a project to start a chat"} className="nav-item" disabled={!project.id} onClick={() => onCreateMission(project)} title={project.id ? "New chat" : "Choose a project to start a chat"} type="button"><ChatCircleDots size={19} /></button>
         </div>}
-        <div aria-label="Project" className="sidebar-nav-group" role="group">
-          {!collapsed && <span className="sidebar-section-label sidebar-nav-heading">Project</span>}
-          {projectItems.map(({ label, icon: Icon, tab, count = 0 }) => (
-            <button
-              aria-label={tab === "Git" && count > 0 ? `${label} · ${count} changed ${count === 1 ? "file" : "files"}` : label}
-              className={`nav-item ${activeTab === tab ? "nav-item--selected" : ""}`}
-              key={label}
-              onClick={() => onNavigate(tab)}
-              title={collapsed ? label : undefined}
-              type="button"
-            >
-              <Icon size={19} weight={activeTab === tab ? "fill" : "regular"} />
-              {!collapsed && <span>{label}</span>}
-              {!collapsed && count > 0 && <small aria-hidden="true" className="nav-item-count">{count > 99 ? "99+" : count}</small>}
-            </button>
-          ))}
-        </div>
         <div aria-label="Workspace" className="sidebar-nav-group sidebar-nav-group--workspace" role="group">
           {!collapsed && <span className="sidebar-section-label sidebar-nav-heading">Workspace</span>}
           {workspaceItems.map(({ label, icon: Icon, tab }) => (

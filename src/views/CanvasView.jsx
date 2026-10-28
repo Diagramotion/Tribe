@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
+import { ArrowLeft, ChatCircleDots, DownloadSimple } from "@phosphor-icons/react";
 import { canvasFilename, downloadCanvasDocument, downloadCanvasSvg, renderCanvasDiagramSvg } from "../domain/canvas-export.js";
 import { applySelectedHunks, reviewDiff } from "../domain/canvas-diff.js";
 import { selectedCanvasText } from "../domain/canvas-selection.js";
 import { runtime } from "../api/runtime.js";
 import { DiagramPreview } from "../components/DiagramPreview.jsx";
+import { IconButton } from "../components/WorkspaceSidebar.jsx";
 import { MarkdownContent } from "../components/MarkdownContent.jsx";
 
 function CanvasPreview({ document, onTextSelection }) {
@@ -359,7 +361,7 @@ export function CanvasView({ document: summary, refreshKey = 0, onBack, backLabe
     }
   }
 
-  if (!detail || !draft) return <section className="tab-panel detail-view canvas-view"><button className="button button--quiet" onClick={onBack} type="button">{backLabel}</button>{error ? <p className="canvas-error">{error}</p> : <div className="column-empty">Loading document…</div>}</section>;
+  if (!detail || !draft) return <section className="tab-panel detail-view canvas-view"><IconButton label={backLabel} onClick={onBack}><ArrowLeft size={16} /></IconButton>{error ? <p className="canvas-error">{error}</p> : <div className="column-empty">Loading document…</div>}</section>;
   const historical = viewRevision !== null;
   const shown = historical ? historyContent : draft;
   const pending = detail.proposals.filter((proposal) => proposal.status === "pending");
@@ -369,10 +371,10 @@ export function CanvasView({ document: summary, refreshKey = 0, onBack, backLabe
     draft: !historical && dirtyRef.current,
   });
   return <section className="tab-panel detail-view canvas-view">
-    <div className="canvas-topbar"><button className="button button--quiet" onClick={onBack} type="button">{backLabel}</button><span>{detail.kind} · Revision {viewRevision ?? detail.revision}</span>
-      <button className="button button--quiet" disabled={!onDiscuss} onClick={discussDocument} type="button">Discuss in chat</button>
-      <button className="button button--quiet" onClick={() => downloadCanvasDocument(exportDocument, exportFilename)} type="button">Download {dirtyRef.current && !historical ? "draft" : "document"}</button>
-      {exportDocument.kind === "diagram" && <button className="button button--quiet" disabled={svgExporting} onClick={() => void exportDiagramSvg(exportDocument, canvasFilename(exportDocument, { revision: historical ? viewRevision : detail.revision, draft: !historical && dirtyRef.current, format: "svg" }))} type="button">{svgExporting ? "Preparing SVG…" : "Download SVG"}</button>}
+    <div className="canvas-topbar"><IconButton label={backLabel} onClick={onBack}><ArrowLeft size={16} /></IconButton><span>{detail.kind} · Revision {viewRevision ?? detail.revision}</span>
+      <IconButton disabled={!onDiscuss} label="Discuss in chat" onClick={discussDocument}><ChatCircleDots size={16} /></IconButton>
+      <IconButton label={`Download ${dirtyRef.current && !historical ? "draft" : "document"}`} onClick={() => downloadCanvasDocument(exportDocument, exportFilename)}><DownloadSimple size={16} /></IconButton>
+      {exportDocument.kind === "diagram" && <IconButton disabled={svgExporting} label={svgExporting ? "Preparing SVG" : "Download SVG"} onClick={() => void exportDiagramSvg(exportDocument, canvasFilename(exportDocument, { revision: historical ? viewRevision : detail.revision, draft: !historical && dirtyRef.current, format: "svg" }))}><DownloadSimple size={16} /></IconButton>}
       <label>History <select aria-label="Document revision history" onChange={(event) => void loadVersion(Number(event.target.value))} value={viewRevision ?? detail.revision}>{detail.versions.map((version) => <option key={version.revision} value={version.revision}>Revision {version.revision} · {version.author}</option>)}</select></label>
       {historical ? <button className="button button--primary" disabled={saving} onClick={() => { setDraft(historyContent); dirtyRef.current = true; setViewRevision(null); setHistoryContent(null); }} type="button">Restore as new revision</button>
         : <button className="button button--primary" disabled={saving || !dirtyRef.current} onClick={() => void save()} type="button">{saving ? "Saving…" : "Save changes"}</button>}

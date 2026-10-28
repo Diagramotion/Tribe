@@ -8,6 +8,7 @@ import base64
 import binascii
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -29,12 +30,14 @@ from .agents import (
     update_agent_definition,
     write_agent_definition,
 )
+from .capabilities import capability_catalog
 from .commands import BackgroundCommandRunner
 from .computer_use import MAX_IMAGE_BYTES, ComputerObservationBroker
 from .credentials import get_api_key, provider_for_model, provider_supports_custom_url, save_api_key, validate_openai_base_url
 from .instance_lock import RuntimeInstanceLock
 from .mcp_registry import MCPRegistry
 from .providers import list_ollama_models, list_provider_models
+from .project_memory import accept_project_memory, list_project_memory, save_project_memory, set_project_memory_status
 from .recipes import get_recipe, list_recipes, save_recipe
 from .skills import SkillCatalog
 from .store import MissionStore, default_data_directory
@@ -53,6 +56,14 @@ if __name__ == "__main__":
     if restore_error:
         print(restore_error, flush=True)
 STORE = MissionStore(RUNTIME_DATA_DIRECTORY / "tribe.sqlite3")
+
+
+def _agent_payload(definition) -> dict:
+    """Expose reusable capability grants, never the expanded internal tool list."""
+    return {
+        **definition.__dict__,
+        "capabilities": list(definition.capabilities),
+    }
 
 
 def validate_agent_model_override(identifier: str, effort: str = "") -> None:
@@ -289,6 +300,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {
                 "agents": SUPERVISOR.status,
                 "agentDirectory": str(USER_AGENT_DIRECTORY),
+                "experimentalContextPruning": STORE.get_setting("experimental_context_pruning") == "true",
+                "contextPruningSummary": STORE.context_pruning_summary(),
             })
         if parsed.path == "/api/models":
             default_model = SUPERVISOR.status.get("model")
@@ -423,8 +436,13 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 return self._json(422, {"error": "repository_path_could_not_be_read"})
         if parsed.path == "/api/recipes":
-            return self._json(200, {"recipes": [recipe.snapshot() | {"source": recipe.source}
-                                                   for recipe in list_recipes(BUILTIN_RECIPE_DIRECTORY, USER_RECIPE_DIRECTORY)]})
+            try:
+                return self._json(200, {"recipes": [recipe.snapshot() | {"source": recipe.source}
+                                                       for recipe in list_recipes(BUILTIN_RECIPE_DIRECTORY, USER_RECIPE_DIRECTORY)]})
+            except ValueError as error:
+                return self._json(422, {"error": "workflow_definition_invalid", "detail": str(error)})
+            except OSError:
+                return self._json(422, {"error": "workflow_library_could_not_be_read"})
         if parsed.path == "/api/schedules":
             project_id = parse_qs(parsed.query).get("project", [""])[0]
             return self._json(200, {"schedules": STORE.schedules(project_id)})
@@ -485,6 +503,16 @@ class Handler(BaseHTTPRequestHandler):
             if not STORE.mission(mission_id):
                 return self._json(404, {"error": "mission_not_found"})
             return self._json(200, {"runs": COMMANDS.list(mission_id)})
+        if parsed.path == "/api/agent-requests":
+            query = parse_qs(parsed.query)
+            mission_id = query.get("mission", [""])[0]
+            if not STORE.mission(mission_id):
+                return self._json(404, {"error": "mission_not_found"})
+            try:
+                limit = int(query.get("limit", ["200"])[0])
+            except ValueError:
+                return self._json(422, {"error": "invalid_limit"})
+            return self._json(200, {"requests": STORE.agent_request_usage_for_mission(mission_id, limit)})
         if parsed.path == "/api/skills":
             query = parse_qs(parsed.query)
             mission_id = query.get("mission", [None])[0]
@@ -496,7 +524,7 @@ class Handler(BaseHTTPRequestHandler):
             if not project_id:
                 return self._json(422, {"error": "project_required"})
             return self._json(200, {
-                "knowledge": STORE.project_knowledge(project_id, include_archived=True),
+                "knowledge": list_project_memory(STORE, project_id, include_archived=True),
                 "proposals": STORE.knowledge_proposals(project_id, pending_only=False),
             })
         mcp_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/mcp", parsed.path)
@@ -529,9 +557,32 @@ class Handler(BaseHTTPRequestHandler):
                 None if keep_mission_empty else requested_mission,
                 select_default_mission=not keep_mission_empty,
             )
+            if data.get("project"):
+                data["knowledge"] = list_project_memory(
+                    STORE, data["project"]["id"], include_archived=True,
+                )
+                data["knowledgeProposals"] = STORE.knowledge_proposals(
+                    data["project"]["id"], pending_only=True,
+                )
+            else:
+                data["knowledge"] = []
+                data["knowledgeProposals"] = []
             with AGENT_REGISTRY_LOCK:
                 available_agents = list(AGENT_DEFINITIONS)
-                data["agents"] = [agent.__dict__ for agent in available_agents]
+                data["agents"] = [_agent_payload(agent) for agent in available_agents]
+            extra_capabilities = {
+                grant for agent in available_agents for grant in agent.capabilities
+            }
+            selected_project = data.get("project")
+            if selected_project:
+                try:
+                    configured_services = MCPRegistry(STORE).get_config(selected_project["id"])
+                except (OSError, ValueError):
+                    configured_services = {"mcpServers": {}}
+                extra_capabilities.update(
+                    f"mcp-service:{name}" for name in configured_services["mcpServers"]
+                )
+            data["capabilityCatalog"] = capability_catalog(tuple(sorted(extra_capabilities)))
             available_agent_ids = [agent.id for agent in available_agents]
             for project in data.get("projects", []):
                 project["agentIds"] = STORE.project_agent_ids(project["id"], available_agent_ids)
@@ -552,7 +603,9 @@ class Handler(BaseHTTPRequestHandler):
             mission_id = query.get("mission", ["mission-first"])[0]
             if "before" in query:
                 try:
-                    before = max(0, int(query["before"][0]))
+                    before = float(query["before"][0])
+                    if not math.isfinite(before) or before < 0:
+                        raise ValueError
                     limit = min(max(int(query.get("limit", ["200"])[0]), 1), 500)
                 except ValueError:
                     return self._json(422, {"error": "invalid_event_page"})
@@ -848,6 +901,7 @@ class Handler(BaseHTTPRequestHandler):
                             str(body.get("model", "")),
                             str(body.get("repositoryAccess", "workspace_write")),
                             str(body.get("effort", "")),
+                            body.get("capabilities", body.get("toolPermissions")),
                         )
                         project_agent_ids = None
                         if project_id:
@@ -873,7 +927,7 @@ class Handler(BaseHTTPRequestHandler):
                             raise RuntimeError("agent role could not be registered") from error
                         AGENT_DEFINITIONS.append(definition)
                     return self._json(201, {
-                        "agent": definition.__dict__,
+                        "agent": _agent_payload(definition),
                         "agentDirectory": str(USER_AGENT_DIRECTORY),
                         **({"projectAgentIds": project_agent_ids} if project_agent_ids is not None else {}),
                     })
@@ -883,10 +937,15 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     recipe = save_recipe(USER_RECIPE_DIRECTORY, str(body.get("id", "")),
                                          str(body.get("title", "")), str(body.get("description", "")),
-                                         str(body.get("instructions", "")), BUILTIN_RECIPE_DIRECTORY)
+                                         str(body.get("instructions", "")), BUILTIN_RECIPE_DIRECTORY,
+                                         body.get("stages"), body.get("objective"), body.get("rules"),
+                                         body.get("tags"), body.get("initial_stage"),
+                                         body.get("terminal_stages"), body.get("transitions"))
                     return self._json(201, {"recipe": recipe.snapshot() | {"source": recipe.source}})
                 except ValueError as error:
                     return self._json(422, {"error": str(error)})
+                except OSError:
+                    return self._json(422, {"error": "workflow_could_not_be_saved"})
             if self.path == "/api/projects":
                 fields = [str(body.get(key, "")).strip() for key in ("repository", "name", "missionTitle", "goal")]
                 if not fields[0] or not fields[1] or len(fields[1]) > 200:
@@ -944,23 +1003,33 @@ class Handler(BaseHTTPRequestHandler):
                 content = str(body.get("content", "")).strip()
                 if not title or not content or len(title) > 200 or len(content) > 20_000:
                     return self._json(422, {"error": "title_and_content_required"})
-                entry = STORE.save_knowledge(project_id, mission_id, "user", title, content)
+                entry = save_project_memory(STORE, project_id, mission_id, "user", title, content)
                 return self._json(201, {"entry": entry})
             review_match = re.fullmatch(r"/api/knowledge/([0-9a-f-]{36})/review", self.path)
             if review_match:
                 decision = str(body.get("decision", "")).strip()
                 result = STORE.review_knowledge_proposal(review_match.group(1), "user", decision)
+                if decision == "accept":
+                    result = accept_project_memory(STORE, result)
                 return self._json(200, result)
             archive_match = re.fullmatch(r"/api/knowledge/([0-9a-f-]{36})/archive", self.path)
             if archive_match:
-                entry = STORE.archive_knowledge(
-                    archive_match.group(1), str(body.get("missionId", "")), "user"
+                mission_id = str(body.get("missionId", ""))
+                mission = STORE.mission(mission_id)
+                if not mission:
+                    return self._json(404, {"error": "mission_not_found"})
+                entry = set_project_memory_status(
+                    STORE, mission["project_id"], archive_match.group(1), "archived", mission_id,
                 )
                 return self._json(200, {"entry": entry})
             restore_match = re.fullmatch(r"/api/knowledge/([0-9a-f-]{36})/restore", self.path)
             if restore_match:
-                entry = STORE.restore_knowledge(
-                    restore_match.group(1), str(body.get("missionId", "")), "user"
+                mission_id = str(body.get("missionId", ""))
+                mission = STORE.mission(mission_id)
+                if not mission:
+                    return self._json(404, {"error": "mission_not_found"})
+                entry = set_project_memory_status(
+                    STORE, mission["project_id"], restore_match.group(1), "active", mission_id,
                 )
                 return self._json(200, {"entry": entry})
             if self.path == "/api/messages":
@@ -1339,6 +1408,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "local_origin_required"})
         if RESTORE_PENDING.is_set():
             return self._json(503, {"error": "workspace_restore_shutting_down"})
+        if self.path == "/api/settings/context-pruning":
+            try:
+                body = self._body()
+                enabled = body.get("enabled")
+                if not isinstance(enabled, bool):
+                    return self._json(422, {"error": "context_pruning_setting_invalid"})
+                STORE.set_setting("experimental_context_pruning", "true" if enabled else "false")
+                return self._json(200, {"enabled": enabled})
+            except json.JSONDecodeError:
+                return self._json(400, {"error": "invalid_request"})
         if self.path == "/api/providers/enabled":
             try:
                 body = self._body()
@@ -1576,11 +1655,12 @@ class Handler(BaseHTTPRequestHandler):
                     str(body.get("model", "")),
                     str(body.get("repositoryAccess", "workspace_write")),
                     str(body.get("effort", "")),
+                    body.get("capabilities", body.get("toolPermissions")),
                 )
                 SUPERVISOR.update_agent(definition)
                 AGENT_DEFINITIONS[index] = definition
             return self._json(200, {
-                "agent": definition.__dict__,
+                "agent": _agent_payload(definition),
                 "agentDirectory": str(USER_AGENT_DIRECTORY),
             })
         except OverflowError:
@@ -1741,7 +1821,7 @@ def main() -> None:
         server = LocalHTTPServer((host, port), Handler)
         STORE.recover_usage_reservations()
         STORE.reconcile_repository_file_deletions()
-        STORE.recover_interrupted_agent_runs()
+        SUPERVISOR.recover_interrupted_agent_runs()
         SUPERVISOR.start_active_missions()
         threading.Thread(target=run_scheduler, daemon=True, name="tribe-scheduler").start()
         try:

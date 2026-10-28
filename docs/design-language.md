@@ -18,8 +18,8 @@ The values in `src/styles.css` are the implementation source of truth. Keep this
 
 ## Component rules
 
-- **Workspace frame:** the sidebar, breadcrumb and tab rail are compact navigation chrome. Main task content gets the remaining width and height. On desktop, a split workspace keeps at least 360px for chat and caps the secondary pane at 60% of available width (up to 820px); narrower screens use the overlay layout. Split panes share a single seam and resize handle; avoid adding a gutter beside the handle.
-- **Navigation:** selected items use a quiet filled surface without an outline. Expanded sidebars use group labels and spacing; keep separators for the icon-only rail where they clarify tool groups. Hover uses a smaller contrast change. Use icon-only actions when the icon is recognisable, with an accessible name and tooltip.
+- **Workspace frame:** the sidebar, breadcrumb and tab rail are compact navigation chrome. Main task content gets the remaining width and height. On desktop, keep chat at least 360px wide; cap the resizable secondary pane at 60% of workspace width and 820px. Narrower screens use the overlay layout. Split panes share a single seam and resize handle; avoid adding a gutter beside the handle.
+- **Navigation and actions:** selected items use a quiet filled surface without an outline. Expanded sidebars use group labels and spacing; keep separators for the icon-only rail where they clarify tool groups. Hover uses a smaller contrast change. Default routine and utility actions to compact icon-only buttons with an accessible name and tooltip, including toolbar and page-header actions such as add, edit, refresh, open, cancel and close. Use visible text buttons only when the label is needed to complete a form (for example, Save or Connect), confirm a consequential choice, or disambiguate an action that has no recognisable icon. Keep secondary actions quiet; do not turn routine actions into large filled buttons or enlarge controls for emphasis. Use the shared compact control height and reserve stronger fill for the primary action.
 - **Tabs:** align tab rails that operate at the same level. Use a short active underline, not a filled card or a second separator around each tab.
 - **Content groups:** use open layouts by default. A card is appropriate for a distinct approval, error, empty state or self-contained task. Never nest cards or frame ordinary messages and list rows.
 - **Project lists:** let the page surface carry the collection; use spacing and quiet hover fills for rows instead of an outer card around bordered rows.
@@ -41,6 +41,7 @@ Model settings use a provider tree: known providers remain visible on the left, 
 
 - Does hierarchy come from spacing and type before borders and cards?
 - Are repeated controls using the same theme, radius, focus and interaction states?
+- Can a text action become a compact icon button with a clear accessible name and tooltip?
 - Are there any redundant labels, titles, nested cards or stacked dividers?
 - Does the primary task remain legible at laptop height and in a narrow split pane?
 - Can a keyboard user identify focus and understand state without colour alone?
