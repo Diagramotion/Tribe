@@ -12,6 +12,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+from .capabilities import WORKFLOW_OPERATION_NAMES
 from urllib.parse import urlparse
 
 from .store import MissionStore
@@ -369,7 +371,8 @@ class MCPRegistry:
             definition["cwd"] = str(resolved)
         return self._resolve_config_secrets(project_id, config)
 
-    def load_toolsets(self, project_id: str) -> list[object]:
+    def load_toolsets(self, project_id: str,
+                      tool_permissions: tuple[str, ...] = ()) -> list[object]:
         source_config = self.get_config(project_id)
         if not source_config["mcpServers"]:
             return []
@@ -379,6 +382,7 @@ class MCPRegistry:
             name: set(definition.get("disabledTools", []))
             for name, definition in source_config["mcpServers"].items()
         }
+        granted_tools = set(tool_permissions)
         config = self._runtime_config(project_id)
         if not config["mcpServers"]:
             return []
@@ -410,6 +414,11 @@ class MCPRegistry:
                     lambda _ctx, tool, server_name=name, disabled=disabled_tools.get(name, set()):
                         _mcp_tool_allowed(tool)
                         and tool.name.removeprefix(f"{server_name}_") not in disabled
+                        and ("mcp:*" in granted_tools
+                             or f"mcp:{server_name}.*" in granted_tools
+                             or f"mcp:{server_name}.{tool.name.removeprefix(f'{server_name}_')}" in granted_tools
+                             or ("workflow:*" in granted_tools
+                                 and tool.name.removeprefix(f"{server_name}_") in WORKFLOW_OPERATION_NAMES))
                         and (server_name != "playwright" or self._browser_access_enabled(project_id))
                 )
                 for name in source_config["mcpServers"] if name in toolsets_by_server

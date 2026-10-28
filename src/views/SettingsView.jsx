@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  CaretDown, CaretLeft, CaretRight, Check, ChartLine, CircleNotch, Cpu, DesktopTower, DownloadSimple, FolderSimple, Image as ImageIcon, MagnifyingGlass, PencilSimple, Plug, Plus, Sparkle, SpeakerHigh, Star, TerminalWindow, TextT, VideoCamera,
+  ArrowClockwise, CaretDown, CaretLeft, CaretRight, Check, ChartLine, CircleNotch, Cpu, DesktopTower, DownloadSimple, FolderSimple, Image as ImageIcon, MagnifyingGlass, PencilSimple, Plug, Plus, Sparkle, SpeakerHigh, Star, TerminalWindow, TextT, VideoCamera,
   ShieldCheck, UploadSimple, X,
 } from "@phosphor-icons/react";
 import openaiLogo from "../assets/model-providers/openai.svg";
@@ -30,12 +30,12 @@ const settingsSections = [
   { id: "commands", label: "Command tools", icon: TerminalWindow },
   { id: "desktop", label: "Desktop access", icon: DesktopTower },
   { id: "data", label: "Usage & data", icon: ChartLine },
+  { id: "experimental", label: "Experimental", icon: Sparkle },
 ];
 const modelProviderLabels = { openai: "OpenAI", anthropic: "Anthropic", google: "Google Gemini", groq: "Groq", mistral: "Mistral", deepseek: "DeepSeek", openrouter: "OpenRouter", xai: "xAI", cerebras: "Cerebras", cohere: "Cohere", fireworks: "Fireworks", together: "Together AI", ollama: "Ollama" };
 const modelProviders = Object.keys(modelProviderLabels);
 const modelProviderLogos = { openai: openaiLogo, anthropic: anthropicLogo, google: googleLogo, groq: groqLogo, mistral: mistralLogo, deepseek: deepseekLogo, openrouter: openrouterLogo, xai: xaiLogo, cerebras: cerebrasLogo, cohere: cohereLogo, fireworks: fireworksLogo, together: togetherLogo, ollama: ollamaLogo };
 const lightModelProviderLogos = new Set(["xai", "cohere"]);
-const DEFAULT_AGENT_RUN_TOKEN_LIMIT = 128_000;
 
 function UsageBreakdown({ heading, items, nameKey }) {
   return <section className="usage-breakdown">
@@ -62,6 +62,14 @@ function ModelCatalog({ models, onModelsChange, onToggle, onSetDefault, defaultM
   const [saving, setSaving] = useState(false);
   const [search, setSearch] = useState("");
   const initialEditorOpened = useRef("");
+  const displayNameInputRef = useRef(null);
+  const editButtonRefs = useRef(new Map());
+  const previousEditingId = useRef(null);
+  useLayoutEffect(() => {
+    if (editingId) displayNameInputRef.current?.focus();
+    else if (previousEditingId.current) editButtonRefs.current.get(previousEditingId.current)?.focus();
+    previousEditingId.current = editingId;
+  }, [editingId]);
   const orderedModels = sortModelCatalog(models, defaultModelId);
   const visibleModels = search.trim()
     ? orderedModels.filter((model) => `${modelDisplayName(model)} ${model.name} ${model.id} ${model.provider}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()))
@@ -149,9 +157,9 @@ function ModelCatalog({ models, onModelsChange, onToggle, onSetDefault, defaultM
         model.reasoningEfforts?.length && `Effort: ${model.reasoningEfforts.join(", ")}`,
         model.inputPricePerMillionUsd != null && `Input $${model.inputPricePerMillionUsd}/M`,
         model.outputPricePerMillionUsd != null && `Output $${model.outputPricePerMillionUsd}/M`,
-      ].filter(Boolean).join(" · ") || "Capabilities not reported by this provider"}</small><small>Details: {model.metadataSource || "unknown"}{model.metadataUpdatedAt ? " · edited" : ""}</small></div><div className="model-catalog-actions">{model.id === defaultModelId ? <span className="model-default-badge"><Check size={12} weight="bold" />Default</span> : <IconButton disabled={!model.allowed || model.toolCalling === false || Boolean(defaultModelSaving) || providerConnectionsLoading} label={defaultModelSaving === model.id ? `Setting ${model.name} as the workspace default` : providerConnectionsLoading ? "Loading provider settings" : !model.allowed ? `Allow ${model.name} before setting it as the default` : model.toolCalling === false ? `${model.name} cannot use agent tools` : `Set ${model.name} as the workspace default`} onClick={() => onSetDefault(model)}>{defaultModelSaving === model.id ? <CircleNotch className="spin" size={15} /> : <Star size={15} />}</IconButton>}<IconButton label={`Edit capabilities for ${model.name}`} onClick={() => editingId === model.id ? setEditingId(null) : edit(model)}><PencilSimple size={15} /></IconButton><button aria-checked={Boolean(model.allowed)} aria-label={`${model.allowed ? "Disallow" : "Allow"} ${model.name}`} className={`model-catalog-switch ${model.allowed ? "model-catalog-switch--on" : ""}`} disabled={toggleBusy === model.id} onClick={() => onToggle(model)} role="switch" type="button"><span /></button></div></div>
+      ].filter(Boolean).join(" · ") || "Capabilities not reported by this provider"}</small><small>Details: {model.metadataSource || "unknown"}{model.metadataUpdatedAt ? " · edited" : ""}</small></div><div className="model-catalog-actions">{model.id === defaultModelId ? <span className="model-default-badge"><Check size={12} weight="bold" />Default</span> : <IconButton disabled={!model.allowed || model.toolCalling === false || Boolean(defaultModelSaving) || providerConnectionsLoading} label={defaultModelSaving === model.id ? `Setting ${model.name} as the workspace default` : providerConnectionsLoading ? "Loading provider settings" : !model.allowed ? `Allow ${model.name} before setting it as the default` : model.toolCalling === false ? `${model.name} cannot use agent tools` : `Set ${model.name} as the workspace default`} onClick={() => onSetDefault(model)}>{defaultModelSaving === model.id ? <CircleNotch className="spin" size={15} /> : <Star size={15} />}</IconButton>}<IconButton ref={(node) => { if (node) editButtonRefs.current.set(model.id, node); else editButtonRefs.current.delete(model.id); }} label={`Edit capabilities for ${model.name}`} onClick={() => editingId === model.id ? setEditingId(null) : edit(model)}><PencilSimple size={15} /></IconButton><button aria-checked={Boolean(model.allowed)} aria-label={`${model.allowed ? "Disallow" : "Allow"} ${model.name}`} className={`model-catalog-switch ${model.allowed ? "model-catalog-switch--on" : ""}`} disabled={toggleBusy === model.id} onClick={() => onToggle(model)} role="switch" type="button"><span /></button></div></div>
       {editingId === model.id && draft && <form className="model-metadata-form" onSubmit={(event) => save(event, model)}>
-        <label className="model-metadata-display-name">Display name<input maxLength="120" onChange={(event) => setField("displayName", event.target.value)} placeholder={model.name} value={draft.displayName} /><small>Shown in model selectors. The provider model ID stays unchanged.</small></label>
+        <label className="model-metadata-display-name">Display name<input ref={displayNameInputRef} maxLength="120" onChange={(event) => setField("displayName", event.target.value)} placeholder={model.name} value={draft.displayName} /><small>Shown in model selectors. The provider model ID stays unchanged.</small></label>
         <label>Context window<input min="1" onChange={(event) => setField("contextWindow", event.target.value)} placeholder="Unknown" type="number" value={draft.contextWindow} /></label>
         <label>Maximum output<input min="1" onChange={(event) => setField("maxOutputTokens", event.target.value)} placeholder="Unknown" type="number" value={draft.maxOutputTokens} /></label>
         <h4 className="model-metadata-heading">Capabilities and pricing</h4>
@@ -166,7 +174,7 @@ function ModelCatalog({ models, onModelsChange, onToggle, onSetDefault, defaultM
         <label>Output price per million tokens<input min="0" onChange={(event) => setField("outputPricePerMillionUsd", event.target.value)} placeholder="Unknown" step="any" type="number" value={draft.outputPricePerMillionUsd} /></label>
         <div className="model-metadata-actions"><button className="button button--quiet" disabled={saving} onClick={() => void resetProviderData(model)} type="button">Restore provider details</button><span /><button className="button button--quiet" disabled={saving} onClick={() => { setEditingId(null); setDraft(null); }} type="button">Cancel</button><button className="button button--quiet" disabled={saving} type="submit">{saving ? "Saving…" : "Save details"}</button></div>
       </form>}
-    </article>) : <p className="model-catalog-no-results">No models match “{search.trim()}”.</p>}</div>
+    </article>) : <p className="model-catalog-no-results">{models.length === 0 ? "No models discovered yet." : `No models match “${search.trim()}”.`}</p>}</div>
     {error && <p className="recipe-error" role="alert">{error}</p>}
   </>;
 }
@@ -194,7 +202,7 @@ function MonthToDateUsage({ usage }) {
 export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webAccess, computerAccess, onSaveUsageBudget, onSaveWebAccess, onSaveComputerAccess, onConfigureModel, onSetWorkspaceDefault, onManageMcp, onExportBackup, onImportBackup, onExportAudit, onClose, initialSection = "workspace", initialModelId = null }) {
   const [budgetInput, setBudgetInput] = useState("");
   const [runCostInput, setRunCostInput] = useState("");
-  const [runTokenInput, setRunTokenInput] = useState(String(DEFAULT_AGENT_RUN_TOKEN_LIMIT));
+  const [runTokenInput, setRunTokenInput] = useState("");
   const [budgetSaving, setBudgetSaving] = useState(false);
   const [webEnabled, setWebEnabled] = useState(false);
   const [webDomains, setWebDomains] = useState("");
@@ -208,6 +216,10 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
   const [providerConnections, setProviderConnections] = useState([]);
   const [providerConnectionsLoading, setProviderConnectionsLoading] = useState(false);
   const [providerFormOpen, setProviderFormOpen] = useState(false);
+  const providerFormInputRef = useRef(null);
+  const providerFormOpenerRef = useRef(null);
+  const providerFormOpenerLabelRef = useRef("");
+  const providerFormWasOpenRef = useRef(false);
   const [connectionProvider, setConnectionProvider] = useState(() => agentRuntime.model?.split(":", 1)[0] || "openai");
   const [customProviderMode, setCustomProviderMode] = useState(() => !modelProviders.includes(agentRuntime.model?.split(":", 1)[0] || "openai"));
   const [connectionApiKey, setConnectionApiKey] = useState("");
@@ -227,6 +239,7 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
   const [restoreFile, setRestoreFile] = useState(null);
   const [restoreReview, setRestoreReview] = useState(false);
   const settingsDialogRef = useRef(null);
+  const settingsSectionNavRef = useRef(null);
   const restoreDialogRef = useRef(null);
   const [restorePending, setRestorePending] = useState(false);
   const [restoreError, setRestoreError] = useState("");
@@ -243,12 +256,54 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
   const [commandToolsLoading, setCommandToolsLoading] = useState(false);
   const [commandToolsSaving, setCommandToolsSaving] = useState(false);
   const [commandToolsError, setCommandToolsError] = useState("");
+  const [contextPruningEnabled, setContextPruningEnabled] = useState(false);
+  const [contextPruningSummary, setContextPruningSummary] = useState({});
+  const [contextPruningSaving, setContextPruningSaving] = useState(false);
+  const [contextPruningError, setContextPruningError] = useState("");
   const [activeSection, setActiveSection] = useState(() => settingsSections.some(({ id }) => id === initialSection) ? initialSection : "workspace");
   const [selectedProvider, setSelectedProvider] = useState("");
   const [selectedModelId, setSelectedModelId] = useState("");
   const [expandedProviders, setExpandedProviders] = useState(() => new Set());
   const [providerSearch, setProviderSearch] = useState("");
   const [providerToggleBusy, setProviderToggleBusy] = useState("");
+  useEffect(() => {
+    const nav = settingsSectionNavRef.current;
+    const selectedTab = nav?.querySelector('[aria-selected="true"]');
+    if (!nav || !selectedTab) return undefined;
+    const revealSelectedTab = () => selectedTab.scrollIntoView({ block: "nearest", inline: "nearest" });
+    revealSelectedTab();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(revealSelectedTab);
+    observer?.observe(nav);
+    return () => observer?.disconnect();
+  }, [activeSection]);
+  useEffect(() => {
+    if (activeSection !== "experimental") return undefined;
+    let current = true;
+    runtime.getSettings().then((settings) => {
+      if (!current) return;
+      setContextPruningEnabled(Boolean(settings.experimentalContextPruning));
+      setContextPruningSummary(settings.contextPruningSummary ?? {});
+    }).catch((error) => {
+      if (current) setContextPruningError(error.message || "Experimental settings could not be loaded.");
+    });
+    return () => { current = false; };
+  }, [activeSection]);
+  async function toggleContextPruning() {
+    if (contextPruningSaving) return;
+    const next = !contextPruningEnabled;
+    setContextPruningSaving(true);
+    setContextPruningError("");
+    try {
+      await runtime.setContextPruning(next);
+      setContextPruningEnabled(next);
+      const settings = await runtime.getSettings();
+      setContextPruningSummary(settings.contextPruningSummary ?? {});
+    } catch (error) {
+      setContextPruningError(error.message || "Context pruning could not be updated.");
+    } finally {
+      setContextPruningSaving(false);
+    }
+  }
   useEffect(() => {
     providerCheckRequest.current += 1;
     setProviderChecking(false);
@@ -289,7 +344,7 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
   useEffect(() => {
     setBudgetInput(usage.budget.monthlyTokenLimit == null ? "" : String(usage.budget.monthlyTokenLimit));
     setRunCostInput(usage.budget.maxRunCostUsd == null ? "" : String(usage.budget.maxRunCostUsd));
-    setRunTokenInput(usage.budget.maxRunTokens == null ? String(DEFAULT_AGENT_RUN_TOKEN_LIMIT) : String(usage.budget.maxRunTokens));
+    setRunTokenInput(usage.budget.maxRunTokens == null ? "" : String(usage.budget.maxRunTokens));
   }, [usage.budget.monthlyTokenLimit, usage.budget.maxRunCostUsd, usage.budget.maxRunTokens]);
   useEffect(() => {
     setWebEnabled(webAccess.enabled);
@@ -571,8 +626,11 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
   const providerRows = [...new Set([...modelProviders, ...providerConnections.map((item) => item.id)])]
     .filter((id) => `${modelProviderLabels[id] ?? id} ${id}`.toLowerCase().includes(providerSearch.trim().toLowerCase()))
     .map((id) => providerConnections.find((item) => item.id === id) ?? { id, status: "not_configured", modelCount: 0, enabled: false });
+  const selectedProviderInResults = providerRows.some((provider) => provider.id === selectedProvider);
   const selectedProviderId = connectionProvider.trim().toLowerCase();
   const selectedProviderConnection = providerConnections.find((connection) => connection.id === selectedProviderId);
+  const selectedProviderConfigured = Boolean(selectedProviderConnection && selectedProviderConnection.status !== "not_configured");
+  const selectedProviderEnabled = Boolean(selectedProviderConfigured && selectedProviderConnection.enabled !== false);
   const providerUsesLocalService = selectedProviderId === "ollama";
   const savedProviderCredential = Boolean(selectedProviderConnection?.credentialAvailable);
   const providerHasSavedConnection = Boolean(selectedProviderConnection && selectedProviderConnection.status !== "not_configured");
@@ -580,6 +638,29 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
   const providerFormTitle = addingCustomProvider
     ? "Add custom provider"
     : `${providerHasSavedConnection ? "Edit" : "Connect"} ${modelProviderLabels[selectedProviderId] ?? selectedProviderId}`;
+  const openProviderForm = (opener) => {
+    providerFormOpenerRef.current = opener ?? document.activeElement;
+    providerFormOpenerLabelRef.current = opener?.getAttribute?.("aria-label") ?? "";
+    setProviderFormOpen(true);
+  };
+  const closeProviderForm = () => {
+    setConnectionError("");
+    setConnectionNotice("");
+    setProviderFormOpen(false);
+  };
+  useLayoutEffect(() => {
+    if (providerFormOpen) {
+      providerFormWasOpenRef.current = true;
+      providerFormInputRef.current?.focus();
+    } else if (providerFormWasOpenRef.current) {
+      providerFormWasOpenRef.current = false;
+      const openerLabel = providerFormOpenerLabelRef.current;
+      const restoredOpener = openerLabel
+        ? [...document.querySelectorAll("button[aria-label]")].find((button) => button.getAttribute("aria-label") === openerLabel)
+        : providerFormOpenerRef.current;
+      restoredOpener?.focus?.();
+    }
+  }, [providerFormOpen]);
   useEffect(() => {
     const onKeyDown = (event) => {
       if (event.key !== "Escape") return;
@@ -590,18 +671,34 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose, restoreReview]);
   return <div className="settings-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }} role="presentation">
-    <section className="settings-dialog" aria-modal="true" aria-labelledby="settings-title" ref={settingsDialogRef} role="dialog" tabIndex={-1}>
+    <section className={`settings-dialog${["workspace", "connections", "commands", "desktop", "experimental"].includes(activeSection) ? " settings-dialog--compact" : ""}`} aria-modal="true" aria-labelledby="settings-title" ref={settingsDialogRef} role="dialog" tabIndex={-1}>
       <header className="settings-dialog-header"><div><span className="eyebrow">Workspace</span><h2 id="settings-title">Settings</h2><p>Manage models, access and local data.</p></div><IconButton label="Close settings" onClick={onClose}><X size={17} /></IconButton></header>
       <div className="settings-dialog-body">
-        <nav className="settings-section-nav" aria-label="Settings sections" role="tablist" aria-orientation="vertical">
+        <nav className="settings-section-nav" aria-label="Settings sections" ref={settingsSectionNavRef} role="tablist" aria-orientation="vertical">
           {settingsSections.map(({ id, label, icon: Icon }) => <button aria-controls="settings-section-panel" aria-selected={activeSection === id} className={`settings-section-tab ${activeSection === id ? "settings-section-tab--active" : ""}`} id={`settings-tab-${id}`} key={id} onClick={() => setActiveSection(id)} role="tab" type="button"><Icon size={16} /><span>{label}</span></button>)}
         </nav>
         <div aria-labelledby={`settings-tab-${activeSection}`} className={`settings-section-panel${activeSection === "models" && selectedModelId ? " settings-section-panel--model-detail" : ""}`} id="settings-section-panel" role="tabpanel">
           <div className={`settings-section-heading${activeSection === "models" ? " settings-section-heading--models" : ""}`}><h3>{selectedSection.label}</h3>{activeSection !== "models" && <p>{settingsDescription(activeSection, project.name)}</p>}</div>
           {activeSection === "workspace" && <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><DesktopTower size={18} /></span><div><h3>This device</h3><p>{workspaceDescription}</p></div></div><span className={`settings-device-status settings-device-status--${runtimeStatus}`}><i />{workspaceStatus}</span></section>}
-          {activeSection === "models" && <div className="model-default-summary"><span className="settings-symbol"><Sparkle size={17} /></span><div><strong>Workspace default</strong><small>{agentRuntime.configured ? agentRuntime.model : "Auto · used when a chat or role has no model override"}</small></div><span aria-live="polite" className={`provider-readiness provider-readiness--${providerReadiness.tone}`} role="status"><i aria-hidden="true" />{providerReadiness.label}</span><div className="provider-actions">{allowedAgentModels.length > 0 && <button className="button button--quiet" onClick={() => { const model = modelCatalog.find((entry) => entry.id === agentRuntime.model) ?? allowedAgentModels[0]; setSelectedProvider(model.provider); setSelectedModelId(model.id); setProviderFormOpen(false); }} type="button">{agentRuntime.configured ? "Change" : "Choose"}</button>}<button className="button button--quiet" disabled={!agentRuntime.configured || providerChecking} onClick={checkProvider} type="button">{providerChecking ? "Testing…" : "Test"}</button></div></div>}
+          {activeSection === "experimental" && <>
+            <section className="settings-card">
+              <div className="settings-card-heading"><span className="settings-symbol"><Sparkle size={18} /></span><div><h3>Prune stale tool results</h3><p>Before each model request, hide older file reads superseded by edits or newer reads, plus repeated read-only command output. Saved chat and run history remain intact.</p></div>
+                <button aria-checked={contextPruningEnabled} aria-label="Prune stale tool results" className={`model-catalog-switch${contextPruningEnabled ? " model-catalog-switch--on" : ""}`} disabled={contextPruningSaving} onClick={() => void toggleContextPruning()} role="switch" type="button"><span /></button>
+              </div>
+              <p className="settings-note">Experimental and off by default. Only completed tool results are eligible; pending approvals are preserved.</p>
+              {contextPruningError && <p className="recipe-error" role="alert">{contextPruningError}</p>}
+            </section>
+            <section className="settings-card">
+              <div className="settings-card-heading"><div><h3>Observed request usage</h3><p>Provider-reported input tokens are actual. Removed-token counts are estimates based on text length; output tokens and completed model responses provide a limited before/after outcome comparison.</p></div></div>
+              <div className="usage-breakdown-grid">{["disabled", "enabled"].map((mode) => {
+                const item = contextPruningSummary[mode] ?? {};
+                return <section className="usage-breakdown" key={mode}><h4>{mode === "enabled" ? "Pruning on" : "Pruning off"}</h4><div className="usage-breakdown-row"><span>Completed model requests</span><span>{new Intl.NumberFormat().format(item.requests ?? 0)}</span></div><div className="usage-breakdown-row"><span>Provider input tokens</span><span>{new Intl.NumberFormat().format(item.input_tokens ?? 0)}</span></div><div className="usage-breakdown-row"><span>Provider output tokens</span><span>{new Intl.NumberFormat().format(item.output_tokens ?? 0)}</span></div>{mode === "enabled" && <><div className="usage-breakdown-row"><span>Older results omitted</span><span>{new Intl.NumberFormat().format(item.pruned_results ?? 0)}</span></div><div className="usage-breakdown-row"><span>Estimated tokens removed</span><span>{new Intl.NumberFormat().format(item.estimated_tokens_removed ?? 0)}</span></div></>}</section>;
+              })}</div>
+            </section>
+          </>}
+          {activeSection === "models" && <div className="model-default-summary"><span className="settings-symbol"><Sparkle size={17} /></span><div><strong>Workspace default</strong><small>{agentRuntime.configured ? agentRuntime.model : "Auto · used when a chat or role has no model override"}</small></div><span aria-live="polite" className={`provider-readiness provider-readiness--${providerReadiness.tone}`} role="status"><i aria-hidden="true" />{providerReadiness.label}</span><div className="provider-actions">{allowedAgentModels.length > 0 && <IconButton label={agentRuntime.configured ? "Change workspace default" : "Choose workspace default"} onClick={() => { const model = modelCatalog.find((entry) => entry.id === agentRuntime.model) ?? allowedAgentModels[0]; setSelectedProvider(model.provider); setSelectedModelId(model.id); setProviderFormOpen(false); }}><PencilSimple size={15} /></IconButton>}<IconButton disabled={!agentRuntime.configured || providerChecking} label={providerChecking ? "Testing connection" : "Test connection"} onClick={checkProvider}><ArrowClockwise size={15} /></IconButton></div></div>}
           {activeSection === "models" && <section className="settings-card provider-connections-card model-settings-workspace" id="provider-connections-card">
-            <div className="provider-connections-heading"><div className="settings-card-heading"><span className="settings-symbol"><Plug size={17} /></span><div><h3>Providers</h3></div></div>{!providerConnectionsLoading && <IconButton label="Add custom provider" onClick={() => {
+            <div className="provider-connections-heading"><div className="settings-card-heading"><span className="settings-symbol"><Plug size={17} /></span><div><h3>Providers</h3></div></div>{!providerConnectionsLoading && <IconButton label="Add custom provider" onClick={(event) => {
               setConnectionProvider("");
               setSelectedProvider("");
               setCustomProviderMode(true);
@@ -609,12 +706,12 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
               setConnectionApiKey("");
               setConnectionError("");
               setConnectionNotice("");
-              setProviderFormOpen(true);
+              openProviderForm(event.currentTarget);
             }}><Plus size={17} /></IconButton>}</div>
             <div className="provider-explorer">
               <label className="model-catalog-search"><MagnifyingGlass aria-hidden="true" size={15} /><input aria-label="Find a provider" onChange={(event) => setProviderSearch(event.target.value)} placeholder="Find a provider" type="search" value={providerSearch} /></label>
               {providerConnectionsLoading && providerConnections.length === 0 && !providerFormOpen && <p className="settings-note">Loading saved provider connections…</p>}
-              <div className="provider-connection-list" aria-label="Providers">{providerRows.map((connection) => {
+              <div className="provider-connection-list" aria-label="Providers">{providerRows.length === 0 && !providerConnectionsLoading ? <p className="settings-note" role="status">No providers match “{providerSearch.trim()}”.</p> : providerRows.map((connection) => {
                 const configured = connection.status !== "not_configured";
                 const providerModels = sortModelCatalog(modelCatalog.filter((model) => model.provider === connection.id), agentRuntime.model);
                 const expanded = expandedProviders.has(connection.id);
@@ -628,8 +725,9 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
               })}</div>
             </div>
             <div className="provider-detail-panel">
+            {providerFormOpen || selectedProviderInResults ? <>
             {providerFormOpen && <form className="provider-connection-form" onSubmit={connectProvider}>
-              <div className="provider-connection-form-heading"><h4>{providerFormTitle}</h4><IconButton label="Close provider form" onClick={() => { setConnectionError(""); setConnectionNotice(""); setProviderFormOpen(false); }}><X size={15} /></IconButton></div>
+              <div className="provider-connection-form-heading"><h4>{providerFormTitle}</h4><IconButton label="Close provider form" onClick={closeProviderForm}><X size={15} /></IconButton></div>
               <label>{customProviderMode ? "Provider ID" : "Provider"}{customProviderMode ? <input aria-label="Provider ID" autoComplete="off" maxLength="100" onChange={(event) => {
                 const nextProvider = event.target.value;
                 if (nextProvider.trim().toLowerCase() !== connectionProvider.trim().toLowerCase()) {
@@ -637,19 +735,20 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
                   setConnectionBaseUrl("");
                 }
                 setConnectionProvider(nextProvider);
-              }} placeholder="e.g. azure" required value={connectionProvider} /> : <span className="provider-form-name">{modelProviderLabels[selectedProviderId] ?? selectedProviderId}</span>}</label>
-              <label>Service URL<input autoComplete="url" onChange={(event) => setConnectionBaseUrl(event.target.value)} placeholder="Provider default" value={connectionBaseUrl} /><small>Optional. Remote endpoints must use HTTPS.</small></label>
+              }} placeholder="e.g. azure" ref={providerFormInputRef} required value={connectionProvider} /> : <span className="provider-form-name">{modelProviderLabels[selectedProviderId] ?? selectedProviderId}</span>}</label>
+              <label>Service URL<input autoComplete="url" onChange={(event) => setConnectionBaseUrl(event.target.value)} placeholder="Provider default" ref={customProviderMode ? undefined : providerFormInputRef} value={connectionBaseUrl} /><small>Optional. Remote endpoints must use HTTPS.</small></label>
               {providerUsesLocalService ? <small className="provider-connection-key-note">No API key needed for a local Ollama service.</small> : <label>API key{savedProviderCredential ? " (optional)" : ""}<input autoComplete="off" onChange={(event) => setConnectionApiKey(event.target.value)} placeholder={savedProviderCredential ? "Leave blank to keep the saved key" : "Enter API key"} type="password" value={connectionApiKey} /></label>}
               <div className="provider-connection-actions"><button className="button button--primary" disabled={connectionSaving || !connectionProvider.trim()} type="submit">{connectionSaving ? "Connecting…" : providerHasSavedConnection ? "Save and fetch models" : "Connect and fetch models"}</button><button className="button button--quiet" disabled={connectionSaving || !connectionProvider.trim()} onClick={() => { configureModel(`${connectionProvider.trim().toLowerCase()}:`, connectionBaseUrl, connectionApiKey); setConnectionApiKey(""); }} type="button"><Plus size={14} />Add model manually</button></div>
             </form>}
             {connectionError && <div className="provider-connection-error" role="alert"><p className="recipe-error">{connectionError}</p>{manualModelSetupRequired && <button className="button button--quiet" onClick={() => { configureModel(`${connectionProvider.trim().toLowerCase()}:`, connectionBaseUrl, connectionApiKey); setConnectionApiKey(""); }} type="button">Enter model ID manually</button>}</div>}
             {connectionNotice && <p className="provider-check provider-check--ok" role="status">{connectionNotice}</p>}
             {!providerFormOpen && !selectedModelId && selectedProvider && <section className="provider-selected-detail" aria-label={`${modelProviderLabels[selectedProvider] ?? selectedProvider} settings`}>
-              <div className="provider-selected-heading"><span className="provider-brand-icon provider-brand-icon--large">{modelProviderLogos[selectedProvider] ? <img alt="" className={lightModelProviderLogos.has(selectedProvider) ? "provider-brand-logo--light" : undefined} src={modelProviderLogos[selectedProvider]} /> : <Cpu size={20} />}</span><div><h3>{modelProviderLabels[selectedProvider] ?? selectedProvider}</h3><small>{selectedProviderConnection?.status === "not_configured" || !selectedProviderConnection ? "Not configured" : selectedProviderConnection.baseUrl || "Provider default endpoint"}</small></div><button aria-checked={selectedProviderConnection?.enabled !== false} aria-label={`${selectedProviderConnection?.enabled === false ? "Enable" : "Disable"} ${modelProviderLabels[selectedProvider] ?? selectedProvider}`} className={`model-catalog-switch${selectedProviderConnection?.enabled !== false ? " model-catalog-switch--on" : ""}`} disabled={!selectedProviderConnection || selectedProviderConnection.status === "not_configured" || providerToggleBusy === selectedProvider} onClick={() => selectedProviderConnection && void toggleProvider(selectedProviderConnection)} role="switch" type="button"><span /></button></div>
-              <div className="provider-overview-actions"><button className="button button--quiet" onClick={() => { setConnectionProvider(selectedProvider); setConnectionBaseUrl(selectedProviderConnection?.baseUrl ?? ""); setConnectionApiKey(""); setConnectionError(""); setConnectionNotice(""); setCustomProviderMode(!modelProviders.includes(selectedProvider)); setProviderFormOpen(true); }} type="button"><PencilSimple size={14} />{selectedProviderConnection?.status === "not_configured" ? "Configure" : "Edit connection"}</button><button className="button button--quiet" disabled={!selectedProviderConnection || selectedProviderConnection.status === "not_configured" || connectionSaving} onClick={() => void fetchProviderModels()} type="button">{connectionSaving ? "Fetching…" : "Fetch models"}</button><button className="button button--quiet" onClick={() => { configureModel(`${selectedProvider}:`, selectedProviderConnection?.baseUrl ?? "", ""); }} type="button"><Plus size={14} />Add model manually</button></div>
+              <div className="provider-selected-heading"><span className="provider-brand-icon provider-brand-icon--large">{modelProviderLogos[selectedProvider] ? <img alt="" className={lightModelProviderLogos.has(selectedProvider) ? "provider-brand-logo--light" : undefined} src={modelProviderLogos[selectedProvider]} /> : <Cpu size={20} />}</span><div><h3>{modelProviderLabels[selectedProvider] ?? selectedProvider}</h3><small>{selectedProviderConfigured ? selectedProviderConnection.baseUrl || "Provider default endpoint" : "Not configured"}</small></div><button aria-checked={selectedProviderEnabled} aria-label={`${selectedProviderEnabled ? "Disable" : "Enable"} ${modelProviderLabels[selectedProvider] ?? selectedProvider}`} className={`model-catalog-switch${selectedProviderEnabled ? " model-catalog-switch--on" : ""}`} disabled={!selectedProviderConfigured || providerToggleBusy === selectedProvider} onClick={() => selectedProviderConnection && void toggleProvider(selectedProviderConnection)} role="switch" type="button"><span /></button></div>
+              <div className="provider-overview-actions"><IconButton label={selectedProviderConnection?.status === "not_configured" ? "Configure provider" : "Edit connection"} onClick={(event) => { setConnectionProvider(selectedProvider); setConnectionBaseUrl(selectedProviderConnection?.baseUrl ?? ""); setConnectionApiKey(""); setConnectionError(""); setConnectionNotice(""); setCustomProviderMode(!modelProviders.includes(selectedProvider)); openProviderForm(event.currentTarget); }}>{selectedProviderConnection?.status === "not_configured" ? <Plug size={16} /> : <PencilSimple size={16} />}</IconButton><IconButton disabled={!selectedProviderConnection || selectedProviderConnection.status === "not_configured" || connectionSaving} label={connectionSaving ? "Fetching models" : "Fetch models"} onClick={() => void fetchProviderModels()}>{connectionSaving ? <CircleNotch className="spin" size={16} /> : <ArrowClockwise size={16} />}</IconButton><IconButton label="Add model manually" onClick={() => { configureModel(`${selectedProvider}:`, selectedProviderConnection?.baseUrl ?? "", ""); }}><Plus size={16} /></IconButton></div>
               <div className="provider-models-heading"><h4>Models</h4><span>{modelCatalog.filter((model) => model.provider === selectedProvider).length}</span></div>
               {modelCatalogLoading ? <p className="settings-note">Loading models…</p> : <ModelCatalog models={modelCatalog.filter((model) => model.provider === selectedProvider)} onModelsChange={setModelCatalog} onToggle={toggleModel} onSetDefault={setWorkspaceDefault} defaultModelId={agentRuntime.model} defaultModelSaving={defaultModelSaving} providerConnectionsLoading={providerConnectionsLoading} toggleBusy={modelToggleBusy} error={modelCatalogError} onError={setModelCatalogError} initialModelId={initialModelId} />}
             </section>}
+            </> : <div className="provider-selection-empty" role="status"><strong>{providerRows.length ? "Choose a provider" : "No provider selected"}</strong><p>{providerRows.length ? "Select a provider in the filtered list to view its connection and models." : "Clear your search to return to the provider list."}</p></div>}
             </div>
           </section>}
           {activeSection === "models" && selectedModelId && <section aria-labelledby="allowed-models-heading" className="settings-card model-catalog-card model-selected-detail" id="model-catalog-card">
@@ -657,13 +756,13 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
             {modelCatalogLoading ? <p className="settings-note">Loading model catalogue…</p> : <ModelCatalog models={modelCatalog.filter((model) => model.id === selectedModelId)} onModelsChange={setModelCatalog} onToggle={toggleModel} onSetDefault={setWorkspaceDefault} defaultModelId={agentRuntime.model} defaultModelSaving={defaultModelSaving} providerConnectionsLoading={providerConnectionsLoading} toggleBusy={modelToggleBusy} error={modelCatalogError} onError={setModelCatalogError} initialModelId={initialModelId} />}
           </section>}
           {activeSection === "connections" && <>
-            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><Plug size={17} /></span><div><h3>Connected services</h3><p>{project.name ? `Services agents can use in ${project.name}. Changes that affect data need your approval.` : "Choose a project to manage its connected services."}</p></div></div><button className="button button--quiet" disabled={!project.id} onClick={onManageMcp} type="button">Manage connections</button></section>
-            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><MagnifyingGlass size={17} /></span><div><h3>Web and browser access</h3><p>Allow agents to research public websites or use the project’s browser. Search, page fetches and browser actions still follow approval rules.</p></div></div><form className="usage-budget-form web-access-form" onSubmit={saveWebAccess}><label className="web-access-toggle"><button aria-checked={webEnabled} className="web-access-switch" disabled={!project.id} onClick={() => setWebEnabled((enabled) => !enabled)} role="switch" type="button"><span /></button><span>Allow website access</span></label><label htmlFor="web-allowed-domains">Allowed websites <small>Enter exact hostnames, one per line. Browser access is unavailable until at least one is listed.</small></label><textarea disabled={!project.id} id="web-allowed-domains" onChange={(event) => setWebDomains(event.target.value)} placeholder="docs.python.org\nreact.dev" rows={3} value={webDomains} /><p className="settings-note">Browser site limits are a guardrail; redirects can leave the list. Navigation and changes in the browser still need your approval.</p>{webError && <p className="recipe-error" role="alert">{webError}</p>}<div className="web-access-footer"><button className="button button--quiet" disabled={!project.id || webSaving} type="submit">{webSaving ? "Saving…" : "Save website settings"}</button></div></form></section>
+            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><Plug size={17} /></span><div><h3>Connected services</h3><p>{project.name ? `Services agents can use in ${project.name}. Changes that affect data need your approval.` : "Choose a project to manage its connected services."}</p></div><IconButton disabled={!project.id} label="Manage connections" onClick={onManageMcp}><Plug size={15} /></IconButton></div></section>
+            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><MagnifyingGlass size={17} /></span><div><h3>Web and browser access</h3><p>Allow agents to research public websites or use the project’s browser. Search, page fetches and browser actions still follow approval rules.</p></div></div><form className="usage-budget-form web-access-form" onSubmit={saveWebAccess}><label className="web-access-toggle"><button aria-checked={webEnabled} className="web-access-switch" disabled={!project.id} onClick={() => setWebEnabled((enabled) => !enabled)} role="switch" type="button"><span /></button><span>Allow website access</span></label><label htmlFor="web-allowed-domains">Allowed websites <small>Enter exact hostnames, one per line. Browser access is unavailable until at least one is listed.</small></label><textarea disabled={!project.id} id="web-allowed-domains" onChange={(event) => setWebDomains(event.target.value)} placeholder={"docs.python.org\nreact.dev"} rows={3} value={webDomains} /><p className="settings-note">Browser site limits are a guardrail; redirects can leave the list. Navigation and changes in the browser still need your approval.</p>{webError && <p className="recipe-error" role="alert">{webError}</p>}<div className="web-access-footer"><button className="button button--quiet" disabled={!project.id || webSaving} type="submit">{webSaving ? "Saving…" : "Save website settings"}</button></div></form></section>
           </>}
           {activeSection === "commands" && <section className="settings-card command-tools-card"><div className="settings-card-heading"><span className="settings-symbol"><TerminalWindow size={17} /></span><div><h3>Project command tools</h3><p>Choose extra executables for background runs in {project.name || "this project"}. Tribe runs each command in the repository folder with your account's file and network access.</p></div></div>{!project.id ? <p className="settings-note">Choose a project to manage its command tools.</p> : <><form className="command-tools-form" onSubmit={addCommandTool}><label htmlFor="project-command-tool">Executable name</label><div><input autoComplete="off" id="project-command-tool" maxLength={128} onChange={(event) => setCommandToolInput(event.target.value)} placeholder="terraform, gh, or a tool on PATH" value={commandToolInput} /><button className="button button--quiet" disabled={commandToolsSaving || !/^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/.test(commandToolInput.trim()) || commandTools.includes(commandToolInput.trim())} type="submit">Add tool</button></div><small>Enter a command name only, without a path or arguments. You start each background run.</small></form>{commandToolsError && <p className="recipe-error" role="alert">{commandToolsError}</p>}{commandToolsLoading ? <p className="settings-note">Loading command tools…</p> : commandTools.length ? <ul className="command-tool-list">{commandTools.map((executable) => <li key={executable}><code>{executable}</code><button className="text-button" disabled={commandToolsSaving} onClick={() => saveCommandTools(commandTools.filter((item) => item !== executable))} type="button">Remove</button></li>)}</ul> : <p className="settings-note">No extra tools approved. Tribe's built-in command set remains available.</p>}</>}</section>}
           {activeSection === "desktop" && <><section className="settings-card desktop-access-card"><div className="settings-card-heading"><span className="settings-symbol"><DesktopTower size={17} /></span><div><h3>Desktop access</h3><p>Check whether this device can support app inspection. This check does not capture the screen or control apps.</p></div></div><button className="button button--quiet" disabled={!window.__TAURI_INTERNALS__ || desktopAccessChecking} onClick={checkDesktopAccess} type="button">{desktopAccessChecking ? "Checking…" : "Check access"}</button>{!window.__TAURI_INTERNALS__ && <p className="settings-note">Available in the desktop app.</p>}{desktopAccessError && <p className="recipe-error" role="alert">{desktopAccessError}</p>}{desktopAccess && <div className="desktop-access-results" role="status"><p><strong>Screen capture</strong><span>{formatPermission(desktopAccess.screenCapture.permission)}</span><small>{desktopAccess.screenCapture.detail}</small>{desktopAccess.platform === "macos" && <button className="button button--quiet desktop-access-settings-link" onClick={() => openDesktopPrivacySettings("screen_capture")} type="button">Open Screen Recording settings</button>}</p><p><strong>Accessibility</strong><span>{formatPermission(desktopAccess.accessibility.permission)}</span><small>{desktopAccess.accessibility.detail}</small>{desktopAccess.platform === "macos" && <button className="button button--quiet desktop-access-settings-link" onClick={() => openDesktopPrivacySettings("accessibility")} type="button">Open Accessibility settings</button>}</p>{desktopAccess.adapterAvailable ? <p className="settings-note">One-shot window screenshots use the macOS system picker. Accessibility data and app controls are not available.</p> : <p className="settings-note">Window selection depends on this app’s WebView on this platform. Packaged support is not yet verified; accessibility data and app controls are not available.</p>}</div>}</section><section className="settings-card computer-access-card"><div className="settings-card-heading"><span className="settings-symbol"><DesktopTower size={17} /></span><div><h3>Computer use for this project</h3><p>Let agents ask to inspect a window you choose. Each request opens the system picker; Tribe never captures in the background.</p></div></div><form className="computer-access-form" onSubmit={saveComputerAccess}><label className="computer-access-toggle"><input checked={computerEnabled} disabled={!project.id} onChange={(event) => setComputerEnabled(event.target.checked)} role="switch" type="checkbox" /><span className="computer-access-switch" aria-hidden="true" /><span>Allow agents to request a window observation</span></label>{computerError && <p className="recipe-error" role="alert">{computerError}</p>}<button className="button button--quiet" disabled={!project.id || computerSaving || computerEnabled === Boolean(computerAccess?.enabled)} type="submit">{computerSaving ? "Saving…" : "Save access"}</button></form></section></>}
           {activeSection === "data" && <>
-            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><ChartLine size={17} /></span><div><h3>Usage limits</h3><p>Set token and cost limits for {project.name || "this project"}.</p></div></div><MonthToDateUsage usage={usage} /><form className="usage-budget-form" onSubmit={saveBudget}><label htmlFor="agent-run-token-limit">Maximum tokens per agent run <small>Default is {DEFAULT_AGENT_RUN_TOKEN_LIMIT.toLocaleString()}. Increase this for longer requests; the model’s context window still applies.</small></label><input id="agent-run-token-limit" max="1000000000" min="1" onChange={(event) => setRunTokenInput(event.target.value)} placeholder={String(DEFAULT_AGENT_RUN_TOKEN_LIMIT)} type="number" value={runTokenInput} /><label htmlFor="monthly-token-limit">Monthly token limit <small>Leave blank for no monthly limit.</small></label><input id="monthly-token-limit" min="1" onChange={(event) => setBudgetInput(event.target.value)} placeholder="No limit" type="number" value={budgetInput} /><label htmlFor="agent-run-cost-limit">Cost per agent run (USD) <small>Leave blank for no run cost ceiling.</small></label><input id="agent-run-cost-limit" max="1000000" min="0.000001" onChange={(event) => setRunCostInput(event.target.value)} placeholder="No limit" step="any" type="number" value={runCostInput} /><small className="budget-limit-note">Best-effort provider estimate. Unpriced models cannot be capped, and the request that crosses a limit may still be billed.</small><div><button className="button button--quiet" disabled={budgetSaving || !project.id} type="submit">{budgetSaving ? "Saving…" : "Save limits"}</button></div></form></section>
+            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><ChartLine size={17} /></span><div><h3>Usage limits</h3><p>Set token and cost limits for {project.name || "this project"}.</p></div></div><MonthToDateUsage usage={usage} /><form className="usage-budget-form" onSubmit={saveBudget}><label htmlFor="agent-run-token-limit">Maximum tokens per agent run <small>No cumulative limit by default. This run budget is separate from the model’s per-request context window; Tribe compacts long conversation history to keep it within that window.</small></label><input id="agent-run-token-limit" max="1000000000" min="1" onChange={(event) => setRunTokenInput(event.target.value)} placeholder="No limit" type="number" value={runTokenInput} /><label htmlFor="monthly-token-limit">Monthly token limit <small>Leave blank for no monthly limit.</small></label><input id="monthly-token-limit" min="1" onChange={(event) => setBudgetInput(event.target.value)} placeholder="No limit" type="number" value={budgetInput} /><label htmlFor="agent-run-cost-limit">Cost per agent run (USD) <small>Leave blank for no run cost ceiling.</small></label><input id="agent-run-cost-limit" max="1000000" min="0.000001" onChange={(event) => setRunCostInput(event.target.value)} placeholder="No limit" step="any" type="number" value={runCostInput} /><small className="budget-limit-note">Best-effort provider estimate. Unpriced models cannot be capped, and the request that crosses a limit may still be billed.</small><div><button className="button button--quiet" disabled={budgetSaving || !project.id} type="submit">{budgetSaving ? "Saving…" : "Save limits"}</button></div></form></section>
             <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><FolderSimple size={17} /></span><div><h3>Project activity</h3><p>{project.name ? `Download messages and agent updates from ${project.name}.` : "Choose a project to export its activity."} The export contains activity and artifact metadata, not file contents.</p></div></div>{auditError && <p className="recipe-error" role="alert">{auditError}</p>}<button className="button button--quiet" disabled={!project.id || auditPending || runtimeStatus !== "connected"} onClick={downloadAudit} type="button"><DownloadSimple size={15} />{auditPending ? "Preparing export…" : "Download activity"}</button></section>
             <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><ShieldCheck size={17} /></span><div><h3>Workspace backup</h3><p>Includes projects, chat activity, plans, shared files and agent conversation context. Repository files and saved credentials are excluded.</p></div></div>{backupError && <p className="recipe-error" role="alert">{backupError}</p>}<button className="button button--quiet" disabled={backupPending || runtimeStatus !== "connected"} onClick={downloadBackup} type="button"><DownloadSimple size={15} />{backupPending ? "Preparing backup…" : "Download backup"}</button></section>
             <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><UploadSimple size={17} /></span><div><h3>Restore a workspace</h3><p>Import a Tribe backup. Agent roles, workflows and connected-service settings on this device are kept.</p></div></div>
@@ -687,6 +786,7 @@ function settingsDescription(section, projectName) {
     commands: projectName ? `Choose background command tools for ${projectName}.` : "Choose a project to configure its command tools.",
     desktop: "Review the permissions needed for computer-use features.",
     data: "Set usage limits and manage workspace exports.",
+    experimental: "Try optional agent features and compare their measured usage.",
   })[section];
 }
 

@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
 import {
-  ArrowDownRight, ArrowSquareOut, BellSimple, CaretDown, CaretRight, ChatCircleDots, CheckCircle, Code,
+  ArrowDownRight, ArrowSquareOut, BellSimple, CaretDown, CaretRight, ChatCircleDots, Code,
   Check, CircleNotch, Copy, CornersIn, FileText, GitDiff, ListChecks,
-  Gear, MagnifyingGlass, Paperclip, PaperPlaneRight, ShieldCheck, Sparkle, Stop, Trash, WarningCircle, Wrench, X,
+  MagnifyingGlass, Paperclip, PaperPlaneRight, ShieldCheck, Sparkle, Stop, Trash, WarningCircle, Wrench, X,
   UsersThree,
 } from "@phosphor-icons/react";
 import { initialAgents } from "../data/workspace.js";
 import { IconButton } from "../components/WorkspaceSidebar.jsx";
+import { shareableArtifacts } from "../domain/artifacts.js";
 import { MessageMarkdown } from "../components/MarkdownContent.jsx";
-import { filterTimelineMessages, groupActivityMessages, mergeTimelineMessages } from "../domain/activity.js";
+import { deduplicateAgentActivityMessages, filterTimelineMessages, groupActivityMessages, mergeTimelineMessages } from "../domain/activity.js";
 import { secureInteractiveDocument } from "../domain/interactive-artifact.js";
 import { agentStatusLabel } from "../domain/labels.js";
+import { channelFollowOutput, channelIsAtBottom, nextChannelPinnedState } from "../domain/channel-scroll.js";
 import { modelDisplayName, sortModelCatalog } from "../domain/model-catalog.js";
 import { runtime } from "../api/runtime.js";
 
@@ -48,11 +50,11 @@ export function AgentLanes({ agents, selectedAgentFilter, onSelect, onStop, clas
               <span className="agent-icon"><AgentIcon agent={agent} /></span>
               <span className="agent-name">{agent.name}</span>
             </button>
-            <span className={`agent-live ${["Not configured", "Provider setup failed", "Needs attention", "Waiting for you", "Waiting for budget", "Stopping"].includes(agent.status) ? "agent-live--attention" : agent.status === "Paused" ? "agent-live--paused" : ""}`}><i />{agentStatusLabel(agent.status)}</span>
-            {["Working", "Waiting for budget", "Stopping"].includes(agent.status) && <IconButton
+            <span className={`agent-live ${["Not configured", "Provider setup failed", "Needs attention", "Waiting for you", "Waiting for budget", "Retrying", "Stopping"].includes(agent.status) ? "agent-live--attention" : agent.status === "Paused" ? "agent-live--paused" : ""}`}><i />{agentStatusLabel(agent.status)}</span>
+            {["Working", "Waiting for budget", "Retrying", "Stopping"].includes(agent.status) && <IconButton
               className="agent-stop-button"
               disabled={stopping.has(agent.id) || agent.status === "Stopping"}
-              label={stopping.has(agent.id) || agent.status === "Stopping" ? `Stopping ${agent.name}` : `Stop ${agent.name}'s current run`}
+              label={stopping.has(agent.id) || agent.status === "Stopping" ? `Stopping ${agent.name}` : agent.status === "Retrying" ? `Cancel ${agent.name}'s scheduled retry` : `Stop ${agent.name}'s current run`}
               onClick={() => stopAgent(agent)}
             >{stopping.has(agent.id) || agent.status === "Stopping" ? <CircleNotch className="spin" size={15} /> : <Stop size={15} weight="fill" />}</IconButton>}
           </div>
@@ -65,6 +67,211 @@ export function AgentLanes({ agents, selectedAgentFilter, onSelect, onStop, clas
       })}
     </section>
   );
+}
+
+const activityAgentStatuses = new Set(["Working", "Waiting for you", "Retrying", "Waiting for budget", "Stopping"]);
+
+export function AgentActivityDock({ agents, onOpen }) {
+  const active = agents.filter((agent) => activityAgentStatuses.has(agent.status));
+  if (active.length === 0) return null;
+  return <div aria-label="Agents currently active" className="agent-activity-dock" role="group">
+    {active.map((agent) => <button
+      aria-label={`Open team activity · ${agent.name} ${agentStatusLabel(agent.status).toLowerCase()}`}
+      className={`agent-activity-chip agent-activity-chip--${agent.color}`}
+      key={agent.id}
+      onClick={() => onOpen()}
+      title={`${agent.name} · ${agentStatusLabel(agent.status)}`}
+      type="button"
+    >
+      <span className="agent-activity-chip-icon"><AgentIcon agent={agent} size={14} /></span>
+      <span>{agent.name}</span>
+      <i aria-hidden="true" className={`agent-activity-chip-dot agent-activity-chip-dot--${agent.status.toLowerCase().replaceAll(" ", "-")}`} />
+    </button>)}
+  </div>;
+}
+
+function observableActivity(message) {
+  if (message.kind === "message") return message.actorType === "human" || Boolean(message.recipientId || message.toolCallId);
+  const type = message.eventType ?? "";
+  return type.startsWith("agent.tool.") || type.startsWith("agent.run.")
+    || type.startsWith("repo.") || type.startsWith("plan.item.")
+    || type.startsWith("review.") || type.startsWith("artifact.")
+    || type.startsWith("canvas.") || type === "mission.blocked"
+    || type === "mission.completed";
+}
+
+function turnLabel(message, agentName) {
+  if (!message) return "Agent turn";
+  const excerpt = String(message.text ?? "").replace(/\s+/g, " ").trim();
+  const source = message.actorType === "human" ? "You"
+    : message.recipientId ? `${message.actor} → ${agentName}`
+      : message.actor;
+  if (!excerpt) return source;
+  const compact = excerpt.length > 72 ? `${excerpt.slice(0, 69).trimEnd()}…` : excerpt;
+  return `${source}: ${compact}`;
+}
+
+function compactExecutionSteps(events) {
+  const rows = [];
+  for (const event of events.filter((entry) => entry.eventType !== "compaction.receipt")) {
+    const previous = rows.at(-1);
+    const activityGroup = (entry) => {
+      if (["Read project file", "Read project files", "Searched project files"].includes(entry?.activityTitle)) return "project exploration";
+      return entry?.activityTitle;
+    };
+    const group = activityGroup(event);
+    const previousGroup = activityGroup(previous);
+    const withinBurst = Number.isFinite(event.timestamp) && Number.isFinite(previous?.timestamp)
+      && event.timestamp >= previous.timestamp && event.timestamp - previous.timestamp <= 180_000;
+    if (group && previousGroup === group && event.actor === previous.actor && withinBurst
+        && event.toolCallId && previous.events) {
+      previous.events.push(event);
+      previous.timestamp = event.timestamp;
+    } else if (group && previousGroup === group && event.actor === previous?.actor && withinBurst
+        && event.toolCallId) {
+      rows[rows.length - 1] = { ...previous, events: [previous, event] };
+    } else rows.push(event);
+  }
+  return rows.map((row) => {
+    if (!row.events) return row;
+    if (["Read project file", "Read project files", "Searched project files"].includes(row.activityTitle)) {
+      return { ...row, activityTitle: "Explored project files" };
+    }
+    return row;
+  });
+}
+
+export function AgentActivityView({ agents, messages, missionId,
+  hasOlderEvents = false, loadingOlderEvents = false, onLoadOlderEvents }) {
+  const [newStepCount, setNewStepCount] = useState(0);
+  const [expandedTurnKeys, setExpandedTurnKeys] = useState(null);
+  const timelineRef = useRef(null);
+  const timelineAtBottomRef = useRef(true);
+  const previousTimelineRef = useRef(null);
+  const turnGroups = useMemo(() => {
+    const entries = messages.filter(observableActivity);
+    const messageBySequence = new Map(messages.map((message) => [message.sequence, message]));
+    const deduplicated = deduplicateAgentActivityMessages(entries);
+    const grouped = new Map();
+    for (const entry of deduplicated) {
+      const sourceSequence = Number.isInteger(entry.triggerSequence) ? entry.triggerSequence : entry.sequence;
+      const key = `${entry.actorId}:${sourceSequence}`;
+      const group = grouped.get(key) ?? { key, actorId: entry.actorId, sourceSequence, events: [] };
+      group.events.push(entry);
+      grouped.set(key, group);
+    }
+    return [...grouped.values()].map((group) => {
+      const events = group.events.sort((left, right) =>
+        (left.timestamp ?? 0) - (right.timestamp ?? 0) || (left.sequence ?? 0) - (right.sequence ?? 0));
+      const prompt = messageBySequence.get(group.sourceSequence);
+      const actor = agents.find((agent) => agent.id === group.actorId);
+      const title = events.find((entry) => entry.workItemTitle)?.workItemTitle
+        || (prompt ? turnLabel(prompt, actor?.name ?? "Agent") : `Turn · ${events[0]?.time ?? ""}`);
+      return { ...group, title, events: compactExecutionSteps(events), timestamp: events[0]?.timestamp ?? 0 };
+    }).sort((left, right) => left.timestamp - right.timestamp);
+  }, [agents, messages]);
+  const timelineEvents = useMemo(() => turnGroups.flatMap((group) => group.events), [turnGroups]);
+  const timelineScope = missionId ?? "";
+  const timelineSignature = turnGroups.map((group) => `${group.key}:${group.events.map((event) => [
+    event.id, event.toolState, event.activityTitle, event.activityDetail, event.text,
+  ].join("\u001f")).join("\u001e")}`).join("\u001d");
+  const followLatest = (timeline) => requestAnimationFrame(() => {
+    if (timelineRef.current === timeline && timelineAtBottomRef.current) timeline.scrollTop = timeline.scrollHeight;
+  });
+  useLayoutEffect(() => {
+    const timeline = timelineRef.current;
+    if (!timeline || turnGroups.length === 0) return;
+    const previous = previousTimelineRef.current;
+    const changedMission = previous?.scope !== timelineScope;
+    const addedSteps = Math.max(0, timelineEvents.length - (changedMission ? 0 : previous?.count ?? 0));
+    const rowChanged = changedMission || previous?.signature !== timelineSignature;
+    if (changedMission) {
+      timelineAtBottomRef.current = true;
+      setNewStepCount(0);
+      setExpandedTurnKeys(new Set([turnGroups.at(-1).key]));
+      followLatest(timeline);
+    } else if (rowChanged) {
+      if (timelineAtBottomRef.current) {
+        setExpandedTurnKeys((current) => new Set([...(current ?? []), turnGroups.at(-1).key]));
+        followLatest(timeline);
+      }
+      else setNewStepCount((count) => count + Math.max(addedSteps, 1));
+    }
+    previousTimelineRef.current = { scope: timelineScope, count: timelineEvents.length, signature: timelineSignature };
+  }, [timelineEvents.length, timelineScope, timelineSignature, turnGroups.length]);
+
+  async function loadEarlierActivity() {
+    if (!hasOlderEvents || loadingOlderEvents || !onLoadOlderEvents || !timelineRef.current) return;
+    const timeline = timelineRef.current;
+    const previousHeight = timeline.scrollHeight;
+    const previousTop = timeline.scrollTop;
+    await onLoadOlderEvents();
+    requestAnimationFrame(() => {
+      if (timelineRef.current === timeline) timeline.scrollTop = timeline.scrollHeight - previousHeight + previousTop;
+    });
+  }
+
+  return <section aria-label="Agent activity" className="agent-activity-view">
+    <header className="agent-activity-heading">
+      <div><h2>Agent activity</h2><p>Each turn shows its handoffs and actions together.</p></div>
+    </header>
+    {turnGroups.length > 0 ? <div className="agent-activity-timeline-wrap">
+      <div aria-label="Team activity timeline" className="agent-activity-timeline" onScroll={(event) => {
+        const node = event.currentTarget;
+        timelineAtBottomRef.current = node.scrollHeight - node.scrollTop - node.clientHeight <= 48;
+        if (timelineAtBottomRef.current) setNewStepCount(0);
+      }} ref={timelineRef} role="list">
+      {hasOlderEvents && <div className="agent-activity-history"><button disabled={loadingOlderEvents} onClick={loadEarlierActivity} type="button">{loadingOlderEvents ? "Loading earlier activity…" : "Load earlier activity"}</button></div>}
+      {turnGroups.map((turn, index) => <details className="agent-activity-turn" key={turn.key} open={expandedTurnKeys?.has(turn.key) ?? index === turnGroups.length - 1} onToggle={(event) => {
+        const isOpen = event.currentTarget.open;
+        setExpandedTurnKeys((current) => {
+          const next = new Set(current ?? [turnGroups.at(-1)?.key].filter(Boolean));
+          if (isOpen) next.add(turn.key);
+          else next.delete(turn.key);
+          return next;
+        });
+      }}>
+        <summary className="agent-activity-turn-heading">
+          <span className="agent-activity-turn-marker" aria-hidden="true" />
+          <span className="agent-activity-turn-copy"><strong>{agents.find((agent) => agent.id === turn.actorId)?.name ?? turn.events[0]?.actor ?? "Agent"} · {turn.title}</strong><small>{turn.events.length} {turn.events.length === 1 ? "update" : "updates"}</small></span>
+          <time>{turn.events[0]?.time}</time>
+        </summary>
+        <div className="agent-activity-turn-events">
+      {turn.events.map((entry) => {
+        const isMessage = entry.kind === "message";
+        const groupedEvents = entry.events ?? [entry];
+        const isGrouped = groupedEvents.length > 1;
+        const groupedTitle = entry.activityTitle;
+        const label = isMessage && entry.recipient
+          ? `${entry.actor} → ${entry.recipient}`
+          : isMessage ? "Update" : entry.actor;
+        return <article className={`agent-activity-event ${isMessage ? "agent-activity-event--message" : ""}`} key={entry.id} role="listitem">
+          <time>{entry.time}</time>
+          <span aria-hidden="true" className="agent-activity-event-marker" />
+          <div className="agent-activity-event-content">
+            <strong>{isMessage ? label : isGrouped ? `${groupedTitle} · ${groupedEvents.length}` : entry.activityTitle ?? entry.actor}</strong>
+            {!isMessage && entry.activityTitle && <span className="agent-activity-event-actor">{entry.actor}</span>}
+            {isMessage ? <div className="agent-activity-event-message"><MessageMarkdown>{entry.text}</MessageMarkdown></div>
+              : !isGrouped && (entry.activityDetail || !entry.activityTitle) && <p>{entry.activityDetail || entry.text}</p>}
+            {isGrouped && <details className="agent-activity-event-steps">
+              <summary>Show {groupedEvents.length} steps</summary>
+              <ul>{groupedEvents.map((step) => <li key={step.id}><time>{step.time}</time><span>{step.activityDetail || step.text}</span></li>)}</ul>
+            </details>}
+            {entry.detail && <details><summary>Show diagnostic</summary><pre>{entry.detail}</pre></details>}
+          </div>
+        </article>;
+      })}
+        </div>
+      </details>)}
+      </div>
+      {!timelineAtBottomRef.current && newStepCount > 0 && <button aria-label={`Jump to ${newStepCount} new activity steps`} className="agent-activity-latest" onClick={() => {
+        const timeline = timelineRef.current;
+        if (timeline) timeline.scrollTo({ top: timeline.scrollHeight, behavior: "smooth" });
+        timelineAtBottomRef.current = true;
+        setNewStepCount(0);
+      }} type="button"><ArrowDownRight size={14} />{newStepCount} new {newStepCount === 1 ? "step" : "steps"}</button>}
+    </div> : <div className="agent-activity-empty"><span><UsersThree size={20} /></span><strong>No activity yet</strong><p>Agent handoffs and actions will appear here while the team works.</p></div>}
+  </section>;
 }
 
 function MessageAvatar({ actorId, actorType, agentDefinitions }) {
@@ -192,6 +399,7 @@ function ChangeEvent({ message, onOpenArtifact, onRecoverAgent, onOpenUsageSetti
     <div className={`change-event${message.runTokenLimit ? " change-event--budget" : ""}`} role="status">
       <span className="change-icon"><ArrowDownRight size={16} /></span>
       <span className="change-event-title">{message.text}</span>
+      {message.recoveryGuidance && <p className="change-event-recovery-guidance">{message.recoveryGuidance}</p>}
       {message.runTokenLimit && <p className="change-event-budget-note">Increase the project limit in Usage &amp; data, then retry.</p>}
       {message.detail && <details className="completion-evidence"><summary>Technical details</summary><p>{message.detail}</p></details>}
       {message.runTokenLimit && <div className="change-event-budget-actions">
@@ -260,7 +468,7 @@ function ChannelMessage({ message, agents, artifacts, onOpenArtifact, onOpenCanv
           )}
           <time>{message.time}</time>
           {message.actorType === "agent" && <span className="agent-tag">Agent</span>}
-          {message.actorType === "agent" && (runDuration || hasPartialTokenUsage) && <span aria-label={usageLabel} className={`message-run-usage${hasTokenUsage ? "" : " message-run-usage--incomplete"}`} title={usageLabel}>
+          {message.actorType === "agent" && message.showRunMetrics !== false && (runDuration || hasPartialTokenUsage) && <span aria-label={usageLabel} className={`message-run-usage${hasTokenUsage ? "" : " message-run-usage--incomplete"}`} title={usageLabel}>
             {[runDuration, visibleTokenUsage].filter(Boolean).join(" · ")}
           </span>}
           <button aria-live="polite" aria-label={copied ? "Message copied" : "Copy message"} className="message-copy-button" onClick={copyMessage} type="button">{copied ? <Check size={14} /> : <Copy size={14} />}</button>
@@ -356,7 +564,10 @@ const channelVirtuosoComponents = {
   Header: ChannelHistoryHeader,
   Footer: () => <div aria-hidden="true" className="channel-list-footer" />,
 };
-const channelAtBottomThreshold = 24;
+// Treat the reader as pinned when they are within roughly one compact row of
+// the end. Virtualised rows and the trailing spacer can otherwise leave a
+// small visual gap that incorrectly disables follow mode.
+const channelAtBottomThreshold = 48;
 
 function InteractionCard({ interaction, onResolve }) {
   const [answer, setAnswer] = useState("");
@@ -439,8 +650,10 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [modelListOpen, setModelListOpen] = useState(false);
   const [modelListSearch, setModelListSearch] = useState("");
+  const [recipientMenuOpen, setRecipientMenuOpen] = useState(false);
   const inputRef = useRef(null);
   const modelMenuRef = useRef(null);
+  const recipientMenuRef = useRef(null);
   const modelListSearchRef = useRef(null);
   const effortPreferenceRef = useRef("");
   const modelCatalogRequestRef = useRef(0);
@@ -488,6 +701,20 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
   }, [modelMenuOpen, modelListOpen]);
 
   useEffect(() => {
+    if (!recipientMenuOpen) return undefined;
+    function dismiss(event) {
+      if (event.key === "Escape") setRecipientMenuOpen(false);
+      else if (!recipientMenuRef.current?.contains(event.target)) setRecipientMenuOpen(false);
+    }
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("keydown", dismiss);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("keydown", dismiss);
+    };
+  }, [recipientMenuOpen]);
+
+  useEffect(() => {
     if (modelListOpen && modelCatalog.length > 8) modelListSearchRef.current?.focus();
   }, [modelListOpen, modelCatalog.length]);
 
@@ -524,6 +751,7 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
 
   function chooseRecipient(agent) {
     setRecipient(agent);
+    setRecipientMenuOpen(false);
     inputRef.current?.focus();
   }
 
@@ -618,11 +846,6 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
       {canvasContext && <div className="composer-canvas-context"><FileText size={15} /><span>{canvasContext.title} · Revision {canvasContext.revision}</span><button aria-label="Remove document context" onClick={() => setCanvasContext(null)} type="button">×</button></div>}
       {attachments.length > 0 && <div aria-label="Attached files" className="composer-attachments">{attachments.map((attachment) => <span className="composer-attachment" key={attachment.id}><FileText size={13} /><span title={attachment.name}>{attachment.name}</span><button aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))} type="button"><X size={13} /></button></span>)}</div>}
       {unsupportedAttachedModalities.length > 0 && <div className="composer-media-warning" role="alert"><WarningCircle aria-hidden="true" size={15} /><span>{receivingAgent?.name ?? "The selected model"}’s model doesn’t list support for {unsupportedAttachedModalities.join(", ")} input.</span><button onClick={resolveMediaWarning} type="button">{hasPinnedReceivingModel ? "Manage role" : "Choose model"}</button></div>}
-      {agents.length > 0 && <div aria-label="Choose who receives this message" className="composer-team-chips" role="group">
-        <button aria-pressed={!recipient} className={`composer-team-chip ${!recipient ? "composer-team-chip--selected" : ""}`} onClick={() => chooseRecipient(null)} title="Send to the team" type="button"><UsersThree size={14} />Team</button>
-        {agents.map((agent) => <button aria-pressed={recipient?.id === agent.id} className={`composer-team-chip ${recipient?.id === agent.id ? "composer-team-chip--selected" : ""}`} key={agent.id} onClick={() => chooseRecipient(recipient?.id === agent.id ? null : agent)} title={`${agent.name} · ${agent.role} · ${agentStatusLabel(agent.status)}`} type="button"><i className={`composer-team-dot ${["Not configured", "Provider setup failed", "Needs attention"].includes(agent.status) ? "composer-team-dot--attention" : ""}`} />{agent.name}</button>)}
-        <IconButton className="composer-team-manage" label="Manage project team" onClick={onManageTeam}><Gear size={14} /></IconButton>
-      </div>}
       <textarea
         ref={inputRef}
         aria-label={composerLabel}
@@ -639,6 +862,33 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
       />
       <div className="composer-tools">
         <IconButton label="Attach a file" onClick={() => onAttach((attachment) => setAttachments((current) => current.some((item) => item.id === attachment.id) ? current : [...current, attachment]))}><Paperclip size={19} /></IconButton>
+        {agents.length > 0 && <div className="composer-recipient-menu-wrap" ref={recipientMenuRef}>
+          <IconButton
+            aria-expanded={recipientMenuOpen}
+            aria-haspopup="dialog"
+            className={`composer-recipient-trigger${recipient || recipientMenuOpen ? " composer-recipient-trigger--active" : ""}`}
+            label={recipient ? `Message ${recipient.name}` : "Choose message recipient · Team"}
+            onClick={() => setRecipientMenuOpen((open) => !open)}
+          >
+            <UsersThree size={18} weight={recipient ? "fill" : "regular"} />
+            {recipient && <i className={`composer-team-dot ${["Not configured", "Provider setup failed", "Needs attention"].includes(recipient.status) ? "composer-team-dot--attention" : ""}`} />}
+          </IconButton>
+          {recipientMenuOpen && <div aria-label="Choose message recipient" className="composer-recipient-popover" role="dialog">
+            <div className="composer-recipient-heading">Send to</div>
+            <div aria-label="Message recipient" className="composer-recipient-options" role="group">
+              <button aria-pressed={!recipient} className={`composer-recipient-option${!recipient ? " composer-recipient-option--selected" : ""}`} onClick={() => chooseRecipient(null)} type="button">
+                <UsersThree aria-hidden="true" size={17} />
+                <span><strong>Team</strong><small>Send to the project team</small></span>
+                {!recipient && <Check aria-hidden="true" className="composer-recipient-check" size={15} />}
+              </button>
+              {agents.map((agent) => <button aria-pressed={recipient?.id === agent.id} className={`composer-recipient-option${recipient?.id === agent.id ? " composer-recipient-option--selected" : ""}`} key={agent.id} onClick={() => chooseRecipient(agent)} title={`${agent.role} · ${agentStatusLabel(agent.status)}`} type="button">
+                <i className={`composer-team-dot ${["Not configured", "Provider setup failed", "Needs attention"].includes(agent.status) ? "composer-team-dot--attention" : ""}`} />
+                <span><strong>{agent.name}</strong><small>{agent.role} · {agentStatusLabel(agent.status)}</small></span>
+                {recipient?.id === agent.id && <Check aria-hidden="true" className="composer-recipient-check" size={15} />}
+              </button>)}
+            </div>
+          </div>}
+        </div>}
         <div className="composer-model-menu-wrap" ref={modelMenuRef}>
           <button aria-expanded={modelMenuOpen} aria-haspopup="dialog" aria-label={`Model ${triggerModelLabel}${receivingAgent?.model ? `, pinned for ${receivingAgent.name}` : ""}, effort ${effortLabel}`} className={`composer-model-trigger${modelMenuOpen ? " composer-model-trigger--open" : ""}`} disabled={preferenceSaving} onClick={() => { setModelListOpen(false); setModelListSearch(""); if (!modelMenuOpen) void refreshModelCatalog(); setModelMenuOpen((open) => !open); }} type="button">
             <Sparkle aria-hidden="true" className="composer-model-trigger-icon" size={15} weight="fill" />
@@ -728,9 +978,10 @@ function MissionOutcomeReview({ messages, onReview }) {
 }
 
 export function ArtifactList({ artifacts, onSelect, compact = false }) {
+  const visibleArtifacts = shareableArtifacts(artifacts);
   return (
     <div className={`artifact-list ${compact ? "artifact-list--compact" : ""}`}>
-      {artifacts.map((artifact) => (
+      {visibleArtifacts.map((artifact) => (
         <button className="artifact-row" key={artifact.id} onClick={() => onSelect(artifact)} type="button">
           <span className={`artifact-icon artifact-icon--${artifact.icon}`}>
             {artifact.icon === "code" ? <Code size={18} /> : <FileText size={18} />}
@@ -747,16 +998,17 @@ export function ArtifactList({ artifacts, onSelect, compact = false }) {
 }
 
 function RightRail({ artifacts, activeInteraction, queuedInteractions, onSelectArtifact, onActivateInteraction }) {
+  const visibleArtifacts = shareableArtifacts(artifacts);
   const needsCount = queuedInteractions.length + (activeInteraction ? 1 : 0);
-  if (artifacts.length === 0 && needsCount === 0) return null;
+  if (visibleArtifacts.length === 0 && needsCount === 0) return null;
   return (
     <aside className="right-rail">
-      {artifacts.length > 0 && <section className="rail-section">
+      {visibleArtifacts.length > 0 && <section className="rail-section">
         <div className="rail-heading">
-          <h2>Artifacts <span>{artifacts.length}</span></h2>
-          <button className="text-button" onClick={() => onSelectArtifact(null)} type="button">View all <ArrowSquareOut size={14} /></button>
+          <h2>Artifacts <span>{visibleArtifacts.length}</span></h2>
+          <IconButton label="View all artifacts" onClick={() => onSelectArtifact(null)}><ArrowSquareOut size={15} /></IconButton>
         </div>
-        <ArtifactList artifacts={artifacts} compact onSelect={onSelectArtifact} />
+        <ArtifactList artifacts={visibleArtifacts} compact onSelect={onSelectArtifact} />
       </section>}
 
       {needsCount > 0 && <section className="rail-section rail-section--needs">
@@ -791,7 +1043,7 @@ function RightRail({ artifacts, activeInteraction, queuedInteractions, onSelectA
   );
 }
 
-export function MissionView({ mission, agents, agentDefinitions = agents, messages, artifacts, hasOlderEvents, loadingOlderEvents, onLoadOlderEvents, workItems, selectedWorkFilter, onSelectWorkFilter, query = "", isolatedWorkspaces, activeInteraction, queuedInteractions, runtimeStatus, workspaceModel, onSend, onRecoverAgent, onStopAgentRun, onResolve, onSelectArtifact, onOpenCanvas, composerDraft, onComposerDraftConsumed, onActivateInteraction, onAttach, onDiscardIsolation, onReviewOutcome, onConnectModel, onManageModelMetadata, onManageTeam, onOpenUsageSettings, onSaveModelPreferences, interactiveResponsesEnabled = false, onShareInteractiveAction }) {
+export function MissionView({ mission, agents, agentDefinitions = agents, messages, artifacts, hasOlderEvents, loadingOlderEvents, onLoadOlderEvents, workItems, query = "", isolatedWorkspaces, activeInteraction, queuedInteractions, runtimeStatus, workspaceModel, onSend, onRecoverAgent, onStopAgentRun, onResolve, onSelectArtifact, onOpenCanvas, composerDraft, onComposerDraftConsumed, onActivateInteraction, onAttach, onDiscardIsolation, onReviewOutcome, onConnectModel, onManageModelMetadata, onManageTeam, onOpenUsageSettings, onSaveModelPreferences, interactiveResponsesEnabled = false, onShareInteractiveAction, onOpenAgentActivity = () => {} }) {
   const activityRows = useMemo(() => groupActivityMessages(messages), [messages]);
   const workingAgents = agents.filter((agent) => agent.status === "Working");
   let latestHumanMessage = null;
@@ -811,6 +1063,10 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
   const channelListRef = useRef(null);
   const channelFrameRef = useRef(null);
   const isAtBottomRef = useRef(true);
+  const userScrollIntentRef = useRef(0);
+  const handledScrollIntentRef = useRef(0);
+  const userScrollPositionRef = useRef(0);
+  const userScrollTimeRef = useRef(0);
   const observedScopeRef = useRef("");
   const observedSequenceRef = useRef(null);
   const observedLatestTextRef = useRef("");
@@ -821,21 +1077,62 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
   const latestSequence = messages.at(-1)?.sequence ?? null;
   const latestMessageText = messages.at(-1)?.text ?? "";
   const scrollToLatest = useCallback((force = false) => {
-    const scroll = (allowWhenAway = false) => {
-      if (!allowWhenAway && !isAtBottomRef.current) return;
+    if (!force && !isAtBottomRef.current) return;
+    const intentAtRequest = userScrollIntentRef.current;
+    requestAnimationFrame(() => {
+      if (!force && userScrollIntentRef.current !== intentAtRequest) return;
       const list = channelListRef.current;
       if (list?.scrollToIndex) {
         list.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
       }
-      const scroller = channelFrameRef.current?.querySelector(".channel-scroll");
-      if (scroller) scroller.scrollTo({ top: scroller.scrollHeight, behavior: "auto" });
-    };
-    requestAnimationFrame(() => {
-      scroll(force);
-      requestAnimationFrame(() => scroll());
-      window.setTimeout(() => requestAnimationFrame(() => scroll()), 80);
     });
   }, []);
+
+  const syncAtBottom = useCallback((reportedAtBottom) => {
+    const scroller = channelFrameRef.current?.querySelector(".channel-scroll");
+    const hasFreshIntent = userScrollIntentRef.current !== handledScrollIntentRef.current
+      && Date.now() - userScrollTimeRef.current < 250;
+    const userMoved = hasFreshIntent && scroller
+      && Math.abs(scroller.scrollTop - userScrollPositionRef.current) > 1;
+    if (userMoved || (userScrollIntentRef.current !== handledScrollIntentRef.current && !hasFreshIntent)) {
+      handledScrollIntentRef.current = userScrollIntentRef.current;
+    }
+    // Measure the current viewport before trusting Virtuoso's callback: it can
+    // report a stale `true` after a reader has scrolled away. Keep the existing
+    // pinned intent when rows have grown but followOutput has not caught up.
+    const atBottom = channelIsAtBottom(scroller, channelAtBottomThreshold, reportedAtBottom, isAtBottomRef.current);
+    // A newly appended or resized row can make the browser briefly report that
+    // the viewport is no longer at the end. Keep the prior follow intent unless
+    // an actual user scroll moved the reader away.
+    const nextPinnedState = nextChannelPinnedState(isAtBottomRef.current, atBottom, userMoved);
+    if (nextPinnedState !== isAtBottomRef.current || atBottom) {
+      isAtBottomRef.current = nextPinnedState;
+      setIsAtBottom(nextPinnedState);
+      if (nextPinnedState) setNewMessageCount(0);
+    }
+  }, []);
+
+  useEffect(() => {
+    const scroller = channelFrameRef.current?.querySelector(".channel-scroll");
+    if (!scroller) return undefined;
+    const handleScroll = () => syncAtBottom();
+    const handleUserScrollIntent = () => {
+      userScrollIntentRef.current += 1;
+      userScrollPositionRef.current = scroller.scrollTop;
+      userScrollTimeRef.current = Date.now();
+    };
+    scroller.addEventListener("scroll", handleScroll, { passive: true });
+    scroller.addEventListener("wheel", handleUserScrollIntent, { passive: true });
+    scroller.addEventListener("touchmove", handleUserScrollIntent, { passive: true });
+    scroller.addEventListener("keydown", handleUserScrollIntent);
+    syncAtBottom();
+    return () => {
+      scroller.removeEventListener("scroll", handleScroll);
+      scroller.removeEventListener("wheel", handleUserScrollIntent);
+      scroller.removeEventListener("touchmove", handleUserScrollIntent);
+      scroller.removeEventListener("keydown", handleUserScrollIntent);
+    };
+  }, [mission?.id, syncAtBottom]);
 
   useEffect(() => {
     const frame = channelFrameRef.current;
@@ -849,8 +1146,7 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
       height = frame.clientHeight;
       if (!resized) return;
       const scroller = frame.querySelector(".channel-scroll");
-      const isAtBottomNow = scroller
-        && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= channelAtBottomThreshold;
+      const isAtBottomNow = channelIsAtBottom(scroller, channelAtBottomThreshold, undefined, isAtBottomRef.current);
       if (!isAtBottomNow && !isAtBottomRef.current) return;
       if (isAtBottomNow) {
         isAtBottomRef.current = true;
@@ -868,7 +1164,7 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
   }, [scrollToLatest]);
 
   useLayoutEffect(() => {
-    const scope = `${mission?.id ?? ""}:${selectedWorkFilter}:${query}`;
+    const scope = `${mission?.id ?? ""}:${query}`;
     if (observedScopeRef.current !== scope) {
       observedScopeRef.current = scope;
       observedSequenceRef.current = latestSequence;
@@ -907,23 +1203,19 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
       scrollToLatest();
       setNewMessageCount(0);
     } else {
-      const addedMessages = messages.filter((message) => message.sequence > previousSequence && message.kind === "message").length;
+      const addedMessages = messages.filter((message) => message.sequence > previousSequence).length;
       if (addedMessages > 0) setNewMessageCount((count) => count + addedMessages);
     }
-  }, [mission?.id, selectedWorkFilter, query, latestSequence, latestMessageText, activityRows, messages, scrollToLatest]);
+  }, [mission?.id, query, latestSequence, latestMessageText, activityRows, messages, scrollToLatest]);
 
   function handleAtBottomChange(atBottom) {
-    isAtBottomRef.current = atBottom;
-    setIsAtBottom(atBottom);
-    if (atBottom) setNewMessageCount(0);
+    syncAtBottom(atBottom);
   }
 
   async function loadEarlierActivity() {
     if (!hasOlderEvents || loadingOlderEvents) return;
     await onLoadOlderEvents((earlierMessages) => {
-      const visibleEarlierMessages = filterTimelineMessages(earlierMessages, {
-        workItemId: selectedWorkFilter, query,
-      });
+      const visibleEarlierMessages = filterConversationMessages(filterTimelineMessages(earlierMessages, { query }), [...messages, ...earlierMessages]);
       const updatedRows = groupActivityMessages(mergeTimelineMessages(messages, visibleEarlierMessages));
       const addedRows = Math.max(0, updatedRows.length - activityRows.length);
       if (addedRows === 0) return;
@@ -949,7 +1241,7 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
           <button className="button button--subtle" onClick={() => onDiscardIsolation(workspace)} type="button">Discard work</button>
         </div>)}
       </section>}
-      <div className={`workspace-columns ${artifacts.length === 0 && queuedInteractions.length === 0 && !activeInteraction ? "workspace-columns--channel-only" : ""}`}>
+      <div className={`workspace-columns ${shareableArtifacts(artifacts).length === 0 && queuedInteractions.length === 0 && !activeInteraction ? "workspace-columns--channel-only" : ""}`}>
         <section className="channel-panel">
           <div className="channel-presence">
             {workingAgents.length > 0
@@ -957,21 +1249,16 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
               : awaitingAgentResponse
                 ? <span aria-label={`Waiting for ${requestedAgent.name} to reply`} aria-live="polite" className="channel-live channel-live--waiting" role="status"><CircleNotch className="spin" size={12} />Waiting for {requestedAgent.name}…</span>
               : <span className={`channel-live ${runtimeStatus === "offline" ? "channel-live--offline" : ""}`}><i /> {runtimeStatus === "connected" ? "Live" : runtimeStatus === "offline" ? "Offline" : "Reconnecting…"}</span>}
+            <AgentActivityDock agents={agents} onOpen={onOpenAgentActivity} />
           </div>
-          {workItems.length > 0 && <nav className="channel-task-filters" aria-label="Filter chat activity">
-            <button className={!selectedWorkFilter ? "channel-task-filter channel-task-filter--selected" : "channel-task-filter"} onClick={() => onSelectWorkFilter("")} type="button">All activity</button>
-            {workItems.map((item) => <button
-              className={selectedWorkFilter === item.workItemId ? "channel-task-filter channel-task-filter--selected" : "channel-task-filter"}
-              key={item.workItemId}
-              onClick={() => onSelectWorkFilter(item.workItemId)}
-              title={`${item.status} · ${item.title}`}
-              type="button"
-            >{item.title}</button>)}
-          </nav>}
           <div className="channel-scroll-frame" ref={channelFrameRef}>
-            {activityRows.length === 0 ? <div className={`channel-empty ${query || selectedWorkFilter ? "channel-empty--filtered" : ""}`}>
-              {query || selectedWorkFilter
+            {activityRows.length === 0 ? <div className={`channel-empty ${query ? "channel-empty--filtered" : ""}`}>
+              {query
                 ? <><strong>No messages found</strong><span>Try another search or clear the current filter.</span></>
+                : hasOlderEvents || loadingOlderEvents
+                  ? <><span className="channel-empty-icon"><CircleNotch className="spin" size={22} /></span><strong>Loading the conversation</strong><span>Earlier messages are being loaded.</span></>
+                : mission?.status === "active" && agents.some((agent) => activityAgentStatuses.has(agent.status))
+                  ? <><span className="channel-empty-icon"><UsersThree size={23} /></span><strong>The team is working</strong><span>Open an agent’s activity above to follow the execution.</span></>
                 : <><span className="channel-empty-icon"><ChatCircleDots size={25} /></span><strong>What would you like to work on?</strong><span>Ask a question or describe a change to this project.</span></>}
             </div> : <Virtuoso
               alignToBottom
@@ -983,7 +1270,7 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
               context={{ hasOlderEvents, loadingOlderEvents, onLoadOlderEvents: loadEarlierActivity }}
               data={activityRows}
               firstItemIndex={firstItemIndex}
-              followOutput={(atBottom) => atBottom ? "auto" : false}
+              followOutput={() => channelFollowOutput(isAtBottomRef.current)}
               initialTopMostItemIndex={Math.max(0, activityRows.length - 1)}
               itemContent={(index, row) => {
               const relativeIndex = index - firstItemIndex;
@@ -1005,10 +1292,10 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
               ref={channelListRef}
               style={{ flex: 1, minHeight: 0 }}
             />}
-          {!isAtBottom && newMessageCount > 0 && <button aria-label={`Jump to ${newMessageCount} new ${newMessageCount === 1 ? "message" : "messages"}`} aria-live="polite" className="channel-latest-button" onClick={jumpToLatest} title="Jump to latest" type="button">
-            <ArrowDownRight size={15} /><span>{newMessageCount > 99 ? "99+" : newMessageCount} new {newMessageCount === 1 ? "message" : "messages"}</span>
-          </button>}
           </div>
+          {!isAtBottom && newMessageCount > 0 && <button aria-label={`Jump to ${newMessageCount} new ${newMessageCount === 1 ? "update" : "updates"}`} aria-live="polite" className="channel-latest-button" onClick={jumpToLatest} title="Jump to latest" type="button">
+            <ArrowDownRight size={15} /><span>{newMessageCount > 99 ? "99+" : newMessageCount} new {newMessageCount === 1 ? "update" : "updates"}</span>
+          </button>}
           <div className="channel-compose-area">
             {mission?.archived_at && <div className="archived-mission-note" role="status">This chat is archived. Restore it to continue the conversation.</div>}
             {mission?.status === "completed" && <MissionOutcomeReview messages={messages} onReview={onReviewOutcome} />}

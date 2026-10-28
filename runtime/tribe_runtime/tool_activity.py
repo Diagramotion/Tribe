@@ -4,8 +4,52 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from typing import Any
 from urllib.parse import urlsplit
+
+
+_NODE_TAP_SUMMARY = {
+    "tests": re.compile(r"(?m)^# tests (\d+)\s*$"),
+    "pass": re.compile(r"(?m)^# pass (\d+)\s*$"),
+    "fail": re.compile(r"(?m)^# fail (\d+)\s*$"),
+}
+_EXIT_CODE = re.compile(r"(?m)^\[exit code: (-?\d+)\]\s*$")
+
+
+def node_test_run_evidence(command: str, output: object) -> dict[str, object] | None:
+    """Recognise a completed Node TAP test run emitted by Harness Shell.
+
+    Harness returns output as a string and omits a zero exit-code marker. Only
+    accept a direct `node --test` invocation with a complete TAP summary so an
+    arbitrary shell command or partial/timeout output cannot satisfy review.
+    """
+    if not isinstance(output, str) or "[Command timed out" in output:
+        return None
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if len(argv) < 3 or argv[:2] != ["node", "--test"]:
+        return None
+    if any(token in {"&&", "||", ";", "|", ">", "<"} for token in argv):
+        return None
+
+    counts: dict[str, int] = {}
+    for label, pattern in _NODE_TAP_SUMMARY.items():
+        match = pattern.search(output)
+        if not match:
+            return None
+        counts[label] = int(match.group(1))
+    if counts["tests"] < 1 or counts["pass"] + counts["fail"] != counts["tests"]:
+        return None
+
+    exit_match = _EXIT_CODE.search(output)
+    exit_code = int(exit_match.group(1)) if exit_match else (0 if counts["fail"] == 0 else 1)
+    if exit_code == 0 and counts["fail"] != 0:
+        return None
+    return {"argv": argv, "exitCode": exit_code, "stdout": output, "stderr": "",
+            "testCount": counts["tests"], "passed": counts["pass"], "failed": counts["fail"]}
 
 
 _BROWSER_ACTIONS = {

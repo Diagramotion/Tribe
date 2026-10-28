@@ -14,7 +14,7 @@
     "desktop:prepare": "python scripts/prepare-macos-swift-runtime.py",
     "runtime:package": "python scripts/package-runtime.py",
     "test:sites": "node --test tests/sites-worker.test.mjs",
-    "test:ui": "node --test tests/activity.test.mjs tests/plan.test.mjs tests/runtime-events.test.mjs tests/canvas-diff.test.mjs tests/canvas-export.test.mjs tests/canvas-selection.test.mjs tests/artifact-preview.test.mjs tests/artifact-anchor.test.mjs tests/computer-capture.test.mjs tests/interactive-artifact.test.mjs tests/settings-view.test.mjs tests/remote-service-form.test.mjs tests/schedules.test.mjs tests/schedule-view.test.mjs tests/slash-commands.test.mjs"
+    "test:ui": "node --test tests/activity.test.mjs tests/channel-scroll.test.mjs tests/plan.test.mjs tests/runtime-events.test.mjs tests/canvas-diff.test.mjs tests/canvas-export.test.mjs tests/canvas-selection.test.mjs tests/artifact-preview.test.mjs tests/artifact-anchor.test.mjs tests/computer-capture.test.mjs tests/interactive-artifact.test.mjs tests/settings-view.test.mjs tests/remote-service-form.test.mjs tests/schedules.test.mjs tests/schedule-view.test.mjs tests/slash-commands.test.mjs"
   },
   "dependencies": {
     "@codemirror/lang-css": "^6.3.1",

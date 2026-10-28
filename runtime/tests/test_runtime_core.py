@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import ClassVar
+from typing import Any, ClassVar
 from unittest.mock import patch
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
@@ -33,10 +33,19 @@ from tribe_runtime.agent_runtime import (
     AgentWorker,
     PydanticAIProvider,
     _build_agent,
+    _agent_conversation_id,
     _continuable_prior_runs,
+    _agent_can_read_context_event,
+    _has_unresolved_harness_tool_effects,
+    _durable_tool_output,
+    _count_compaction_receipts,
+    _agent_failure_kind,
+    _project_team_context,
+    _user_facing_agent_text,
     _next_agent_reply_metadata,
     _provider_retry_delay,
-    _tools_for_repository_access,
+    _scheduled_provider_retry_delay,
+    _tools_for_agent,
 )
 from tribe_runtime.agents import (
     AgentDefinition,
@@ -46,8 +55,9 @@ from tribe_runtime.agents import (
     load_agent_definitions,
     write_agent_definition,
 )
-from tribe_runtime.harness_capabilities import build_capabilities
+from tribe_runtime.harness_capabilities import _compaction_keep_tokens, build_capabilities
 from tribe_runtime.mcp_registry import MCPRegistry
+from tribe_runtime import project_memory
 from tribe_runtime.recipes import get_recipe, list_recipes, save_recipe
 from tribe_runtime.skills import SkillCatalog
 from tribe_runtime.store import SCHEMA_VERSION, MissionStore
@@ -71,9 +81,30 @@ def _database_connection(path: Path):
 
 
 class RuntimeCase(unittest.TestCase):
+    def test_compaction_retained_context_scales_below_eight_thousand_tokens(self) -> None:
+        self.assertEqual(_compaction_keep_tokens(16_000), 3_200)
+        self.assertEqual(_compaction_keep_tokens(1_000_000), 200_000)
+        self.assertEqual(_compaction_keep_tokens(None), 32_000)
+
+    def test_agent_channel_copy_removes_internal_identifiers(self) -> None:
+        text = (
+            "Tests passed (run 7a8d9474-e130-42fe-afdd-9914ee3789a4) "
+            "after tool call_abcdefghijklmnop."
+        )
+        cleaned = _user_facing_agent_text(text)
+        self.assertNotIn("7a8d9474-e130-42fe-afdd-9914ee3789a4", cleaned)
+        self.assertNotIn("call_abcdefghijklmnop", cleaned)
+        self.assertIn("Tests passed", cleaned)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="tribe-runtime-test-")
         self.root = Path(self.temp.name)
+        self._smriti_environment = patch.dict(
+            os.environ, {"SMRITI_MEMORY_ROOT": str(self.root / "smriti")}
+        )
+        self._smriti_environment.start()
+        with project_memory._LOCK:
+            project_memory._STORES.clear()
         self.repository = self.root / "repository"
         self.repository.mkdir()
         self.git("init", "-q")
@@ -88,6 +119,9 @@ class RuntimeCase(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        with project_memory._LOCK:
+            project_memory._STORES.clear()
+        self._smriti_environment.stop()
         self.temp.cleanup()
 
     def git(self, *args: str) -> str:
@@ -95,6 +129,16 @@ class RuntimeCase(unittest.TestCase):
             ["git", *args], cwd=self.repository, check=True, capture_output=True, text=True
         )
         return result.stdout.strip()
+
+    @staticmethod
+    def reveal_deferred_test_tools(agent: Any, capabilities: list[Any] | None = None) -> None:
+        """Let TestModel call named tools directly without simulating ToolSearch."""
+        for tool in getattr(agent._function_toolset, "tools", {}).values():
+            if getattr(tool, "defer_loading", False):
+                tool.defer_loading = False
+        for capability in capabilities or []:
+            if getattr(capability, "defer_loading", False):
+                capability.defer_loading = False
 
     def test_mcp_registry_validates_scope_and_marks_only_read_only_tools_approval_free(self) -> None:
         registry = MCPRegistry(self.store)
@@ -121,7 +165,7 @@ class RuntimeCase(unittest.TestCase):
         self.assertEqual(registry.server_for_tool(self.project["id"], "docs_publish"), ("docs", "publish"))
         with patch.dict(os.environ, {"TRIBE_TEST_DOCS_TOKEN": "test-token"}):
             runtime_config = registry._runtime_config(self.project["id"])
-            self.assertEqual(len(registry.load_toolsets(self.project["id"])), 1)
+            self.assertEqual(len(registry.load_toolsets(self.project["id"], ("mcp:*",))), 1)
         self.assertNotIn("readOnlyTools", runtime_config["mcpServers"]["docs"])
         self.assertEqual(runtime_config["mcpServers"]["docs"]["env"]["DOCS_TOKEN"], "test-token")
         self.assertEqual(runtime_config["mcpServers"]["docs"]["cwd"], str(self.repository.resolve()))
@@ -310,7 +354,7 @@ class RuntimeCase(unittest.TestCase):
             return [local_toolset]
 
         with patch("pydantic_ai.mcp.load_mcp_toolsets", side_effect=load_standard_toolsets):
-            toolsets = registry.load_toolsets(self.project["id"])
+            toolsets = registry.load_toolsets(self.project["id"], ("mcp:*",))
 
         self.assertEqual(len(toolsets), 2)
         self.assertNotIn("docs", loaded_configurations[0]["mcpServers"])
@@ -358,7 +402,7 @@ class RuntimeCase(unittest.TestCase):
 
         toolset = FilterableToolset()
         with patch("pydantic_ai.mcp.load_mcp_toolsets", return_value=[toolset]) as load:
-            loaded = registry.load_toolsets(self.project["id"])
+            loaded = registry.load_toolsets(self.project["id"], ("mcp:*",))
         load.assert_called_once()
         self.assertEqual(loaded, [toolset])
         self.assertTrue(toolset.predicate(None, SimpleNamespace(name="active_search")))
@@ -456,7 +500,7 @@ for line in sys.stdin:
         docs_toolset = FilterableToolset()
         browser_toolset = FilterableToolset()
         with patch("pydantic_ai.mcp.load_mcp_toolsets", return_value=[docs_toolset, browser_toolset]):
-            registry.load_toolsets(self.project["id"])
+            registry.load_toolsets(self.project["id"], ("mcp:*",))
         self.assertTrue(browser_toolset.predicate(None, SimpleNamespace(name="playwright_browser_navigate")))
         self.store.set_project_web_access(self.project["id"], False, ["docs.python.org"])
         self.assertFalse(browser_toolset.predicate(None, SimpleNamespace(name="playwright_browser_navigate")))
@@ -469,11 +513,16 @@ for line in sys.stdin:
         user_dir = self.root / "data" / "recipes"
         builtin = get_recipe(builtin_dir, user_dir, "goal-driven-sdlc")
         self.assertIsNotNone(builtin)
-        self.assertEqual(builtin.version, 7)
+        self.assertEqual(builtin.version, 9)
+        self.assertEqual([stage["id"] for stage in builtin.stages], [
+            "discovery", "planning", "building", "verification", "review", "finish",
+        ])
 
         saved = save_recipe(user_dir, "goal-driven-sdlc", "My SDLC", "A custom delivery flow.",
-                            "Discover, implement, verify, and review.", builtin_dir)
+                            "Discover, implement, verify, and review.", builtin_dir,
+                            [{"id": "research", "title": "Research"}, {"id": "synthesis", "title": "Synthesis"}])
         self.assertEqual(saved.version, builtin.version + 1)
+        self.assertEqual([stage["title"] for stage in saved.stages], ["Research", "Synthesis"])
         self.assertEqual(get_recipe(builtin_dir, user_dir, saved.id).source, "user")
         self.assertEqual(len(list_recipes(builtin_dir, user_dir)), 3)
 
@@ -485,6 +534,42 @@ for line in sys.stdin:
         self.assertEqual(json.loads(restored["recipe_snapshot"])["instructions"], saved.instructions)
         event = self.store.events_after(mission["id"], 0)[0]
         self.assertEqual(event["payload"]["workflow"]["version"], saved.version)
+
+    def test_workflow_progress_stage_is_durable_and_bound_to_the_mission_snapshot(self) -> None:
+        workflow = {
+            "id": "research-flow", "version": 1, "title": "Research flow",
+            "description": "Research then synthesise.", "instructions": "Follow the stages.",
+            "stages": [{"id": "research", "title": "Research"},
+                       {"id": "synthesis", "title": "Synthesis"}],
+        }
+        mission = self.store.create_mission(
+            self.project["id"], "Workflow stage", "Run a research workflow", workflow,
+        )
+        first = self.store.set_mission_workflow_stage(mission["id"], "planner", "research", "Inspect sources")
+        self.assertTrue(first["changed"])
+        self.assertEqual(self.store.mission(mission["id"])["workflow_context"]["stage"]["title"], "Research")
+        repeated = self.store.set_mission_workflow_stage(mission["id"], "planner", "research")
+        self.assertFalse(repeated["changed"])
+        with self.assertRaisesRegex(ValueError, "workflow_stage_not_in_selected_workflow"):
+            self.store.set_mission_workflow_stage(mission["id"], "planner", "not-a-stage")
+
+    def test_workflow_stage_tool_is_exposed_only_by_profile_permission(self) -> None:
+        permitted = AgentDefinition(
+            "planner", "Planner", "Planning", "", "planner.md",
+            tool_permissions=("set_workflow_stage",),
+        )
+        agent = _build_agent(permitted, "openai:test-model")
+        allowed = _tools_for_agent(agent, "read_only", permitted.tool_permissions)
+        denied = _tools_for_agent(agent, "read_only", ())
+        self.assertIn("update_workflow_state", {tool.name for tool in allowed})
+        self.assertNotIn("update_workflow_state", {tool.name for tool in denied})
+        self.assertTrue(all(
+            tool.defer_loading for tool in agent._function_toolset.tools.values()
+            if tool.name in {
+                "list_workflows", "get_workflow", "activate_workflow",
+                "get_workflow_state", "update_workflow_state",
+            }
+        ))
 
     def test_new_mission_records_selected_skills_and_initial_message_routing(self) -> None:
         mission = self.store.create_mission(
@@ -526,145 +611,87 @@ for line in sys.stdin:
                 http.server_close()
                 thread.join(timeout=3)
 
-    def test_goal_driven_sdlc_repository_actions_require_a_live_plan_claim(self) -> None:
+    def test_workflow_choice_does_not_gate_profile_granted_repository_actions(self) -> None:
         mission = self.store.create_mission(
-            self.project["id"], "Planned delivery", "Implement a change",
-            {"id": "goal-driven-sdlc", "version": 1, "title": "Goal-driven SDLC",
-             "instructions": "Plan, implement, verify and review."},
+            self.project["id"], "Guided delivery", "Implement a change",
+            {"id": "goal-driven-sdlc", "version": 7, "title": "Goal-driven SDLC"},
         )
         workspace = WorkspaceTools(self.store, mission["id"], "builder")
-        with self.assertRaisesRegex(PermissionError, "current finalized plan"):
-            workspace.write_file("unplanned.txt", "must not be written")
-        self.assertFalse((self.repository / "unplanned.txt").exists())
-        with self.assertRaisesRegex(PermissionError, "current finalized plan"):
-            workspace.run_tests(["pytest", "--version"])
-        self.assertFalse(any(event["type"] == "repo.test_run.started"
-                            for event in self.store.events_after(mission["id"], 0)))
+        workspace.write_file("without-plan.txt", "profile access is the repository boundary")
+        self.assertTrue((self.repository / "without-plan.txt").is_file())
 
-        item = self.store.create_work_item(mission["id"], "Implement change", "Write and verify the feature")
-        with self.assertRaisesRegex(PermissionError, "current finalized plan"):
-            self.store.claim_work(mission["id"], "builder")
-        self.store.finalize_plan(mission["id"], "planner", [{
-            "criterion": "Implement and verify the change", "work_item_ids": [item["id"]],
-        }])
-        claim = self.store.claim_work(mission["id"], "builder")
-        self.assertEqual(claim["id"], item["id"])
-        claimed_workspace = WorkspaceTools(self.store, mission["id"], "builder", claim["id"])
-        self.assertEqual(claimed_workspace.write_file("planned.txt", "written under a live claim")['change'], "created")
-        self.assertEqual((self.repository / "planned.txt").read_text(encoding="utf-8"),
-                         "written under a live claim")
-        with self.store._connect() as db:
-            db.execute("UPDATE work_items SET lease_until = ? WHERE id = ?",
-                       ("2000-01-01T00:00:00+00:00", claim["id"]))
-        with self.assertRaisesRegex(PermissionError, "live plan-item claim"):
-            claimed_workspace.write_file("expired.txt", "must not be written")
-        self.assertFalse((self.repository / "expired.txt").exists())
+        first = self.store.create_work_item(mission["id"], "Implement change")
+        claim = self.store.claim_work(mission["id"], "builder", work_item_id=first["id"])
+        self.assertEqual(claim["id"], first["id"])
+        second = self.store.create_work_item(mission["id"], "Verify the change")
+        self.assertEqual(self.store.work_items(mission["id"])[0]["status"], "claimed")
+        self.store.complete_work(first["id"], "builder", "Implemented the requested change")
+        next_claim = self.store.claim_work(mission["id"], "reviewer", work_item_id=second["id"])
+        self.assertEqual(next_claim["id"], second["id"])
 
-    def test_goal_driven_sdlc_plan_checkpoint_is_planner_owned_and_invalidated_by_replanning(self) -> None:
+    def test_finalized_plan_is_optional_and_replanning_does_not_revoke_claims(self) -> None:
         mission = self.store.create_mission(
-            self.project["id"], "Plan checkpoint", "Deliver a verified change",
-            {"id": "goal-driven-sdlc", "version": 3, "title": "Goal-driven SDLC"},
-        )
-        with self.assertRaisesRegex(PermissionError, "only the planner"):
-            self.store.finalize_plan(mission["id"], "builder", ["Change is delivered"])
-        with self.assertRaisesRegex(ValueError, "at_least_one_work_item"):
-            self.store.finalize_plan(mission["id"], "planner", [{
-                "criterion": "Change is delivered", "work_item_ids": ["missing"],
-            }])
-
-        item = self.store.create_work_item(mission["id"], "Implement and verify the change")
-        self.store.finalize_plan(mission["id"], "planner", [{
-            "criterion": "Change is delivered", "work_item_ids": [item["id"]],
-        }])
-        claim = self.store.claim_work(mission["id"], "builder", work_item_id=item["id"])
-        workspace = WorkspaceTools(self.store, mission["id"], "builder", claim["id"])
-        workspace.write_file("first.txt", "planned")
-
-        self.store.create_work_item(mission["id"], "Investigate a newly found edge case")
-        with self.assertRaisesRegex(PermissionError, "current finalized plan"):
-            self.store.claim_work(mission["id"], "reviewer")
-        released = self.store.work_items(mission["id"])[0]
-        self.assertEqual((released["status"], released["owner"], released["lease_until"]),
-                         ("ready", None, None))
-        with self.assertRaisesRegex(PermissionError, "finalized plan is stale"):
-            self.store.complete_work(claim["id"], "builder", "stale completion")
-        with self.assertRaisesRegex(PermissionError, "current finalized plan"):
-            workspace.write_file("stale-plan.txt", "must not be written")
-        self.assertFalse((self.repository / "stale-plan.txt").exists())
-        second = self.store.work_items(mission["id"])[-1]
-        with self.assertRaisesRegex(ValueError, "every_plan_task_must_support"):
-            self.store.finalize_plan(mission["id"], "planner", [{
-                "criterion": "Change is delivered", "work_item_ids": [item["id"]],
-            }])
-        self.store.finalize_plan(mission["id"], "planner", [
-            {"criterion": "Change is delivered", "work_item_ids": [item["id"]]},
-            {"criterion": "Edge case is addressed", "work_item_ids": [second["id"]]},
-        ])
-        claim = self.store.claim_work(mission["id"], "builder", work_item_id=item["id"])
-        self.store.revise_work_item(
-            mission["id"], second["id"], "planner", "Investigate and resolve the edge case",
-            "Include a regression check.",
-        )
-        self.assertEqual(self.store.work_items(mission["id"])[0]["status"], "ready")
-        with self.assertRaisesRegex(PermissionError, "current finalized plan"):
-            self.store.claim_work(mission["id"], "reviewer")
-        self.store.finalize_plan(mission["id"], "planner", [
-            {"criterion": "Change is delivered", "work_item_ids": [item["id"]]},
-            {"criterion": "Edge case is addressed", "work_item_ids": [second["id"]]},
-        ])
-        claim = self.store.claim_work(mission["id"], "builder", work_item_id=item["id"])
-        workspace = WorkspaceTools(self.store, mission["id"], "builder", claim["id"])
-        workspace.write_file("replanned.txt", "replanned")
-
-    def test_v7_discovery_checkpoint_is_required_evidence_linked_and_invalidates_old_plan(self) -> None:
-        mission = self.store.create_mission(
-            self.project["id"], "Discovery gate", "Deliver a verified change",
+            self.project["id"], "Optional plan", "Deliver a change",
             {"id": "goal-driven-sdlc", "version": 7, "title": "Goal-driven SDLC"},
         )
         item = self.store.create_work_item(mission["id"], "Implement change")
-        criterion = [{"criterion": "The change is implemented", "work_item_ids": [item["id"]]}]
+        self.store.finalize_plan(mission["id"], "planner", [{
+            "criterion": "The change is delivered", "work_item_ids": [item["id"]],
+        }])
+        claim = self.store.claim_work(mission["id"], "builder", work_item_id=item["id"])
+        self.store.create_work_item(mission["id"], "Cover an additional edge case")
+        self.assertEqual(self.store.work_items(mission["id"])[0]["owner"], "builder")
+        self.assertFalse(self.store.has_current_plan_checkpoint(mission["id"]))
+        self.store.complete_work(claim["id"], "builder", "Finished the claimed implementation")
+        self.assertEqual(self.store.work_items(mission["id"])[0]["status"], "done")
 
-        with self.assertRaisesRegex(ValueError, "discovery_checkpoint_required"):
-            self.store.finalize_plan(mission["id"], "planner", criterion)
-        with self.assertRaisesRegex(PermissionError, "only the planner"):
-            self.store.complete_discovery(mission["id"], "builder", "A sufficiently detailed repository summary.", [])
-        with self.assertRaisesRegex(ValueError, "discovery_evidence_path_invalid"):
-            self.store.complete_discovery(
-                mission["id"], "planner", "The repository has a tested Python application and README.", ["../outside.md"]
-            )
+    def test_repeating_unchanged_plan_finalization_reuses_the_existing_checkpoint(self) -> None:
+        mission = self.store.create_mission(self.project["id"], "Plan retry", "Deliver a change")
+        item = self.store.create_work_item(mission["id"], "Implement change")
+        criteria = [{
+            "criterion": "The change is implemented", "work_item_ids": [item["id"]],
+        }]
 
-        discovery = self.store.complete_discovery(
-            mission["id"], "planner", "The repository has a Python application and a README with local setup guidance.",
-            ["README.md"],
+        first = self.store.finalize_plan(mission["id"], "planner", criteria)
+        repeated = self.store.finalize_plan(mission["id"], "planner", criteria)
+
+        self.assertEqual(repeated["id"], first["id"])
+        finalizations = [event for event in self.store.events_after(mission["id"], 0)
+                         if event["type"] == "plan.finalized"]
+        self.assertEqual(len(finalizations), 1)
+
+        next_item = self.store.create_work_item(mission["id"], "Verify the change")
+        revised = self.store.finalize_plan(mission["id"], "planner", [{
+            "criterion": "The change is implemented", "work_item_ids": [item["id"]],
+        }, {
+            "criterion": "The change is verified", "work_item_ids": [next_item["id"]],
+        }])
+        self.assertNotEqual(revised["id"], first["id"])
+
+    def test_discovery_and_plan_finalization_remain_optional_guidance(self) -> None:
+        mission = self.store.create_mission(
+            self.project["id"], "Optional discovery", "Deliver a verified change",
+            {"id": "bug-fix", "version": 1, "title": "Bug fix", "instructions": "Fix and verify."},
         )
-        self.assertEqual(discovery["type"], "sdlc.discovery.completed")
-        self.assertEqual(discovery["payload"]["evidence"][0]["path"], "README.md")
-        self.assertEqual(discovery["payload"]["evidence"][0]["sha256"],
-                         hashlib.sha256((self.repository / "README.md").read_bytes()).hexdigest())
-        finalized = self.store.finalize_plan(mission["id"], "planner", criterion)
-        self.assertEqual(finalized["payload"]["discoveryEventId"], discovery["id"])
-
-        claim = self.store.claim_work(mission["id"], "builder")
-        self.assertEqual(claim["id"], item["id"])
-        updated_discovery = self.store.complete_discovery(
-            mission["id"], "planner", "Repository review found an additional compatibility constraint to plan for.",
-            ["README.md"],
-        )
-        with self.assertRaisesRegex(PermissionError, "current finalized plan"):
-            self.store.claim_work(mission["id"], "builder")
-        item_after_replan = self.store.work_items(mission["id"])[0]
-        self.assertEqual((item_after_replan["status"], item_after_replan["owner"]), ("ready", None))
-        bootstrap = self.store.bootstrap(self.project["id"], mission["id"])
-        self.assertEqual(bootstrap["mission"]["workflow_context"]["discovery"]["id"], updated_discovery["id"])
+        item = self.store.create_work_item(mission["id"], "Implement change")
+        finalized = self.store.finalize_plan(mission["id"], "planner", [{
+            "criterion": "The change is implemented", "work_item_ids": [item["id"]],
+        }])
+        self.assertEqual(finalized["type"], "plan.finalized")
+        self.assertFalse(any(
+            event["type"] == "sdlc.discovery.completed"
+            for event in self.store.events_after(mission["id"], 0)
+        ))
+        self.assertEqual(self.store.claim_work(mission["id"], "builder")["id"], item["id"])
 
     def test_workflow_recipe_rejects_invalid_identity_and_empty_guidance(self) -> None:
         recipes_dir = self.root / "recipes"
         with self.assertRaisesRegex(ValueError, "recipe_id"):
             save_recipe(recipes_dir, "../oops", "Bad", "A summary.", "Instructions", ROOT / "recipes")
-        with self.assertRaisesRegex(ValueError, "instructions"):
+        with self.assertRaisesRegex(ValueError, "guidance"):
             save_recipe(recipes_dir, "valid-id", "Valid", "A summary.", "", ROOT / "recipes")
 
-    def test_agent_memory_is_proposed_reviewed_and_archived_with_provenance(self) -> None:
+    def test_agent_memory_proposal_review_stays_separate_from_the_legacy_migration_source(self) -> None:
         existing = self.store.save_knowledge(
             self.project["id"], self.mission["id"], "user", "Build command", "Run npm test."
         )
@@ -693,9 +720,9 @@ for line in sys.stdin:
         self.assertEqual(reviewed["proposal"]["status"], "accepted")
         self.assertEqual(reviewed["proposal"]["reviewed_by"], "user")
         self.assertEqual(reviewed["entry"]["content"], "Run npm run test.")
-        self.assertEqual(reviewed["entry"]["created_by"], "user")
+        self.assertEqual(reviewed["entry"]["created_by"], "builder")
         self.assertEqual(reviewed["entry"]["updated_by"], "user")
-        self.assertEqual(self.store.project_knowledge(self.project["id"])[0]["content"], "Run npm run test.")
+        self.assertEqual(self.store.project_knowledge(self.project["id"])[0]["content"], "Run npm test.")
 
         archived = self.store.archive_knowledge(reviewed["entry"]["id"], self.mission["id"])
         self.assertEqual(archived["status"], "archived")
@@ -703,7 +730,7 @@ for line in sys.stdin:
         self.assertEqual(self.store.project_knowledge(self.project["id"], include_archived=True)[0]["status"], "archived")
         restored = self.store.restore_knowledge(archived["id"], self.mission["id"])
         self.assertEqual(restored["status"], "active")
-        self.assertEqual(self.store.project_knowledge(self.project["id"])[0]["content"], "Run npm run test.")
+        self.assertEqual(self.store.project_knowledge(self.project["id"])[0]["content"], "Run npm test.")
         event_types = [event["type"] for event in self.store.events_after(self.mission["id"], 0)]
         self.assertIn("knowledge.proposed", event_types)
         self.assertIn("knowledge.proposal.reviewed", event_types)
@@ -943,11 +970,13 @@ for line in sys.stdin:
             workspace, skills, trigger_sequence=1,
             step_store=SqliteStepStore(database=self.store.data_dir / "web-approval-steps.sqlite3"),
             web_access={"enabled": True, "allowedDomains": ["docs.python.org"]},
+            tool_permissions=("duckduckgo_search", "web_fetch"),
         )
         self.assertTrue(any(isinstance(capability, WebSearch) for capability in capabilities))
         fetch = next(capability for capability in capabilities if isinstance(capability, WebFetch))
         self.assertEqual(fetch.allowed_domains, ["docs.python.org"])
         agent = Agent(TestModel(call_tools=["duckduckgo_search"]))
+        self.reveal_deferred_test_tools(agent, capabilities)
         failures: list[BaseException] = []
 
         def run_agent() -> None:
@@ -1072,7 +1101,7 @@ for line in sys.stdin:
 
         async def invoke():
             agent = Agent("test")
-            return await agent.run("Call the ping tool.", toolsets=registry.load_toolsets(self.project["id"]))
+            return await agent.run("Call the ping tool.", toolsets=registry.load_toolsets(self.project["id"], ("mcp:*",)))
 
         result = asyncio.run(invoke())
         tool_results = [
@@ -1140,7 +1169,7 @@ for line in sys.stdin:
                     "Call fixture.write now.",
                     deps=None,
                     capabilities=capabilities,
-                    toolsets=registry.load_toolsets(self.project["id"]),
+                    toolsets=registry.load_toolsets(self.project["id"], ("mcp:*",)),
                     conversation_id=f"test:{self.mission['id']}:tester",
                 )))
             except Exception as error:  # noqa: BLE001 - capture provider-thread failures for assertions
@@ -1196,6 +1225,65 @@ for line in sys.stdin:
         self.assertEqual(reviewer_claim["id"], second["id"])
         self.assertEqual(self.store.renew_work_claims(self.mission["id"], "builder"), 1)
         self.assertIsNone(self.store.complete_work(first["id"], "reviewer", "wrong owner"))
+
+    def test_agent_can_release_only_its_own_claim_for_another_role(self) -> None:
+        item = self.store.create_work_item(self.mission["id"], "Independent review")
+        claimed = self.store.claim_work(self.mission["id"], "builder", work_item_id=item["id"])
+
+        self.assertIsNone(self.store.release_work_claim(
+            self.mission["id"], "reviewer", item["id"], "wrong owner",
+        ))
+        released = self.store.release_work_claim(
+            self.mission["id"], "builder", item["id"], "This task is assigned to the reviewer",
+        )
+
+        self.assertEqual(claimed["owner"], "builder")
+        self.assertEqual(released["status"], "ready")
+        self.assertIsNone(released["owner"])
+        event = next(
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "plan.item.released"
+        )
+        self.assertEqual(event["actorId"], "builder")
+        self.assertEqual(event["payload"]["reason"], "This task is assigned to the reviewer")
+        self.assertEqual(
+            self.store.claim_work(self.mission["id"], "reviewer", work_item_id=item["id"])["owner"],
+            "reviewer",
+        )
+
+    def test_harness_node_test_results_become_idempotent_durable_verification_events(self) -> None:
+        output = """[stdout]
+TAP version 13
+1..2
+# tests 2
+# pass 2
+# fail 0
+"""
+        first = self.store.record_harness_node_test_result(
+            self.mission["id"], "builder", 17, "shell-call-1",
+            "node --test habit-tracker/test/habits.test.js", output, "task-1", "tool-event-1",
+        )
+        duplicate = self.store.record_harness_node_test_result(
+            self.mission["id"], "builder", 17, "shell-call-1",
+            "node --test habit-tracker/test/habits.test.js", output, "task-1",
+        )
+
+        self.assertEqual(first["id"], duplicate["id"])
+        self.assertEqual(first["type"], "repo.test_run.completed")
+        self.assertEqual(first["payload"]["exitCode"], 0)
+        self.assertEqual(first["payload"]["testCount"], 2)
+        self.assertEqual(first["payload"]["sourceToolCallId"], "shell-call-1")
+        self.assertEqual(first["payload"]["sourceToolEventId"], "tool-event-1")
+
+    def test_harness_test_evidence_rejects_incomplete_or_non_test_output(self) -> None:
+        self.assertIsNone(self.store.record_harness_node_test_result(
+            self.mission["id"], "builder", 18, "shell-call-2",
+            "node --test habit-tracker/test/habits.test.js", "[Command timed out after 30s]", "task-1",
+        ))
+        self.assertIsNone(self.store.record_harness_node_test_result(
+            self.mission["id"], "builder", 18, "shell-call-3",
+            "node -e console.log('tests passed')", "tests passed", "task-1",
+        ))
 
     def test_agent_can_self_claim_a_selected_eligible_item(self) -> None:
         first = self.store.create_work_item(self.mission["id"], "Review the design")
@@ -1584,6 +1672,9 @@ for line in sys.stdin:
             "\n```"
         )
         source = self.store.append_agent_update(self.mission["id"], "planner", publication)
+        self.assertEqual(source["payload"]["channelAudience"], "activity")
+        direct = self.store.append_agent_update(self.mission["id"], "planner", "Please review this.", "reviewer")
+        self.assertEqual(direct["payload"]["channelAudience"], "conversation")
         documents = self.store.canvas_documents(self.mission["id"])
         document = documents[0]
         document_id = document["id"]
@@ -1734,7 +1825,24 @@ for line in sys.stdin:
         with self.assertRaisesRegex(ValueError, "project_not_found"):
             self.store.write_project_audit_export("missing-project", self.root / "missing.json")
 
-    def test_reviewer_completion_requires_done_work_and_resolved_user_requests(self) -> None:
+    def test_mission_completion_waits_for_live_claims_without_gating_ready_plan_items(self) -> None:
+        active_item = self.store.create_work_item(self.mission["id"], "Finish the active fix")
+        claim = self.store.claim_work(
+            self.mission["id"], "builder", work_item_id=active_item["id"],
+        )
+        self.assertIsNotNone(claim)
+
+        with self.assertRaisesRegex(ValueError, "mission_has_work_in_progress"):
+            self.store.complete_mission(self.mission["id"], "reviewer", "Everything is complete")
+        self.assertEqual(self.store.mission(self.mission["id"])["status"], "active")
+
+        self.store.complete_work(active_item["id"], "builder", "Fix completed")
+        completed = self.store.complete_mission(
+            self.mission["id"], "planner", "The requested work is complete.",
+        )
+        self.assertEqual(completed["mission"]["status"], "completed")
+
+    def test_completion_does_not_require_plan_work_but_resolves_user_requests_and_validates_supplied_evidence(self) -> None:
         with self.assertRaisesRegex(ValueError, "mission_must_be_completed"):
             self.store.review_mission_outcome(self.mission["id"], "accepted")
         implementation = self.store.create_work_item(self.mission["id"], "Implement acceptance conditions")
@@ -1743,8 +1851,6 @@ for line in sys.stdin:
             "planner", depends_on=[implementation["id"]],
         )
         builder_task = self.store.claim_work(self.mission["id"], "builder")
-        with self.assertRaisesRegex(ValueError, "all_mission_work_items_must_be_done"):
-            self.store.complete_mission(self.mission["id"], "reviewer", "Complete", ["Not finished"])
         self.store.complete_work(builder_task["id"], "builder", "Implemented and verified")
         reviewer_task = self.store.claim_work(self.mission["id"], "reviewer")
         self.store.complete_work(reviewer_task["id"], "reviewer", "Review passed")
@@ -1792,6 +1898,14 @@ for line in sys.stdin:
             for mission in exported["missions"]
             for event in mission["events"]
         ))
+        optional_mission = self.store.create_mission(
+            self.project["id"], "Optional plan work", "Complete without workflow gates",
+        )
+        self.store.create_work_item(optional_mission["id"], "Optional follow-up")
+        self.assertEqual(
+            self.store.complete_mission(optional_mission["id"], "reviewer", "Complete")["mission"]["status"],
+            "completed",
+        )
 
     def test_mission_completion_maps_each_acceptance_check_to_its_sources(self) -> None:
         implementation = self.store.create_work_item(self.mission["id"], "Implement output")
@@ -1812,12 +1926,6 @@ for line in sys.stdin:
             "repo.test_run.completed", "reviewer", self.mission["id"],
             {"runId": "verification", "argv": ["pytest", "tests"], "exitCode": 0},
         )
-        with self.assertRaisesRegex(ValueError, "each_acceptance_check_needs_1_to_10"):
-            self.store.complete_mission(
-                self.mission["id"], "reviewer", "Ready",
-                acceptance_checks=[{"criterion": "Release notes are available", "evidence_refs": []}],
-            )
-
         result = self.store.complete_mission(
             self.mission["id"], "reviewer", "Ready for review",
             acceptance_checks=[
@@ -1837,190 +1945,50 @@ for line in sys.stdin:
         with self.assertRaisesRegex(ValueError, "outcome_must_be"):
             self.store.review_mission_outcome(self.mission["id"], "maybe")
 
-    def test_goal_driven_sdlc_requires_fresh_verification_and_later_review(self) -> None:
+    def test_selected_workflow_does_not_gate_completion_on_plan_review_test_or_evidence(self) -> None:
         mission = self.store.create_mission(
-            self.project["id"], "SDLC gates", "Deliver a verified change",
-            {"id": "goal-driven-sdlc", "version": 1, "title": "Goal-driven SDLC"},
+            self.project["id"], "Flexible workflow", "Deliver a useful change",
+            {"id": "goal-driven-sdlc", "version": 7, "title": "Goal-driven SDLC"},
         )
-        self.store.create_work_item(mission["id"], "Implement change")
-        self.store.create_work_item(mission["id"], "Independent review")
-        criteria = [{
-            "criterion": "The requested change is implemented and verified",
-            "work_item_ids": [self.store.work_items(mission["id"])[0]["id"],
-                              self.store.work_items(mission["id"])[1]["id"]],
-        }]
-        finalized = self.store.finalize_plan(mission["id"], "planner", criteria)
-        self.assertEqual(finalized["type"], "plan.finalized")
-        self.assertEqual(finalized["payload"]["acceptanceCriteria"][0]["workItems"][0]["title"], "Implement change")
-        builder = self.store.claim_work(mission["id"], "builder")
-        self.store.complete_work(builder["id"], "builder", "Implementation complete")
-        stale_test = self.store.append(
-            "repo.test_run.completed", "builder", mission["id"],
-            {"runId": "stale", "argv": ["pytest"], "exitCode": 0},
+        self.store.create_work_item(mission["id"], "Optional follow-up task")
+
+        result = self.store.complete_mission(
+            mission["id"], "reviewer", "The requested change is complete.", acceptance_checks=[],
         )
-        latest_change = self.store.append("repo.file.changed", "builder", mission["id"], {"path": "src/change.py"})
-        reviewer = self.store.claim_work(mission["id"], "reviewer")
-        self.store.complete_work(reviewer["id"], "reviewer", "Reviewed implementation")
 
-        def complete(test_id: str) -> dict:
-            return self.store.complete_mission(
-                mission["id"], "reviewer", "Change delivered",
-                [item["criterion"] for item in criteria], [test_id],
-            )
+        self.assertEqual(result["mission"]["status"], "completed")
+        self.assertEqual(result["event"]["payload"]["acceptanceChecks"], [])
+        self.assertEqual(result["event"]["payload"]["evidenceRefs"], [])
 
-        with self.assertRaisesRegex(ValueError, "verification_must_follow_latest_change"):
-            complete(stale_test["id"])
-
-        fresh_test = self.store.append(
-            "repo.test_run.completed", "builder", mission["id"],
-            {"runId": "fresh", "argv": ["pytest"], "exitCode": 0},
+    def test_review_checkpoint_is_optional_for_any_workflow_and_does_not_create_tasks(self) -> None:
+        finding = {"severity": "medium", "file": "src/example.py", "issue": "Consider a follow-up."}
+        result = self.store.record_review_checkpoint(
+            self.mission["id"], "reviewer", "changes_requested", "One optional improvement remains.",
+            findings=[finding],
         )
-        with self.assertRaisesRegex(ValueError, "match_the_finalized_plan_criteria"):
+        self.assertEqual(result["event"]["payload"]["verificationEventId"], None)
+        self.assertEqual(result["event"]["payload"]["findings"], [finding])
+        self.assertEqual(result["workItems"], [])
+        self.assertEqual(self.store.work_items(self.mission["id"]), [])
+
+    def test_completion_validates_evidence_only_when_the_agent_supplies_references(self) -> None:
+        failed_run = self.store.append(
+            "repo.test_run.completed", "reviewer", self.mission["id"],
+            {"runId": "failed-run", "argv": ["pytest"], "exitCode": 1},
+        )
+        with self.assertRaisesRegex(ValueError, "verification_evidence_must_reference"):
             self.store.complete_mission(
-                mission["id"], "reviewer", "Wrong criteria",
-                acceptance_checks=[{"criterion": "A different criterion", "evidence_refs": [fresh_test["id"]]}],
+                self.mission["id"], "reviewer", "The work is complete.", evidence_refs=[failed_run["id"]],
             )
-        with self.assertRaisesRegex(ValueError, "latest_successful_test_run"):
-            self.store.record_review_checkpoint(
-                mission["id"], "reviewer", "approved", "Reviewed the change", stale_test["id"], []
-            )
-        with self.assertRaisesRegex(ValueError, "approved_review_checkpoint"):
-            complete(fresh_test["id"])
-
-        self.store.create_work_item(mission["id"], "Review verified result")
-        criteria[0]["work_item_ids"].append(self.store.work_items(mission["id"])[-1]["id"])
-        refinalized = self.store.finalize_plan(mission["id"], "planner", criteria)
-        reviewer = self.store.claim_work(mission["id"], "reviewer")
-        self.store.complete_work(reviewer["id"], "reviewer", "Fresh verification reviewed")
-        checkpoint = self.store.record_review_checkpoint(
-            mission["id"], "reviewer", "approved", "Acceptance criteria and regression risk reviewed.",
-            fresh_test["id"], [],
-        )
-        self.assertEqual(checkpoint["event"]["type"], "review.checkpoint.recorded")
-        self.assertEqual(checkpoint["event"]["payload"]["changeEventId"], latest_change["id"])
-        self.assertEqual(complete(fresh_test["id"])["mission"]["status"], "completed")
-
-        for index in range(205):
-            self.store.append("agent.message.created", "builder", mission["id"], {"text": f"Update {index}"})
-        bootstrap = self.store.bootstrap(self.project["id"], mission["id"])
-        workflow = bootstrap["mission"]["workflow_context"]
-        self.assertEqual(workflow["planFinalizedSequence"], refinalized["sequence"])
-        self.assertEqual(workflow["latestChange"]["id"], latest_change["id"])
-        self.assertEqual(workflow["latestTest"]["id"], fresh_test["id"])
-        self.assertEqual(workflow["latestTest"]["exitCode"], 0)
-        self.assertEqual(workflow["latestSuccessfulTest"]["id"], fresh_test["id"])
-        self.assertEqual(workflow["latestReview"]["id"], checkpoint["event"]["id"])
-        self.assertEqual(len(bootstrap["events"]), 200)
-
-    def test_latest_failed_test_blocks_sdlc_review_and_completion_until_rechecked(self) -> None:
-        mission = self.store.create_mission(
-            self.project["id"], "Latest verification gate", "Deliver a verified change",
-            {"id": "goal-driven-sdlc", "version": 1, "title": "Goal-driven SDLC"},
-        )
-        self.store.create_work_item(mission["id"], "Implement the change")
-        self.store.create_work_item(mission["id"], "Review the change")
-        tasks = self.store.work_items(mission["id"])
-        self.store.finalize_plan(mission["id"], "planner", [{
-            "criterion": "The change is verified",
-            "work_item_ids": [task["id"] for task in tasks],
-        }])
-        builder = self.store.claim_work(mission["id"], "builder")
-        self.store.complete_work(builder["id"], "builder", "Implementation complete")
-        reviewer = self.store.claim_work(mission["id"], "reviewer")
-        self.store.complete_work(reviewer["id"], "reviewer", "Independent review complete")
-        passing_test = self.store.append(
-            "repo.test_run.completed", "builder", mission["id"],
-            {"runId": "passing", "argv": ["pytest"], "exitCode": 0},
-        )
-        self.store.record_review_checkpoint(
-            mission["id"], "reviewer", "approved", "The verified change is ready.", passing_test["id"], [],
-        )
-        self.store.append(
-            "repo.test_run.completed", "builder", mission["id"],
-            {"runId": "failing", "argv": ["pytest"], "exitCode": 1},
-        )
-
-        with self.assertRaisesRegex(ValueError, "review_requires_latest_test_run_to_pass"):
-            self.store.record_review_checkpoint(
-                mission["id"], "reviewer", "approved", "Reusing the previous passing run.",
-                passing_test["id"], [],
-            )
-        with self.assertRaisesRegex(ValueError, "requires_latest_test_run_to_pass"):
-            self.store.complete_mission(
-                mission["id"], "reviewer", "Complete", ["The change is verified"], [passing_test["id"]],
-            )
-
-        recheck = self.store.append(
-            "repo.test_run.completed", "builder", mission["id"],
-            {"runId": "recheck", "argv": ["pytest"], "exitCode": 0},
-        )
-        self.store.create_work_item(mission["id"], "Review the successful recheck")
-        tasks = self.store.work_items(mission["id"])
-        self.store.finalize_plan(mission["id"], "planner", [{
-            "criterion": "The change is verified",
-            "work_item_ids": [task["id"] for task in tasks],
-        }])
-        reviewer = self.store.claim_work(mission["id"], "reviewer")
-        self.store.complete_work(reviewer["id"], "reviewer", "The successful recheck is independently reviewed")
-        self.store.record_review_checkpoint(
-            mission["id"], "reviewer", "approved", "The latest recheck passes.", recheck["id"], [],
+        passed_run = self.store.append(
+            "repo.test_run.completed", "reviewer", self.mission["id"],
+            {"runId": "passed-run", "argv": ["pytest"], "exitCode": 0},
         )
         result = self.store.complete_mission(
-            mission["id"], "reviewer", "Complete", ["The change is verified"], [recheck["id"]],
+            self.mission["id"], "reviewer", "The work is complete.", evidence_refs=[passed_run["id"]],
         )
         self.assertEqual(result["mission"]["status"], "completed")
-
-    def test_review_checkpoint_is_bound_to_current_evidence_and_validates_findings(self) -> None:
-        mission = self.store.create_mission(
-            self.project["id"], "Review checkpoint", "Deliver a verified change",
-            {"id": "goal-driven-sdlc", "version": 2, "title": "Goal-driven SDLC"},
-        )
-        self.store.create_work_item(mission["id"], "Review the implementation")
-        self.store.finalize_plan(mission["id"], "planner", [{
-            "criterion": "Implementation meets the goal",
-            "work_item_ids": [self.store.work_items(mission["id"])[0]["id"]],
-        }])
-        first_test = self.store.append(
-            "repo.test_run.completed", "builder", mission["id"],
-            {"runId": "first", "argv": ["pytest"], "exitCode": 0},
-        )
-        with self.assertRaisesRegex(ValueError, "review_requires_all_plan_work_items_done"):
-            self.store.record_review_checkpoint(
-                mission["id"], "reviewer", "approved", "Review before work is done.", first_test["id"], [],
-            )
-        review_work = self.store.claim_work(mission["id"], "reviewer")
-        self.store.complete_work(review_work["id"], "reviewer", "Reviewed the implementation")
-        self.store.record_review_checkpoint(
-            mission["id"], "reviewer", "approved", "Initial review passed.", first_test["id"], [],
-        )
-        self.store.append("repo.file.changed", "builder", mission["id"], {"path": "src/fix.py"})
-        with self.assertRaisesRegex(ValueError, "verification_must_follow_latest_change"):
-            self.store.record_review_checkpoint(
-                mission["id"], "reviewer", "approved", "Stale review.", first_test["id"], [],
-            )
-
-        latest_test = self.store.append(
-            "repo.test_run.completed", "builder", mission["id"],
-            {"runId": "latest", "argv": ["pytest"], "exitCode": 0},
-        )
-        finding = {"severity": "high", "file": "src/fix.py", "issue": "The edge case is still unhandled."}
-        requested = self.store.record_review_checkpoint(
-            mission["id"], "reviewer", "changes_requested", "One blocking issue remains.",
-            latest_test["id"], [finding],
-        )
-        self.assertEqual(requested["event"]["payload"]["findings"], [finding])
-        self.assertEqual(len(requested["workItems"]), 1)
-        self.assertEqual(requested["workItems"][0]["owner"], None)
-        self.assertIn("The edge case is still unhandled.", requested["workItems"][0]["detail"])
-        review_task_id = requested["workItems"][0]["id"]
-        self.store.finalize_plan(mission["id"], "planner", [{
-            "criterion": "Implementation meets the goal",
-            "work_item_ids": [self.store.work_items(mission["id"])[0]["id"], review_task_id],
-        }])
-        with self.assertRaisesRegex(ValueError, "cannot_include_critical_or_high_findings"):
-            self.store.record_review_checkpoint(
-                mission["id"], "reviewer", "approved", "Approve anyway.", latest_test["id"], [finding],
-            )
+        self.assertEqual(result["event"]["payload"]["evidenceRefs"][0]["id"], passed_run["id"])
 
     def test_agent_event_claim_is_single_owner_and_commits_result_with_offset_once(self) -> None:
         trigger = self.store.append(
@@ -2049,9 +2017,76 @@ for line in sys.stdin:
         ]
         self.assertEqual(len(result_events), 1)
         self.assertEqual(result_events[0]["payload"]["text"], "Implemented the change.")
+        self.assertEqual(result_events[0]["payload"]["channelAudience"], "conversation")
         self.assertEqual(self.store.agent_offset("builder", self.mission["id"]), trigger["sequence"])
         run = self.store.agent_event_run("builder", self.mission["id"], trigger["sequence"])
         self.assertEqual((run["status"], run["attempts"], run["work_item_id"]), ("completed", 1, "work-1"))
+
+    def test_completed_work_item_result_is_published_as_a_chat_message(self) -> None:
+        item = self.store.create_work_item(self.mission["id"], "Implement the feature")
+        claim = self.store.claim_work(self.mission["id"], "builder", work_item_id=item["id"])
+        self.store.complete_work(claim["id"], "builder", "Implementation is ready.")
+        trigger = self.store.events_after(self.mission["id"], 0)[-1]
+        self.store.begin_agent_event("builder", self.mission["id"], trigger["sequence"])
+
+        self.store.complete_agent_event(
+            "builder", self.mission["id"], trigger["sequence"],
+            "Implementation is ready.", item["id"],
+            publish_output=True,
+        )
+
+        run = self.store.agent_event_run("builder", self.mission["id"], trigger["sequence"])
+        self.assertEqual(run["output_text"], "Implementation is ready.")
+        messages = [event for event in self.store.events_after(self.mission["id"], 0)
+                    if event["type"] == "agent.message.created"
+                    and event["payload"].get("triggerSequence") == trigger["sequence"]]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["payload"]["channelAudience"], "conversation")
+
+    def test_bootstrap_restores_completed_agent_turns_hidden_by_older_runtime(self) -> None:
+        trigger = self.store.append("message.created", "user", self.mission["id"], {"text": "Inspect this."})
+        self.store.begin_agent_event("builder", self.mission["id"], trigger["sequence"])
+        self.store.complete_agent_event(
+            "builder", self.mission["id"], trigger["sequence"],
+            "The inspection is complete.", None, publish_output=False,
+        )
+        self.store.append("agent.activity", "builder", self.mission["id"], {
+            "status": "Ready", "triggerSequence": trigger["sequence"],
+        })
+        self.store.append("mission.completed", "planner", self.mission["id"], {"summary": "Done."})
+
+        result = self.store.bootstrap(self.project["id"], self.mission["id"])
+        replies = [event for event in result["events"] if event["payload"].get("historyProjection")]
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[0]["payload"]["channelAudience"], "conversation")
+        self.assertEqual(replies[0]["payload"]["text"], "The inspection is complete.")
+        completion_sequence = next(event["sequence"] for event in result["events"]
+                                  if event["type"] == "mission.completed")
+        self.assertLess(replies[0]["sequence"], completion_sequence)
+
+    def test_plan_items_can_be_created_atomically_with_key_dependencies(self) -> None:
+        created = self.store.create_work_items(self.mission["id"], [
+            {"key": "build", "title": "Build the feature", "detail": "Implement it"},
+            {"key": "verify", "title": "Verify the feature", "detail": "Run checks", "depends_on": ["build"]},
+            {"key": "review", "title": "Review the result", "detail": "Inspect the change", "depends_on": ["verify"]},
+        ], "planner")
+
+        self.assertEqual([item["key"] for item in created], ["build", "verify", "review"])
+        self.assertEqual(created[1]["depends_on"], [created[0]["id"]])
+        self.assertEqual(created[2]["depends_on"], [created[1]["id"]])
+        created_events = [event for event in self.store.events_after(self.mission["id"], 0)
+                          if event["type"] == "plan.item.created"]
+        self.assertEqual(len(created_events), 3)
+
+    def test_invalid_plan_batch_is_atomic(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot contain a cycle"):
+            self.store.create_work_items(self.mission["id"], [
+                {"key": "first", "title": "First", "depends_on": ["second"]},
+                {"key": "second", "title": "Second", "depends_on": ["first"]},
+            ], "planner")
+        self.assertEqual(self.store.work_items(self.mission["id"]), [])
+        self.assertFalse(any(event["type"] == "plan.item.created"
+                             for event in self.store.events_after(self.mission["id"], 0)))
 
     def test_agent_event_claim_is_atomic_across_store_connections(self) -> None:
         trigger = self.store.append(
@@ -2112,6 +2147,7 @@ for line in sys.stdin:
         ]
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0]["payload"]["error"], "provider unavailable")
+        self.assertEqual(failures[0]["payload"]["failureKind"], "unknown")
         self.assertEqual(self.store.agent_offset("reviewer", self.mission["id"]), trigger["sequence"])
         self.assertEqual(
             self.store.agent_event_run("reviewer", self.mission["id"], trigger["sequence"])["status"],
@@ -2247,6 +2283,63 @@ for line in sys.stdin:
             if item["type"] == "agent.run.failed"
         )
         self.assertIn("automatic retry stopped", failure["payload"]["error"])
+        self.assertEqual(failure["payload"]["failureKind"], "unknown_side_effect")
+
+    def test_worker_does_not_retry_when_harness_ledger_has_an_unresolved_tool_effect(self) -> None:
+        from pydantic_ai.exceptions import ModelConnectionError
+        from pydantic_ai_harness.step_persistence import (
+            RunRecord, SqliteStepStore, ToolEffectRecord,
+        )
+
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Recover an interrupted native tool", "recipient": "builder"},
+        )
+        step_store = SqliteStepStore(database=self.store.data_dir / "agent_steps.sqlite3")
+        asyncio.run(step_store.register_run(RunRecord(
+            run_id="harness-unresolved", conversation_id=f"tribe:{self.mission['id']}:builder",
+            agent_name=f"tribe:{self.mission['id']}:builder",
+            metadata={"trigger_sequence": str(trigger["sequence"])},
+        )))
+        asyncio.run(step_store.record_tool_effect(ToolEffectRecord(
+            run_id="harness-unresolved", tool_call_id="native-write", tool_name="write_file",
+            status="started",
+        )))
+        calls = 0
+
+        class FailingPydanticProvider(PydanticAIProvider):
+            async def run(inner_self, store, mission_id, event, cancellation_token=None):
+                nonlocal calls
+                calls += 1
+                raise ModelConnectionError(
+                    "test-model", "provider disconnected after a native tool", phase="read"
+                )
+
+        stop = threading.Event()
+        worker = AgentWorker(
+            self.store, self.mission["id"],
+            AgentDefinition("builder", "Builder", "Implementation", "", "builder.md"),
+            FailingPydanticProvider.__new__(FailingPydanticProvider), stop,
+        )
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            run = self.store.agent_event_run("builder", self.mission["id"], trigger["sequence"])
+            if run and run["status"] == "failed":
+                break
+            time.sleep(0.02)
+        stop.set()
+        thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(calls, 1)
+        failure = next(
+            item for item in self.store.events_after(self.mission["id"], trigger["sequence"])
+            if item["type"] == "agent.run.failed"
+        )
+        self.assertIn("may have started a tool side effect", failure["payload"]["error"])
+        self.assertEqual(failure["payload"]["failureKind"], "unknown_side_effect")
 
     def test_worker_redacts_provider_environment_secrets_from_durable_failures(self) -> None:
         self.store.set_setting("model", "zai:glm-4.5")
@@ -2331,7 +2424,341 @@ for line in sys.stdin:
         )
         self.assertEqual(retry_event["actorId"], "builder")
         self.assertEqual(retry_event["payload"]["attempt"], 2)
-        self.assertEqual(retry_event["payload"]["maxAttempts"], 3)
+        self.assertEqual(retry_event["payload"]["maxAttempts"], 24)
+        self.assertEqual(retry_event["payload"]["failureKind"], "transient_provider")
+
+    def test_worker_resumes_harness_checkpoint_on_safe_inline_retry(self) -> None:
+        from pydantic_ai.exceptions import ModelUnavailableError
+
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Continue from the last safe checkpoint", "recipient": "builder"},
+        )
+        calls = 0
+        resumed_checkpoint = False
+
+        class RecoveringPydanticProvider(PydanticAIProvider):
+            async def run(inner_self, store, mission_id, event, cancellation_token=None):
+                nonlocal calls, resumed_checkpoint
+                calls += 1
+                if calls == 1:
+                    raise ModelUnavailableError("test-model", "provider temporarily unavailable")
+                resumed_checkpoint = event.get("resumeCheckpoint") is True
+                return "Completed from the saved checkpoint"
+
+        stop = threading.Event()
+        worker = AgentWorker(
+            self.store, self.mission["id"],
+            AgentDefinition("builder", "Builder", "Implementation", "", "builder.md"),
+            RecoveringPydanticProvider.__new__(RecoveringPydanticProvider), stop,
+        )
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            run = self.store.agent_event_run("builder", self.mission["id"], trigger["sequence"])
+            if run and run["status"] == "completed":
+                break
+            time.sleep(0.02)
+        stop.set()
+        thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(calls, 2)
+        self.assertTrue(resumed_checkpoint)
+
+    def test_worker_retries_after_a_settled_post_update_without_duplicate_message(self) -> None:
+        from pydantic_ai.exceptions import ModelUnavailableError
+
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Continue from the completed update", "recipient": "planner"},
+        )
+        calls = 0
+        resumed_checkpoint = False
+        tool_call_id = "post-update-once"
+
+        class UpdateThenRecoverProvider(PydanticAIProvider):
+            async def run(inner_self, store, mission_id, event, cancellation_token=None):
+                nonlocal calls, resumed_checkpoint
+                calls += 1
+                if calls == 1:
+                    store.append("agent.tool.started", "planner", mission_id, {
+                        "toolName": "post_update", "toolCallId": tool_call_id,
+                        "triggerSequence": trigger["sequence"],
+                    })
+                    store.append_agent_update(
+                        mission_id, "planner", "Discovery is complete; I am preparing the plan.",
+                        metadata={
+                            "triggerSequence": trigger["sequence"], "toolCallId": tool_call_id,
+                        },
+                    )
+                    store.append("agent.tool.completed", "planner", mission_id, {
+                        "toolName": "post_update", "toolCallId": tool_call_id,
+                        "triggerSequence": trigger["sequence"], "outcome": "success",
+                    })
+                    raise ModelUnavailableError("test-model", "provider disconnected after update")
+                resumed_checkpoint = event.get("resumeCheckpoint") is True
+                return "Completed from the saved checkpoint"
+
+        stop = threading.Event()
+        worker = AgentWorker(
+            self.store, self.mission["id"],
+            AgentDefinition("planner", "Planner", "Planning", "", "planner.md"),
+            UpdateThenRecoverProvider.__new__(UpdateThenRecoverProvider), stop,
+        )
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            run = self.store.agent_event_run("planner", self.mission["id"], trigger["sequence"])
+            if run and run["status"] == "completed":
+                break
+            time.sleep(0.02)
+        stop.set()
+        thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(calls, 2)
+        self.assertTrue(resumed_checkpoint)
+        updates = [
+            item for item in self.store.events_after(self.mission["id"], trigger["sequence"])
+            if item["type"] == "agent.message.created"
+            and item["payload"].get("toolCallId") == tool_call_id
+        ]
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(
+            self.store.agent_event_run("planner", self.mission["id"], trigger["sequence"])["status"],
+            "completed",
+        )
+
+    def test_worker_continues_after_a_completed_failing_test_command(self) -> None:
+        from pydantic_ai.exceptions import ModelUnavailableError
+
+        item = self.store.create_work_item(self.mission["id"], "Implement and verify the change")
+        self.store.claim_work(self.mission["id"], "builder", work_item_id=item["id"])
+        workspace = WorkspaceTools(
+            self.store, self.mission["id"], "builder", item["id"],
+        )
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Run tests and fix any failures", "recipient": "builder"},
+        )
+        calls = 0
+        resumed_checkpoint = False
+
+        class CommandThenRecoverProvider(PydanticAIProvider):
+            async def run(inner_self, store, mission_id, event, cancellation_token=None):
+                nonlocal calls, resumed_checkpoint
+                calls += 1
+                if calls == 1:
+                    workspace.run_tests(["pytest", "tests"])
+                    raise ModelUnavailableError("test-model", "provider disconnected after test output")
+                resumed_checkpoint = event.get("resumeCheckpoint") is True
+                return "The test failed; I used its output to choose the next step."
+
+        stop = threading.Event()
+        worker = AgentWorker(
+            self.store, self.mission["id"],
+            AgentDefinition("builder", "Builder", "Implementation", "", "builder.md"),
+            CommandThenRecoverProvider.__new__(CommandThenRecoverProvider), stop,
+        )
+        failure = {
+            "exit_code": 1, "stdout": "1 failed", "stderr": "assertion mismatch",
+            "timed_out": False, "cancelled": False,
+        }
+        with patch("tribe_runtime.commands.run_foreground_process", return_value=failure):
+            thread = threading.Thread(target=worker.run)
+            thread.start()
+            deadline = time.monotonic() + 6
+            while time.monotonic() < deadline:
+                run = self.store.agent_event_run("builder", self.mission["id"], trigger["sequence"])
+                if run and run["status"] == "completed":
+                    break
+                time.sleep(0.02)
+            stop.set()
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(calls, 2)
+        self.assertTrue(resumed_checkpoint)
+        result = next(
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.completed"
+        )
+        self.assertEqual(result["payload"]["exitCode"], 1)
+        self.assertEqual(result["payload"]["stderr"], "assertion mismatch")
+        completed = self.store.agent_event_run("builder", self.mission["id"], trigger["sequence"])
+        self.assertEqual(completed["status"], "completed")
+
+    def test_worker_persists_safe_provider_retry_across_restart(self) -> None:
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Continue after a provider outage", "recipient": "builder"},
+        )
+        source = f'''\
+import os
+import threading
+import time
+from pathlib import Path
+from tribe_runtime.agent_runtime import AgentWorker
+from tribe_runtime.agents import AgentDefinition
+from tribe_runtime.store import MissionStore
+from pydantic_ai.exceptions import ModelUnavailableError
+
+store = MissionStore(Path({str(self.store.path)!r}))
+class FailingProvider:
+    def __init__(self):
+        self.calls = 0
+    async def run(self, store, mission_id, event):
+        self.calls += 1
+        raise ModelUnavailableError("test-model", "provider temporarily unavailable")
+
+provider = FailingProvider()
+definition = AgentDefinition("builder", "Builder", "Implementation", "", "builder.md")
+worker = AgentWorker(store, {self.mission["id"]!r}, definition, provider, threading.Event())
+thread = threading.Thread(target=worker.run)
+thread.start()
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    run = store.agent_event_run("builder", {self.mission["id"]!r}, {trigger["sequence"]})
+    if run and run["status"] == "retrying":
+        assert provider.calls == 3
+        os._exit(26)
+    time.sleep(0.01)
+os._exit(27)
+'''
+        crashed_process = subprocess.run(
+            [sys.executable, "-c", source], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(crashed_process.returncode, 26, crashed_process.stderr)
+
+        restarted_store = MissionStore(self.store.path)
+        run = restarted_store.agent_event_run("builder", self.mission["id"], trigger["sequence"])
+        self.assertEqual(run["status"], "retrying")
+        self.assertTrue(run["retry_at"])
+        self.assertEqual(
+            restarted_store.agent_offset("builder", self.mission["id"]), trigger["sequence"] - 1,
+        )
+        not_due = restarted_store.begin_agent_event(
+            "builder", self.mission["id"], trigger["sequence"],
+        )
+        self.assertFalse(not_due["claimed"])
+
+        with restarted_store._connect() as db:
+            db.execute(
+                "UPDATE agent_event_runs SET retry_at=? WHERE agent_id=? AND mission_id=? AND trigger_sequence=?",
+                ("1970-01-01T00:00:00+00:00", "builder", self.mission["id"], trigger["sequence"]),
+            )
+
+        class RecoveringProvider:
+            async def run(self, store, mission_id, event):
+                return "Completed after the persisted retry"
+
+        second_stop = threading.Event()
+        second_worker = AgentWorker(
+            restarted_store, self.mission["id"],
+            AgentDefinition("builder", "Builder", "Implementation", "", "builder.md"),
+            RecoveringProvider(), second_stop,
+        )
+        second_thread = threading.Thread(target=second_worker.run)
+        second_thread.start()
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            run = restarted_store.agent_event_run("builder", self.mission["id"], trigger["sequence"])
+            if run and run["status"] == "completed":
+                break
+            time.sleep(0.02)
+        second_stop.set()
+        second_thread.join(timeout=3)
+
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["attempts"], 4)
+
+    def test_scheduled_provider_retry_can_be_cancelled_without_a_live_worker_call(self) -> None:
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Cancel the scheduled retry", "recipient": "builder"},
+        )
+        self.store.begin_agent_event("builder", self.mission["id"], trigger["sequence"])
+        self.store.schedule_agent_event_retry(
+            "builder", self.mission["id"], trigger["sequence"],
+            3, 24, "provider temporarily unavailable", 60,
+        )
+        supervisor = AgentSupervisor(
+            self.store,
+            [AgentDefinition("builder", "Builder", "Implementation", "", "builder.md")],
+        )
+
+        self.assertTrue(supervisor.stop_agent_run(self.mission["id"], "builder"))
+        run = self.store.agent_event_run("builder", self.mission["id"], trigger["sequence"])
+        interrupted = next(
+            item for item in self.store.events_after(self.mission["id"], trigger["sequence"])
+            if item["type"] == "agent.run.interrupted"
+        )
+        self.assertEqual(run["status"], "interrupted")
+        self.assertIsNone(run["retry_at"])
+        self.assertTrue(interrupted["payload"]["cancelledByUser"])
+        self.assertEqual(
+            self.store.agent_offset("builder", self.mission["id"]), trigger["sequence"],
+        )
+
+    def test_scheduled_provider_retry_expires_after_its_persisted_deadline(self) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Expire a stale provider retry", "recipient": "builder"},
+        )
+        run = self.store.begin_agent_event("builder", self.mission["id"], trigger["sequence"])
+        self.store.schedule_agent_event_retry(
+            "builder", self.mission["id"], trigger["sequence"], run["attempts"], 24,
+            "provider unavailable", 30,
+        )
+        with self.store._connect() as db:
+            db.execute(
+                "UPDATE agent_event_runs SET created_at=?,retry_deadline_at=NULL,retry_at=? "
+                "WHERE agent_id='builder' AND mission_id=? AND trigger_sequence=?",
+                ((datetime.now(UTC) - timedelta(hours=25)).isoformat(),
+                 (datetime.now(UTC) - timedelta(seconds=2)).isoformat(),
+                 self.mission["id"], trigger["sequence"]),
+            )
+
+        reclaimed = self.store.begin_agent_event("builder", self.mission["id"], trigger["sequence"])
+
+        self.assertFalse(reclaimed["claimed"])
+        self.assertEqual(reclaimed["status"], "failed")
+        self.assertIsNone(reclaimed["retry_at"])
+        self.assertEqual(self.store.agent_offset("builder", self.mission["id"]), trigger["sequence"])
+        self.assertTrue(any(
+            item["type"] == "agent.run.failed" and "retry window expired" in item["payload"]["error"]
+            for item in self.store.events_after(self.mission["id"], trigger["sequence"])
+        ))
+
+    def test_due_provider_retry_claims_the_saved_checkpoint_frontier(self) -> None:
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Resume the saved provider frontier", "recipient": "builder"},
+        )
+        first = self.store.begin_agent_event("builder", self.mission["id"], trigger["sequence"])
+        self.store.schedule_agent_event_retry(
+            "builder", self.mission["id"], trigger["sequence"], first["attempts"], 24,
+            "provider temporarily unavailable", 30,
+        )
+        with self.store._connect() as db:
+            db.execute(
+                "UPDATE agent_event_runs SET retry_at='1970-01-01T00:00:00+00:00' "
+                "WHERE agent_id='builder' AND mission_id=? AND trigger_sequence=?",
+                (self.mission["id"], trigger["sequence"]),
+            )
+
+        reclaimed = self.store.begin_agent_event("builder", self.mission["id"], trigger["sequence"])
+
+        self.assertTrue(reclaimed["claimed"])
+        self.assertTrue(reclaimed["resume_checkpoint"])
+        self.assertEqual(reclaimed["status"], "running")
 
     def test_user_cancellation_wins_over_worker_stop_during_provider_backoff(self) -> None:
         from pydantic_ai.exceptions import ModelUnavailableError
@@ -2453,13 +2880,40 @@ for line in sys.stdin:
         )
         self.assertIsNone(
             _provider_retry_delay(
-                ModelRateLimitError("test-model", "wait longer", retry_after=31), 1
+                ModelRateLimitError("test-model", "wait longer", retry_after=21_601), 1
             )
+        )
+        self.assertEqual(
+            _scheduled_provider_retry_delay(
+                ModelUnavailableError("test-model", "still unavailable"), 3
+            ),
+            30.0,
         )
         self.assertIsNone(
             _provider_retry_delay(ModelQuotaExceededError("test-model", "quota exhausted"), 1)
         )
         self.assertIsNone(_provider_retry_delay(RuntimeError("invalid request"), 1))
+
+    def test_agent_failure_categories_distinguish_recovery_paths(self) -> None:
+        from pydantic_ai.exceptions import ModelUnavailableError, UsageLimitExceeded
+
+        class ToolExecutionError(RuntimeError):
+            tool_name = "run_command"
+
+        class InvalidRequestError(RuntimeError):
+            status_code = 400
+
+        self.assertEqual(_agent_failure_kind(ModelUnavailableError("test-model", "offline")), "transient_provider")
+        self.assertEqual(_agent_failure_kind(UsageLimitExceeded("request limit")), "usage_limit")
+        self.assertEqual(_agent_failure_kind(InvalidRequestError("bad payload")), "invalid_request")
+        self.assertEqual(_agent_failure_kind(ToolExecutionError("command failed")), "tool_failure")
+        self.assertEqual(_agent_failure_kind(PermissionError("permission denied")), "policy_denial")
+        self.assertEqual(
+            _agent_failure_kind(RuntimeError("prompt flagged as potentially violating our usage policy")),
+            "policy_denial",
+        )
+        self.assertEqual(_agent_failure_kind(RuntimeError("unknown"), unknown_side_effect=True), "unknown_side_effect")
+        self.assertEqual(_agent_failure_kind(RuntimeError("unexpected")), "unknown")
 
     def test_worker_does_not_resume_a_deferred_approval_after_inline_run_completed(self) -> None:
         trigger = self.store.append(
@@ -2670,6 +3124,43 @@ for line in sys.stdin:
         result = _continuable_prior_runs(RunStore(), "builder", "mission", runs, 30)
 
         self.assertEqual([run.run_id for run in result], ["completed", "legacy"])
+        resumed = _continuable_prior_runs(
+            RunStore(), "builder", "mission", runs, 30, include_current_trigger=True,
+        )
+        self.assertEqual(
+            [run.run_id for run in resumed], ["completed", "current", "legacy"],
+        )
+
+    def test_harness_tool_effect_ledger_blocks_unsafe_provider_retry(self) -> None:
+        from pydantic_ai_harness.step_persistence import (
+            RunRecord, SqliteStepStore, ToolEffectRecord,
+        )
+
+        step_store = SqliteStepStore(database=self.store.data_dir / "agent_steps.sqlite3")
+        conversation_id = f"tribe:{self.mission['id']}:builder"
+
+        async def record_run_and_tool_start() -> None:
+            await step_store.register_run(RunRecord(
+                run_id="harness-run-1", conversation_id=conversation_id,
+                agent_name=f"tribe:{self.mission['id']}:builder",
+                metadata={"trigger_sequence": "9"},
+            ))
+            await step_store.record_tool_effect(ToolEffectRecord(
+                run_id="harness-run-1", tool_call_id="call-1", tool_name="write_file",
+                status="started",
+            ))
+
+        asyncio.run(record_run_and_tool_start())
+        self.assertTrue(_has_unresolved_harness_tool_effects(
+            self.store.data_dir, self.mission["id"], "builder", 9,
+        ))
+        asyncio.run(step_store.record_tool_effect(ToolEffectRecord(
+            run_id="harness-run-1", tool_call_id="call-1", tool_name="write_file",
+            status="completed",
+        )))
+        self.assertFalse(_has_unresolved_harness_tool_effects(
+            self.store.data_dir, self.mission["id"], "builder", 9,
+        ))
 
     def test_mission_blocks_after_last_active_task_finishes_and_unblocks_when_plan_grows(self) -> None:
         self.store.create_work_item(self.mission["id"], "Finish current task")
@@ -2806,6 +3297,58 @@ for line in sys.stdin:
         self.assertTrue(captured["deferred_tool_results"].approvals["tool-call-789"])
         row = self.store.deferred_tool_approvals(self.mission["id"], "builder")[0]
         self.assertEqual(row["status"], "consumed")
+
+    def test_provider_returns_declined_approval_as_feedback_on_the_saved_tool_call(self) -> None:
+        from types import SimpleNamespace
+
+        from pydantic_ai.messages import (
+            ModelMessagesTypeAdapter,
+            ModelRequest,
+            ModelResponse,
+            ToolCallPart,
+            UserPromptPart,
+        )
+
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"], {"text": "Run the focused test"},
+        )
+        self.store.begin_agent_event("builder", self.mission["id"], trigger["sequence"])
+        history = ModelMessagesTypeAdapter.dump_json([
+            ModelRequest(parts=[UserPromptPart("Run the focused test")]),
+            ModelResponse(parts=[ToolCallPart(
+                tool_name="run_command", args={"command": "node --test test/habits.test.js"},
+                tool_call_id="declined-tool-call",
+            )]),
+        ]).decode("utf-8")
+        interaction = self.store.create_deferred_tool_interaction(
+            mission_id=self.mission["id"], requested_by="builder",
+            title="Run command outside safe set", details="Exact command: node --test test/habits.test.js",
+            target=f"Run command in {self.repository}", trigger_sequence=trigger["sequence"],
+            run_id="provider-run", conversation_id=f"tribe:{self.mission['id']}:builder",
+            tool_call_id="declined-tool-call", tool_name="run_command",
+            tool_arguments={"command": "node --test test/habits.test.js"}, message_history=history,
+        )
+        resolution = self.store.resolve_interaction(interaction["id"], "denied")
+        captured: dict[str, object] = {}
+
+        class ResumingAgent:
+            async def run(inner_self, prompt, **kwargs):
+                captured.update(prompt=prompt, **kwargs)
+                return SimpleNamespace(output="I will use the repository test tool instead.")
+
+        provider = PydanticAIProvider(
+            AgentDefinition("builder", "Builder", "Implementation", "Build work", "builder.md"),
+            "openai:test-model",
+        )
+        provider.agent = ResumingAgent()
+        result = asyncio.run(provider.run(self.store, self.mission["id"], resolution["event"]))
+
+        self.assertEqual(result.text, "I will use the repository test tool instead.")
+        self.assertIsNone(captured["prompt"])
+        self.assertEqual(len(captured["message_history"]), 2)
+        self.assertFalse(captured["deferred_tool_results"].approvals["declined-tool-call"])
+        row = self.store.deferred_tool_approvals(self.mission["id"], "builder")[0]
+        self.assertEqual(row["status"], "denied")
 
     def test_unsupported_provider_does_not_persist_partial_configuration(self) -> None:
         supervisor = AgentSupervisor(self.store, [])
@@ -2958,6 +3501,34 @@ for line in sys.stdin:
         self.assertEqual(gateway.provider.name, "litellm")
         self.assertEqual(gateway.provider.client.api_key, "proxy-secret")
         self.assertEqual(str(gateway.provider.client.base_url), "http://localhost:4000/v1/")
+
+    def test_provider_sdk_retries_are_disabled_when_sdk_exposes_retry_count(self) -> None:
+        from tribe_runtime.agent_runtime import _model_for_identifier
+
+        model = _model_for_identifier("openai:gpt-test", "openai-secret")
+
+        self.assertEqual(model.provider.client.max_retries, 0)
+
+    def test_google_cohere_mistral_and_google_gateway_retries_are_disabled(self) -> None:
+        from tribe_runtime.agent_runtime import _model_for_identifier
+
+        google = _model_for_identifier("google:gemini-2.5-flash", "google-secret")
+        self.assertEqual(
+            google.provider.client._api_client._http_options.retry_options.attempts, 1,
+        )
+
+        google_gateway = _model_for_identifier(
+            "gateway/google:gemini-2.5-flash", "gateway-secret", "http://localhost:4000/v1",
+        )
+        self.assertEqual(
+            google_gateway.provider.client._api_client._http_options.retry_options.attempts, 1,
+        )
+
+        cohere = _model_for_identifier("cohere:command-a-03-2025", "cohere-secret")
+        self.assertEqual(cohere.provider.client._client_wrapper.get_max_retries(), 0)
+
+        mistral = _model_for_identifier("mistral:mistral-large-latest", "mistral-secret")
+        self.assertEqual(mistral.provider.client.sdk_configuration.retry_config.strategy, "none")
 
     def test_openai_endpoint_url_validation_rejects_insecure_remote_and_embedded_secrets(self) -> None:
         from tribe_runtime.credentials import validate_openai_base_url
@@ -3419,6 +3990,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             patch("tribe_runtime.commands.run_foreground_process", return_value=completed) as run,
         ):
             workspace.run_tests(["pytest", "--version"])
+            node_result = workspace.run_tests(["node", "--test", "tests/focus-timer.test.mjs"])
 
         environment = run.call_args.kwargs["env"]
         self.assertNotIn("OPENAI_API_KEY", environment)
@@ -3426,8 +3998,88 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertNotIn("AWS_ACCESS_KEY_ID", environment)
         self.assertIn("PATH", environment)
         self.assertEqual(environment["GIT_AUTHOR_NAME"], "Tribe Agent")
-        self.assertEqual(run.call_args.args[0], ["pytest", "--version"])
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args.args[0], ["node", "--test", "tests/focus-timer.test.mjs"])
+        self.assertEqual(node_result["argv"], ["node", "--test", "tests/focus-timer.test.mjs"])
+        self.assertTrue(node_result["verificationEventId"])
+        completion_event = next(
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.completed"
+            and event["payload"]["runId"] == node_result["runId"]
+        )
+        self.assertEqual(node_result["verificationEventId"], completion_event["id"])
         self.assertIsNone(run.call_args.kwargs["is_cancelled"])
+
+    def test_expected_agent_tool_validation_errors_return_recovery_feedback(self) -> None:
+        builder = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build", "builder.md",
+            tool_permissions=("post_update", "message_agent", "reply_to_agent"),
+        )
+        builder_workspace = WorkspaceTools(self.store, self.mission["id"], builder.id)
+        builder_deps = AgentDependencies(
+            self.store, self.mission["id"], builder, builder_workspace, SkillCatalog(self.repository),
+        )
+        agent = _build_agent(builder, "openai:test-model")
+        message = agent._function_toolset.tools["message_agent"]
+        reply = agent._function_toolset.tools["reply_to_agent"]
+        context = SimpleNamespace(deps=builder_deps)
+        for text in ("First coordination note", "Second coordination note"):
+            result = message.function(context, "reviewer", text)
+            self.assertEqual(result, "Direct message sent.")
+        builder_deps.reply_to_agent_id = "planner"
+        self.assertEqual(
+            reply.function(context, "Here is the requested clarification."),
+            "Direct message sent.",
+        )
+        direct_messages = [
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "agent.message.created" and event["actorId"] == builder.id
+        ]
+        self.assertEqual([event["payload"]["recipient"] for event in direct_messages],
+                         ["reviewer", "reviewer", "planner"])
+        thread_id = direct_messages[0]["payload"]["replyChainId"]
+        dm_event = {"id": direct_messages[0]["id"], "type": "agent.message.created",
+                    "payload": direct_messages[0]["payload"]}
+        self.assertEqual(_agent_conversation_id(self.mission["id"], "reviewer", dm_event),
+                         f"tribe:{self.mission['id']}:reviewer:dm:{thread_id}")
+        self.assertEqual(_agent_conversation_id(self.mission["id"], "reviewer", {
+            "id": "broadcast", "type": "agent.message.created", "payload": {"recipient": None},
+        }), f"tribe:{self.mission['id']}:reviewer")
+
+        reviewer = AgentDefinition("reviewer", "Reviewer", "Review", "Review", "reviewer.md")
+        review_mission = self.store.create_mission(
+            self.project["id"], "Review tool recovery", "Verify review-tool error recovery",
+            {"id": "goal-driven-sdlc", "version": 1, "title": "Goal-driven SDLC"},
+        )
+        work = self.store.create_work_item(review_mission["id"], "Review the result")
+        criteria = [{"criterion": "The result is verified", "work_item_ids": [work["id"]]}]
+        self.store.finalize_plan(review_mission["id"], "planner", criteria)
+        test_event = self.store.append(
+            "repo.test_run.completed", "builder", review_mission["id"],
+            {"runId": "passing", "argv": ["pytest"], "exitCode": 0},
+        )
+        review_work = self.store.claim_work(review_mission["id"], reviewer.id)
+        self.store.complete_work(review_work["id"], reviewer.id, "Review completed")
+        reviewer_workspace = WorkspaceTools(self.store, review_mission["id"], reviewer.id)
+        reviewer_deps = AgentDependencies(
+            self.store, review_mission["id"], reviewer, reviewer_workspace, SkillCatalog(self.repository),
+        )
+        reviewer_agent = _build_agent(reviewer, "openai:test-model")
+        self.assertNotIn("record_review_checkpoint", reviewer_agent._function_toolset.tools)
+        self.assertTrue(test_event["id"])
+
+        planner = next(item for item in discover_agents(ROOT / "agents") if item.id == "planner")
+        planner_workspace = WorkspaceTools(self.store, review_mission["id"], planner.id)
+        planner_deps = AgentDependencies(
+            self.store, review_mission["id"], planner, planner_workspace,
+            SkillCatalog(self.repository),
+        )
+        planner_agent = _build_agent(planner, "openai:test-model")
+        complete_tool = planner_agent._function_toolset.tools["update_state"]
+        completion = complete_tool.function(
+            SimpleNamespace(deps=planner_deps), "chat", "finish", summary="Complete",
+        )
+        self.assertEqual(completion["event"]["type"], "mission.completed")
 
     def test_repository_test_tool_forwards_agent_cancellation_token(self) -> None:
         from pydantic_ai import CancellationToken
@@ -3468,28 +4120,123 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         )
         self.assertEqual(completion["payload"]["exitCode"], 0)
 
+    def test_repository_test_tool_returns_nonzero_exit_as_actionable_result(self) -> None:
+        definition = AgentDefinition("builder", "Builder", "Implementation", "Build", "builder.md")
+        item = self.store.create_work_item(self.mission["id"], "Run a failing test command")
+        claimed = self.store.claim_work(self.mission["id"], definition.id)
+        self.assertEqual(claimed["id"], item["id"])
+        attempt_cursor = self.store.latest_sequence(self.mission["id"])
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace,
+            SkillCatalog(self.repository), active_work_item_id=item["id"],
+        )
+        self.store.append("agent.tool.started", definition.id, self.mission["id"], {
+            "toolName": "run_repository_tests", "toolCallId": "test-call-1",
+        })
+        tool = _build_agent(definition, "openai:test-model")._function_toolset.tools[
+            "run_repository_tests"
+        ]
+        failure = {
+            "exit_code": 1, "stdout": "1 failed", "stderr": "assertion mismatch",
+            "cancelled": False, "timed_out": False,
+        }
+
+        with patch("tribe_runtime.commands.run_foreground_process", return_value=failure):
+            result = tool.function(
+                SimpleNamespace(deps=dependencies, tool_call_id="test-call-1"), ["pytest", "tests"],
+            )
+
+        self.assertEqual(result["exitCode"], 1)
+        self.assertEqual(result["stdout"], "1 failed")
+        self.assertEqual(result["stderr"], "assertion mismatch")
+        completion = next(
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.completed"
+        )
+        self.assertEqual(completion["payload"]["exitCode"], 1)
+        self.assertEqual(completion["payload"]["toolCallId"], "test-call-1")
+        self.store.append("agent.tool.completed", definition.id, self.mission["id"], {
+            "toolName": "run_repository_tests", "toolCallId": "test-call-1", "outcome": "success",
+        })
+        self.assertFalse(self.store.has_unexpected_agent_effect_after(
+            self.mission["id"], attempt_cursor, definition.id,
+        ))
+        incomplete_cursor = self.store.latest_sequence(self.mission["id"])
+        self.store.append("agent.tool.started", definition.id, self.mission["id"], {
+            "toolName": "run_repository_tests", "toolCallId": "test-call-2",
+        })
+        self.store.append("repo.test_run.started", definition.id, self.mission["id"], {
+            "runId": "interrupted-command", "argv": ["pytest", "tests"],
+            "toolCallId": "test-call-2",
+        })
+        self.assertTrue(self.store.has_unexpected_agent_effect_after(
+            self.mission["id"], incomplete_cursor, definition.id,
+        ))
+
+    def test_command_output_is_durable_activity_data_not_an_artifact(self) -> None:
+        output = "test output"
+        self.assertEqual(_durable_tool_output("run_command", output), output)
+        self.assertIsNone(_durable_tool_output("read_repository_file", output))
+        self.assertIsNone(_durable_tool_output("run_command", "   "))
+        self.assertEqual(len(_durable_tool_output("check_command", "x" * 200_010)), 200_000)
+
+    def test_file_recovery_hashes_complete_unified_edits_and_rejects_uncertain_diffs(self) -> None:
+        from difflib import unified_diff
+
+        from tribe_runtime.file_recovery import expected_file_hash
+
+        path = self.root / "edit.txt"
+        before = "keep this\nreplace this\nlast line\n"
+        after = "keep this\nreplacement\nlast line\nnew line\n"
+        path.write_text(before, encoding="utf-8")
+        diff = "".join(unified_diff(
+            before.splitlines(keepends=True), after.splitlines(keepends=True),
+            fromfile="a/edit.txt", tofile="b/edit.txt",
+        ))
+        self.assertEqual(
+            expected_file_hash(path, diff, truncated=False),
+            hashlib.sha256(after.encode("utf-8")).hexdigest(),
+        )
+        self.assertIsNone(expected_file_hash(path, diff, truncated=True))
+        self.assertIsNone(expected_file_hash(path, "--- a/edit.txt\n+++ b/edit.txt\n", truncated=False))
+        path.unlink()
+        create_diff = "".join(unified_diff(
+            [], after.splitlines(keepends=True), fromfile="/dev/null", tofile="b/edit.txt",
+        ))
+        self.assertEqual(
+            expected_file_hash(path, create_diff, truncated=False),
+            hashlib.sha256(after.encode("utf-8")).hexdigest(),
+        )
+
     def test_agent_claim_tool_accepts_the_selected_work_item_id(self) -> None:
         from pydantic_ai.models.test import TestModel
 
-        definition = AgentDefinition("builder", "Builder", "Implementation", "Build", "builder.md")
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build", "builder.md",
+            capabilities=("task_coordination",),
+        )
         self.store.create_work_item(self.mission["id"], "Review the design")
         selected = self.store.create_work_item(self.mission["id"], "Implement the fix")
         workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
         dependencies = AgentDependencies(
             self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
         )
-        tool = _build_agent(definition, "openai:test-model")._function_toolset.tools["claim_work"]
+        tool = _build_agent(definition, "openai:test-model")._function_toolset.tools["update_state"]
         self.assertEqual(
-            tool.function_schema.json_schema["required"], ["work_item_id"],
+            tool.function_schema.json_schema["required"], ["target", "action"],
         )
 
-        claimed = tool.function(SimpleNamespace(deps=dependencies), selected["id"])
+        claimed = tool.function(SimpleNamespace(deps=dependencies), "task", "claim", selected["id"])
 
         self.assertEqual(claimed["id"], selected["id"])
         self.assertEqual(dependencies.active_work_item_id, selected["id"])
         self.assertEqual(workspace.work_item_id, selected["id"])
 
-        reviewer = AgentDefinition("reviewer", "Reviewer", "Review", "Review", "reviewer.md")
+        reviewer = AgentDefinition(
+            "reviewer", "Reviewer", "Review", "Review", "reviewer.md",
+            capabilities=("task_coordination", "conversation"),
+        )
         model_selected = self.store.create_work_item(self.mission["id"], "Verify the implementation")
         reviewer_workspace = WorkspaceTools(self.store, self.mission["id"], reviewer.id)
         reviewer_dependencies = AgentDependencies(
@@ -3499,19 +4246,20 @@ with workspace._path_lock(Path(repository) / 'README.md'):
 
         async def run_agent_choice() -> None:
             agent = _build_agent(reviewer, "openai:test-model")
+            self.reveal_deferred_test_tools(agent)
 
             class BoardChoiceModel(TestModel):
                 def gen_tool_args(self, tool_def):
                     if tool_def.name == "list_plan_items":
                         return {}
-                    if tool_def.name == "claim_work":
-                        return {"work_item_id": model_selected["id"]}
+                    if tool_def.name == "update_state":
+                        return {"target": "task", "action": "claim", "target_id": model_selected["id"]}
                     if tool_def.name == "post_update":
                         return {"text": "I claimed the implementation task."}
                     return super().gen_tool_args(tool_def)
 
             with agent.override(model=BoardChoiceModel(
-                call_tools=["list_plan_items", "claim_work", "post_update"],
+                call_tools=["list_plan_items", "update_state", "post_update"],
             )):
                 await agent.run("Choose and claim the verification task from the board.", deps=reviewer_dependencies)
 
@@ -3649,7 +4397,10 @@ with workspace._path_lock(Path(repository) / 'README.md'):
     def test_tribe_repository_tools_run_without_a_harness_workspace(self) -> None:
         from pydantic_ai.models.test import TestModel
 
-        definition = AgentDefinition("builder", "Builder", "Implementation", "Build work", "builder.md")
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build work", "builder.md",
+            tool_permissions=("read_repository_file",),
+        )
         workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
         skills = SkillCatalog(self.repository)
         dependencies = AgentDependencies(self.store, self.mission["id"], definition, workspace, skills)
@@ -3666,7 +4417,9 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             if os.name == "posix" else nullcontext()
         )
         with platform_boundary:
-            capabilities = build_capabilities(workspace, skills)
+            capabilities = build_capabilities(
+                workspace, skills, tool_permissions=definition.tool_permissions,
+            )
         capability_names = {type(item).__name__ for item in capabilities}
         if os.name != "posix":
             self.assertNotIn("LocalWorkspace", capability_names)
@@ -3690,6 +4443,42 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             if event["type"] == "agent.tool.completed"
         )
         self.assertEqual(tool_event["payload"]["toolName"], "read_repository_file")
+
+    def test_missing_repository_file_returns_recoverable_tool_result(self) -> None:
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build work", "builder.md",
+            tool_permissions=("read_repository_file",),
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
+        skills = SkillCatalog(self.repository)
+        dependencies = AgentDependencies(self.store, self.mission["id"], definition, workspace, skills)
+        agent = _build_agent(definition, "openai:test-model")
+
+        class MissingFileModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "read_repository_file":
+                    return {"path": "package.json"}
+                return super().gen_tool_args(tool_def)
+
+        async def run() -> str:
+            with agent.override(model=MissingFileModel(
+                call_tools=["read_repository_file"], custom_output_text="I will use the repository search results."
+            )):
+                result = await agent.run(
+                    "Check whether this repository has a package manifest.", deps=dependencies,
+                    conversation_id=f"tribe:{self.mission['id']}:{definition.id}",
+                )
+            return result.output
+
+        self.assertEqual(asyncio.run(run()), "I will use the repository search results.")
+        completed = [
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "agent.tool.completed"
+            and event["payload"].get("toolName") == "read_repository_file"
+        ]
+        self.assertEqual(len(completed), 1)
 
     def test_harness_tools_are_blocked_after_workspace_switch_mid_run(self) -> None:
         workspace = WorkspaceTools(self.store, self.mission["id"], "builder")
@@ -3828,6 +4617,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         agents = discover_agents(ROOT / "agents")
         self.assertEqual({agent.id for agent in agents}, {"planner", "builder", "reviewer"})
         self.assertTrue(all(agent.instructions for agent in agents))
+        self.assertTrue(all(agent.tool_permissions is not None for agent in agents))
 
     def test_agent_registry_rejects_duplicate_ids(self) -> None:
         directory = self.root / "agents"
@@ -3848,96 +4638,327 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         agent = write_agent_definition(
             directory, "auditor", "Auditor", "Review changes", "Inspect and verify only.",
             repository_access="read_only",
+            tool_permissions=("read_repository_file",),
         )
         loaded = discover_agents(directory)[0]
         self.assertEqual(agent.repository_access, "read_only")
         self.assertEqual(loaded.repository_access, "read_only")
+        self.assertEqual(loaded.capabilities, ("repository_read",))
         self.assertIn("repository_access: read_only", (directory / "auditor.md").read_text())
+        self.assertIn('capabilities: ["repository_read"]',
+                      (directory / "auditor.md").read_text())
+        with self.assertRaisesRegex(ValueError, "unknown capability"):
+            write_agent_definition(
+                directory, "unknown_tool", "Bad role", "Test", "Invalid permissions.",
+                tool_permissions=("unregistered_tool",),
+            )
 
     def test_read_only_role_function_toolset_hides_repository_mutations(self) -> None:
         reviewer = next(agent for agent in discover_agents(ROOT / "agents") if agent.id == "reviewer")
         agent = _build_agent(reviewer, "openai:gpt-4o-mini")
 
-        allowed = {tool.name for tool in _tools_for_repository_access(agent, "read_only") or []}
+        allowed = {tool.name for tool in _tools_for_agent(
+            agent, "read_only", reviewer.tool_permissions,
+        )}
 
         self.assertIn("read_repository_file", allowed)
-        self.assertIn("run_repository_tests", allowed)
-        self.assertIn("record_review_checkpoint", allowed)
-        self.assertIn("complete_mission", allowed)
-        self.assertIn("complete_discovery", allowed)
-        self.assertIn("finalize_plan", allowed)
+        self.assertNotIn("run_repository_tests", allowed)
+        self.assertIn("update_state", allowed)
+        self.assertNotIn("complete_mission", allowed)
+        self.assertNotIn("complete_discovery", allowed)
+        self.assertNotIn("finalize_plan", allowed)
+        self.assertNotIn("create_plan_item", allowed)
+        self.assertNotIn("revise_plan_item", allowed)
         self.assertNotIn("write_repository_file", allowed)
         self.assertNotIn("delete_repository_file", allowed)
         self.assertNotIn("integrate_isolated_changes", allowed)
-        self.assertIsNone(_tools_for_repository_access(agent, "workspace_write"))
+        self.assertNotIn("complete_discovery", {
+            tool.name for tool in _tools_for_agent(
+                agent, "workspace_write",
+                next(item for item in discover_agents(ROOT / "agents") if item.id == "builder").tool_permissions,
+            )
+        })
         self.assertFalse(agent._function_toolset.tools["post_update"].defer_loading)
         self.assertFalse(agent._function_toolset.tools["read_repository_file"].defer_loading)
         self.assertFalse(agent._function_toolset.tools["search_repository"].defer_loading)
         self.assertTrue(agent._function_toolset.tools["create_plan_item"].defer_loading)
+        self.assertTrue(agent._function_toolset.tools["create_plan_items"].defer_loading)
         self.assertTrue(agent._function_toolset.tools["write_repository_file"].defer_loading)
-        completion_schema = agent._function_toolset.tools["complete_mission"].function_schema.json_schema
-        self.assertEqual(completion_schema["required"], ["summary", "acceptance_checks"])
-        checkpoint_schema = agent._function_toolset.tools["record_review_checkpoint"].function_schema.json_schema
-        self.assertIn("verification_event_id", checkpoint_schema["required"])
-        self.assertIn("acceptance_criteria", agent._function_toolset.tools["finalize_plan"].function_schema.json_schema["required"])
-        criterion_schema = agent._function_toolset.tools["finalize_plan"].function_schema.json_schema["$defs"]["PlanAcceptanceCriterion"]
-        self.assertEqual(criterion_schema["required"], ["criterion", "work_item_ids"])
-        check_schema = completion_schema["$defs"]["AcceptanceCheck"]
-        self.assertEqual(check_schema["required"], ["criterion", "evidence_refs"])
 
-    def test_reviewer_agent_can_record_a_checkpoint_through_its_native_tool(self) -> None:
-        from pydantic_ai.models.test import TestModel
-
-        mission = self.store.create_mission(
-            self.project["id"], "Tool checkpoint", "Deliver a verified change",
-            {"id": "goal-driven-sdlc", "version": 2, "title": "Goal-driven SDLC"},
+    def test_registered_artifact_and_document_tools_are_grantable_from_profiles(self) -> None:
+        permissions = ("list_artifacts", "get_artifact", "create_artifact", "comment_on_artifact")
+        directory = self.root / "artifact-agents"
+        write_agent_definition(
+            directory, "publisher", "Publisher", "Review deliverables", "Inspect mission outputs.",
+            tool_permissions=permissions,
         )
-        self.store.create_work_item(mission["id"], "Review implementation")
-        self.store.finalize_plan(mission["id"], "planner", [{
-            "criterion": "Implementation meets the goal",
-            "work_item_ids": [self.store.work_items(mission["id"])[0]["id"]],
-        }])
-        review_work = self.store.claim_work(mission["id"], "reviewer")
-        self.store.complete_work(review_work["id"], "reviewer", "Reviewed implementation")
-        test_event = self.store.append(
-            "repo.test_run.completed", "builder", mission["id"],
-            {"runId": "reviewed", "argv": ["pytest"], "exitCode": 0},
-        )
-        definition = AgentDefinition("reviewer", "Reviewer", "Review", "Review changes", "reviewer.md",
-                                     repository_access="read_only")
-        workspace = WorkspaceTools(self.store, mission["id"], definition.id)
-        dependencies = AgentDependencies(
-            self.store, mission["id"], definition, workspace, SkillCatalog(self.repository),
-        )
+        definition = discover_agents(directory)[0]
         agent = _build_agent(definition, "openai:test-model")
 
-        class CheckpointModel(TestModel):
-            def gen_tool_args(self, tool_def):
-                if tool_def.name == "record_review_checkpoint":
-                    return {
-                        "disposition": "approved",
-                        "summary": "Acceptance criteria and risks checked.",
-                        "verification_event_id": test_event["id"],
-                        "findings": [],
-                    }
-                return super().gen_tool_args(tool_def)
+        available = {tool.name for tool in _tools_for_agent(
+            agent, definition.repository_access, definition.tool_permissions,
+        )}
 
-        async def run() -> None:
-            with agent.override(model=CheckpointModel(call_tools=["record_review_checkpoint"])):
-                await agent.run("Record the review checkpoint.", deps=dependencies)
+        self.assertEqual(available, set(permissions))
+        self.assertTrue(all(agent._function_toolset.tools[name].defer_loading for name in permissions))
 
-        asyncio.run(run())
-        events = self.store.events_after(mission["id"], 0)
-        checkpoint = next(event for event in events if event["type"] == "review.checkpoint.recorded")
-        self.assertEqual(checkpoint["payload"]["verificationEventId"], test_event["id"])
-        self.assertEqual(checkpoint["payload"]["disposition"], "approved")
+    def test_agent_instructions_route_tests_through_the_restricted_test_tool(self) -> None:
+        builder = next(agent for agent in discover_agents(ROOT / "agents") if agent.id == "builder")
+        agent = _build_agent(builder, "openai:gpt-4o-mini")
+        instructions = agent._instructions[0].instruction
+
+        self.assertFalse(agent._function_toolset.tools["run_repository_tests"].defer_loading)
+        self.assertIn("Use the granted project command capability to run appropriate checks.", instructions)
+        self.assertIn("A failed command is feedback", instructions)
+        self.assertIn("check the task's stated intended role", instructions)
+        self.assertIn("Specialized capabilities may be deferred and discovered with load_capability", instructions)
+        state_tool = agent._function_toolset.tools["update_state"]
+        self.assertEqual(state_tool.function_schema.json_schema["required"], ["target", "action"])
+        self.assertNotIn("complete_discovery", agent._function_toolset.tools)
+        self.assertNotIn("finalize_plan", agent._function_toolset.tools)
+        self.assertNotIn("record_review_checkpoint", agent._function_toolset.tools)
+
+    def test_profile_grants_control_planning_and_review_tools_independent_of_role_id(self) -> None:
+        from tribe_runtime.agents import TOOL_PERMISSION_NAMES
+
+        planner_definition = next(item for item in discover_agents(ROOT / "agents") if item.id == "planner")
+        reviewer_definition = next(item for item in discover_agents(ROOT / "agents") if item.id == "reviewer")
+        planner = _build_agent(
+            planner_definition,
+            "openai:test-model",
+        )
+        reviewer = _build_agent(
+            reviewer_definition,
+            "openai:test-model",
+        )
+        planner_tools = {tool.name for tool in _tools_for_agent(
+            planner, planner_definition.repository_access, planner_definition.tool_permissions,
+        )}
+        reviewer_tools = {tool.name for tool in _tools_for_agent(
+            reviewer, reviewer_definition.repository_access, reviewer_definition.tool_permissions,
+        )}
+
+        self.assertTrue({"create_plan_item", "create_plan_items", "revise_plan_item"}.issubset(planner_tools))
+        self.assertTrue({"create_plan_item", "create_plan_items", "revise_plan_item"}.isdisjoint(reviewer_tools))
+        self.assertIn("update_state", planner_tools)
+        self.assertIn("update_state", reviewer_tools)
+        self.assertNotIn("complete_mission", reviewer_tools)
+        self.assertNotIn("record_review_checkpoint", planner_tools)
+        custom_definition = AgentDefinition(
+            "delivery-lead", "Delivery lead", "Plan delivery", "Plan work", "delivery-lead.md",
+            repository_access="read_only", tool_permissions=("finalize_plan",),
+        )
+        self.assertNotIn("finalize_plan", {
+            tool.name for tool in _tools_for_agent(
+                planner, custom_definition.repository_access,
+                custom_definition.tool_permissions,
+            )
+        })
+        custom_finisher = AgentDefinition(
+            "delivery-finisher", "Delivery finisher", "Mission closure", "Close completed work",
+            "delivery-finisher.md", repository_access="read_only",
+            tool_permissions=("complete_mission",),
+        )
+        self.assertIn("update_state", {
+            tool.name for tool in _tools_for_agent(
+                planner, custom_finisher.repository_access, custom_finisher.tool_permissions,
+            )
+        })
+        ungranted_definition = AgentDefinition(
+            "ungranted", "Unassigned", "No access", "No tools granted", "ungranted.md",
+        )
+        self.assertEqual([], _tools_for_agent(
+            planner, ungranted_definition.repository_access, ungranted_definition.tool_permissions,
+        ))
+        self.assertTrue(TOOL_PERMISSION_NAMES)
+        for name in ("create_plan_item", "revise_plan_item", "update_state"):
+            self.assertFalse(planner._function_toolset.tools[name].defer_loading)
+        self.assertNotIn("finalize_plan", planner._function_toolset.tools)
+        self.assertNotIn("complete_discovery", planner._function_toolset.tools)
+        self.assertIn("update_state", reviewer._function_toolset.tools)
+
+    def test_planner_eager_board_tool_is_in_the_model_callable_schema(self) -> None:
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "planner", "Planner", "Planning", "Plan work", "planner.md",
+            tool_permissions=("list_plan_items",),
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+        )
+        agent = _build_agent(definition, "openai:test-model")
+        model = TestModel(call_tools=["list_plan_items"], custom_output_text="Board checked.")
+        capabilities = build_capabilities(
+            workspace, dependencies.skills, repository_access="read_only",
+            tool_permissions=definition.tool_permissions,
+        )
+
+        async def run() -> str:
+            with agent.override(model=model, tools=_tools_for_agent(
+                agent, definition.repository_access, definition.tool_permissions,
+            )):
+                result = await agent.run(
+                    "Inspect the current plan board.", deps=dependencies, capabilities=capabilities,
+                )
+            return result.output
+
+        self.assertEqual(asyncio.run(run()), "Board checked.")
+        self.assertIn(
+            "list_plan_items",
+            {tool.name for tool in model.last_model_request_parameters.function_tools},
+        )
+
+    def test_finalize_plan_validation_errors_return_recovery_feedback(self) -> None:
+        definition = AgentDefinition("planner", "Planner", "Planning", "Plan", "planner.md")
+        tools = _build_agent(definition, "openai:test-model")._function_toolset.tools
+        self.assertNotIn("finalize_plan", tools)
+        self.assertIn("create_plan_item", tools)
+
+    def test_discovery_checkpoint_rejection_returns_recoverable_tool_feedback(self) -> None:
+        definition = AgentDefinition("planner", "Planner", "Planning", "Plan", "planner.md")
+        tools = _build_agent(definition, "openai:test-model")._function_toolset.tools
+        self.assertNotIn("complete_discovery", tools)
+
+    def test_mark_mission_blocked_without_a_pending_request_returns_recovery_feedback(self) -> None:
+        definition = AgentDefinition(
+            "planner", "Planner", "Planning", "Plan", "planner.md",
+            tool_permissions=("mark_mission_blocked",),
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+        )
+        tool = _build_agent(definition, "openai:test-model")._function_toolset.tools["update_state"]
+
+        result = tool.function(
+            SimpleNamespace(deps=dependencies), "chat", "waiting", summary="Waiting for a user request",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "mission_block_requires_a_pending_user_request")
+        self.assertEqual(result["action"], "continue_work_or_explain_blocker")
+
+    def test_claim_and_complete_work_policy_denials_return_recovery_feedback(self) -> None:
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build", "builder.md",
+            tool_permissions=("claim_work", "complete_work"),
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+        )
+        tools = _build_agent(definition, "openai:test-model")._function_toolset.tools
+        with patch.object(self.store, "claim_work", side_effect=ValueError("plan_checkpoint_stale")):
+            claim = tools["update_state"].function(
+                SimpleNamespace(deps=dependencies), "task", "claim", "task-id",
+            )
+        with patch.object(self.store, "complete_work", side_effect=ValueError("plan_checkpoint_stale")):
+            completion = tools["update_state"].function(
+                SimpleNamespace(deps=dependencies), "task", "complete", "task-id", "Done and verified",
+            )
+
+        self.assertEqual(claim, {
+            "ok": False, "error": "plan_checkpoint_stale", "action": "wait_for_current_plan",
+        })
+        self.assertEqual(completion, {
+            "ok": False, "error": "plan_checkpoint_stale", "action": "refresh_plan_and_retry",
+        })
+
+    def test_complete_work_retries_owned_claim_once_and_reports_observed_state(self) -> None:
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build", "builder.md",
+            tool_permissions=("complete_work",),
+        )
+        ready = self.store.create_work_item(self.mission["id"], "A task not yet claimed")
+        claimed = self.store.create_work_item(self.mission["id"], "A task to complete")
+        self.store.claim_work(self.mission["id"], definition.id, work_item_id=claimed["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition,
+            WorkspaceTools(self.store, self.mission["id"], definition.id),
+            SkillCatalog(self.repository),
+        )
+        tool = _build_agent(definition, "openai:test-model")._function_toolset.tools[
+            "update_state"
+        ]
+        original_complete = self.store.complete_work
+        complete_attempts = 0
+
+        def transient_completion_miss(*args):
+            nonlocal complete_attempts
+            complete_attempts += 1
+            return None if complete_attempts == 1 else original_complete(*args)
+
+        with patch.object(
+            self.store, "complete_work", side_effect=transient_completion_miss,
+        ) as complete:
+            result = tool.function(
+                SimpleNamespace(deps=dependencies), "task", "complete", claimed["id"],
+                "Implemented and verified",
+            )
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(complete.call_count, 2)
+
+        unclaimed_result = tool.function(
+            SimpleNamespace(deps=dependencies), "task", "complete", ready["id"],
+            "Not actually claimed",
+        )
+        self.assertEqual(unclaimed_result["observedStatus"], "ready")
+        self.assertIsNone(unclaimed_result["observedOwner"])
+
+    def test_auto_chat_can_select_workflow_but_explicit_choice_cannot_be_replaced(self) -> None:
+        planner = next(item for item in discover_agents(ROOT / "agents") if item.id == "planner")
+        workspace = WorkspaceTools(self.store, self.mission["id"], planner.id)
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], planner, workspace, SkillCatalog(self.repository),
+        )
+        tools = _build_agent(planner, "openai:test-model")._function_toolset.tools
+
+        available = tools["list_workflows"].function(SimpleNamespace(deps=dependencies))
+        self.assertIn("goal-driven-sdlc", {workflow["id"] for workflow in available})
+        selected = tools["activate_workflow"].function(
+            SimpleNamespace(deps=dependencies), "goal-driven-sdlc",
+        )
+        self.assertTrue(selected["ok"])
+        self.assertEqual(self.store.mission(self.mission["id"])["recipe_id"], "goal-driven-sdlc")
+        self.assertTrue(any(
+            event["type"] == "mission.workflow.selected"
+            for event in self.store.events_after(self.mission["id"], 0)
+        ))
+
+        explicit = self.store.create_mission(
+            self.project["id"], "Explicit workflow", "Fix a defect",
+            {"id": "bug-fix", "version": 1, "title": "Bug fix", "instructions": "Fix and verify."},
+        )
+        explicit_workspace = WorkspaceTools(self.store, explicit["id"], planner.id)
+        explicit_dependencies = AgentDependencies(
+            self.store, explicit["id"], planner, explicit_workspace, SkillCatalog(self.repository),
+        )
+        rejected = tools["activate_workflow"].function(
+            SimpleNamespace(deps=explicit_dependencies), "goal-driven-sdlc",
+        )
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(self.store.mission(explicit["id"])["recipe_id"], "bug-fix")
+
+    def test_reviewer_agent_can_record_a_checkpoint_through_its_native_tool(self) -> None:
+        definition = next(item for item in discover_agents(ROOT / "agents") if item.id == "reviewer")
+        tools = _build_agent(definition, "openai:test-model")._function_toolset.tools
+        self.assertIn("message_agent", tools)
+        self.assertNotIn("record_review_checkpoint", tools)
 
     def test_read_only_role_does_not_receive_harness_filesystem_or_shell(self) -> None:
         workspace = WorkspaceTools(self.store, self.mission["id"], "reviewer")
         skills = SkillCatalog(self.repository)
 
-        read_only = build_capabilities(workspace, skills, repository_access="read_only")
-        writer = build_capabilities(workspace, skills, repository_access="workspace_write")
+        read_only = build_capabilities(
+            workspace, skills, repository_access="read_only",
+            tool_permissions=("read_file", "write_file", "run_command"),
+        )
+        writer = build_capabilities(
+            workspace, skills, repository_access="workspace_write",
+            tool_permissions=("read_file", "write_file", "run_command"),
+        )
         read_only_names = {type(capability).__name__ for capability in read_only}
         writer_names = {type(capability).__name__ for capability in writer}
 
@@ -4104,6 +5125,131 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertEqual(captured["prompt"]["agent_claimed_work_item"], claimed["id"])
         self.assertEqual(captured["prompt"]["project"]["goal"], "Long-term project goal")
 
+    def test_provider_prompt_includes_recent_repository_test_evidence(self) -> None:
+        tool_call_id = "call_harness_test_evidence"
+        source_tool_event = self.store.append("agent.tool.completed", "builder", self.mission["id"], {
+            "toolCallId": tool_call_id, "toolName": "run_command", "outcome": "success",
+            "summary": "node --test test/habits.test.js",
+            "output": "TAP version 13\n1..1\n# tests 1\n# pass 1\n# fail 0\n",
+        })
+        evidence_event = self.store.record_harness_node_test_result(
+            self.mission["id"], "builder", source_tool_event["sequence"], tool_call_id,
+            "node --test test/habits.test.js", "TAP version 13\n1..1\n# tests 1\n# pass 1\n# fail 0\n",
+            None, source_tool_event_id=source_tool_event["id"],
+        )
+        captured = {}
+
+        class AgentStub:
+            async def run(self, prompt, **kwargs):
+                captured["prompt"] = json.loads(prompt)
+                return type("Result", (), {"output": "no-op"})()
+
+        trigger = self.store.append("message.created", "user", self.mission["id"], {
+            "text": "Review the latest test run", "recipient": "reviewer",
+        })
+        with patch("tribe_runtime.agent_runtime._build_agent", return_value=AgentStub()):
+            provider = PydanticAIProvider(
+                AgentDefinition("reviewer", "Reviewer", "Quality", "Review evidence", "reviewer.md"),
+                "openai:test-model",
+            )
+            asyncio.run(provider.run(self.store, self.mission["id"], trigger))
+
+        runs = captured["prompt"]["recent_test_runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["event_id"], evidence_event["id"])
+        self.assertEqual(runs[0]["argv"], ["node", "--test", "test/habits.test.js"])
+        self.assertEqual(runs[0]["exit_code"], 0)
+        self.assertIn("# pass 1", runs[0]["stdout_tail"])
+
+    def test_agent_verification_context_includes_exact_current_plan_criteria(self) -> None:
+        mission = self.store.create_mission(
+            self.project["id"], "Criteria context", "Deliver a verified change",
+            {"id": "goal-driven-sdlc", "version": 7, "title": "Goal-driven SDLC"},
+        )
+        item = self.store.create_work_item(mission["id"], "Implement change")
+        self.store.complete_discovery(
+            mission["id"], "planner", "Inspected project instructions and identified the change scope.", [],
+        )
+        criterion = "All acceptance checks are satisfied exactly as finalized."
+        self.store.finalize_plan(mission["id"], "planner", [{
+            "criterion": criterion, "work_item_ids": [item["id"]],
+        }])
+
+        context = self.store.agent_verification_context(mission["id"])
+
+        self.assertEqual(context["acceptance_criteria"], [criterion])
+        self.assertIsInstance(context["plan_checkpoint_sequence"], int)
+
+    def test_invalid_plan_dependency_is_returned_to_agent_without_aborting_turn(self) -> None:
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "planner", "Planner", "Planning", "Plan work", "planner.md",
+            tool_permissions=("create_plan_item",),
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+        )
+        agent = _build_agent(definition, "openai:test-model")
+
+        class InvalidDependencyModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "create_plan_item":
+                    return {
+                        "title": "Review delivery", "detail": "Confirm the result",
+                        "depends_on": ["not-a-task-in-this-mission"],
+                    }
+                return super().gen_tool_args(tool_def)
+
+        with patch.object(
+            self.store, "create_work_item",
+            side_effect=ValueError("work item dependencies must belong to this mission"),
+        ):
+            with agent.override(model=InvalidDependencyModel(
+                call_tools=["create_plan_item"],
+                custom_output_text="I can correct the task dependency and continue.",
+            )):
+                result = asyncio.run(agent.run(
+                    "Add a reviewer task depending on the QA task.", deps=dependencies,
+                ))
+
+        self.assertEqual(result.output, "I can correct the task dependency and continue.")
+
+    def test_planner_can_create_a_dependency_ordered_batch_in_one_tool_call(self) -> None:
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "planner", "Planner", "Planning", "Plan work", "planner.md",
+            tool_permissions=("create_plan_items",),
+        )
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition,
+            WorkspaceTools(self.store, self.mission["id"], definition.id),
+            SkillCatalog(self.repository),
+        )
+        agent = _build_agent(definition, "openai:test-model")
+
+        class BatchPlanModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "create_plan_items":
+                    return {"items": [
+                        {"key": "implement", "title": "Implement feature", "detail": "Build the feature."},
+                        {"key": "verify", "title": "Verify feature", "detail": "Run the checks.",
+                         "depends_on": ["implement"]},
+                    ]}
+                return super().gen_tool_args(tool_def)
+
+        with agent.override(model=BatchPlanModel(
+            call_tools=["create_plan_items"], custom_output_text="The two tasks are on the plan.",
+        )):
+            result = asyncio.run(agent.run("Plan the implementation and verification.", deps=dependencies))
+
+        items = self.store.work_items(self.mission["id"])
+        self.assertEqual([item["title"] for item in items], ["Implement feature", "Verify feature"])
+        self.assertEqual(items[1]["depends_on"], [items[0]["id"]])
+        self.assertEqual(result.output, "The two tasks are on the plan.")
+
     def test_provider_continues_the_prior_persisted_agent_conversation(self) -> None:
         from pydantic_ai import Agent
         from pydantic_ai.models.test import TestModel
@@ -4146,6 +5292,55 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             for message in history for part in message.parts
         ))
 
+    def test_provider_resumes_saved_frontier_without_repeating_the_trigger_prompt(self) -> None:
+        from pydantic_ai import Agent
+        from pydantic_ai.models.test import TestModel
+        from pydantic_ai_harness.step_persistence import SqliteStepStore, StepPersistence
+
+        event = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Resume this request", "recipient": "builder"},
+        )
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        step_store = SqliteStepStore(database=self.store.data_dir / "agent_steps.sqlite3")
+        conversation_id = f"tribe:{self.mission['id']}:builder"
+        prior_agent = Agent("openai:test-model")
+
+        async def save_frontier() -> None:
+            with prior_agent.override(model=TestModel(call_tools=[], custom_output_text="checkpoint text")):
+                await prior_agent.run(
+                    "The original trigger and context.",
+                    capabilities=[StepPersistence(
+                        store=step_store, agent_name=conversation_id,
+                        metadata={"trigger_sequence": str(event["sequence"])},
+                        capture_frontier=True,
+                    )],
+                    conversation_id=conversation_id,
+                )
+
+        asyncio.run(save_frontier())
+        captured = {}
+
+        class AgentStub:
+            async def run(self, prompt, **kwargs):
+                captured.update(prompt=prompt, **kwargs)
+                return type("Result", (), {"output": "resumed output"})()
+
+        with patch("tribe_runtime.agent_runtime._build_agent", return_value=AgentStub()):
+            provider = PydanticAIProvider(
+                AgentDefinition("builder", "Builder", "Implementation", "Build features", "builder.md"),
+                "openai:test-model",
+            )
+            asyncio.run(provider.run(
+                self.store, self.mission["id"], {**event, "resumeCheckpoint": True},
+            ))
+
+        self.assertIsNone(captured["prompt"])
+        self.assertTrue(any(
+            getattr(part, "content", "") == "The original trigger and context."
+            for message in captured["message_history"] for part in message.parts
+        ))
+
     def test_pydantic_ai_binds_plan_read_and_revise_tools(self) -> None:
         agent = _build_agent(
             AgentDefinition("planner", "Planner", "Planning", "Plan work", "planner.md"),
@@ -4153,18 +5348,18 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         )
         self.assertIn("list_plan_items", agent._function_toolset.tools)
         self.assertIn("revise_plan_item", agent._function_toolset.tools)
-        self.assertIn("list_mission_artifacts", agent._function_toolset.tools)
-        self.assertIn("read_mission_artifact", agent._function_toolset.tools)
-        self.assertIn("read_artifact_reviews", agent._function_toolset.tools)
+        self.assertIn("list_artifacts", agent._function_toolset.tools)
+        self.assertIn("get_artifact", agent._function_toolset.tools)
+        self.assertIn("create_artifact", agent._function_toolset.tools)
         self.assertIn("comment_on_artifact", agent._function_toolset.tools)
-        self.assertIn("list_canvas_documents", agent._function_toolset.tools)
-        self.assertIn("read_canvas_document", agent._function_toolset.tools)
-        self.assertIn("read_canvas_version", agent._function_toolset.tools)
 
     def test_harness_filesystem_tool_writes_and_records_a_repository_change(self) -> None:
         from pydantic_ai.models.test import TestModel
 
-        definition = AgentDefinition("builder", "Builder", "Implementation", "Build work", "builder.md")
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build work", "builder.md",
+            tool_permissions=("write_file",),
+        )
         workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
         skills = SkillCatalog(self.repository)
         trigger = self.store.append(
@@ -4176,6 +5371,10 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             trigger_sequence=trigger["sequence"],
         )
         agent = _build_agent(definition, "openai:test-model")
+        capabilities = build_capabilities(
+            workspace, skills, tool_permissions=definition.tool_permissions,
+        )
+        self.reveal_deferred_test_tools(agent, capabilities)
         test_model = TestModel(call_tools=["write_file"], custom_output_text="file written")
 
         async def run() -> str:
@@ -4183,7 +5382,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                 result = await agent.run(
                     "Create a small text file with the Harness write_file tool.",
                     deps=dependencies,
-                    capabilities=build_capabilities(workspace, skills),
+                    capabilities=capabilities,
                     conversation_id=f"tribe:{self.mission['id']}:{definition.id}",
                 )
             return result.output
@@ -4212,8 +5411,14 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             event["payload"].get("triggerSequence") == trigger["sequence"]
             for event in tool_events
         ))
-        self.assertTrue(any(event["type"] == "artifact.created"
-                            for event in self.store.events_after(self.mission["id"], 0)))
+        self.assertFalse(any(event["type"] == "artifact.created"
+                             for event in self.store.events_after(self.mission["id"], 0)))
+        changed_call_id = changed[0]["payload"]["toolCallId"]
+        self.assertTrue(changed_call_id)
+        self.assertEqual(next(
+            event["payload"]["toolCallId"] for event in tool_events
+            if event["type"] == "agent.tool.started"
+        ), changed_call_id)
         from pydantic_ai_harness.step_persistence import SqliteStepStore
 
         step_store = SqliteStepStore(database=self.store.data_dir / "agent_steps.sqlite3")
@@ -4228,7 +5433,10 @@ with workspace._path_lock(Path(repository) / 'README.md'):
     def test_harness_releases_path_lock_after_each_completed_write(self) -> None:
         from pydantic_ai.models.test import TestModel
 
-        definition = AgentDefinition("builder", "Builder", "Implementation", "Build work", "builder.md")
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build work", "builder.md",
+            tool_permissions=("write_file",),
+        )
         workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
         skills = SkillCatalog(self.repository)
         dependencies = AgentDependencies(
@@ -4270,13 +5478,17 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             call_tools=["write_file", "verify_lock_released"],
             custom_output_text="write lock verified",
         )
+        capabilities = build_capabilities(
+            workspace, skills, tool_permissions=definition.tool_permissions,
+        )
+        self.reveal_deferred_test_tools(agent, capabilities)
 
         async def run() -> str:
             with agent.override(model=test_model):
                 result = await agent.run(
                     "Write a small text file, then verify its path is available to another agent.",
                     deps=dependencies,
-                    capabilities=build_capabilities(workspace, skills),
+                    capabilities=capabilities,
                     conversation_id=f"tribe:{self.mission['id']}:{definition.id}:lock-test",
                 )
             return result.output
@@ -4293,7 +5505,10 @@ with workspace._path_lock(Path(repository) / 'README.md'):
     def test_harness_directory_creation_records_change_and_releases_path_lock(self) -> None:
         from pydantic_ai.models.test import TestModel
 
-        definition = AgentDefinition("builder", "Builder", "Implementation", "Build work", "builder.md")
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build work", "builder.md",
+            tool_permissions=("create_directory",),
+        )
         workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
         skills = SkillCatalog(self.repository)
         dependencies = AgentDependencies(
@@ -4301,6 +5516,10 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             file_locks={}, pending_file_changes={},
         )
         agent = _build_agent(definition, "openai:test-model")
+        capabilities = build_capabilities(
+            workspace, skills, tool_permissions=definition.tool_permissions,
+        )
+        self.reveal_deferred_test_tools(agent, capabilities)
         test_model = TestModel(call_tools=["create_directory"], custom_output_text="directory created")
 
         async def run() -> str:
@@ -4308,7 +5527,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                 result = await agent.run(
                     "Create a new generated directory.",
                     deps=dependencies,
-                    capabilities=build_capabilities(workspace, skills),
+                    capabilities=capabilities,
                     conversation_id=f"tribe:{self.mission['id']}:{definition.id}:directory-lock-test",
                 )
             return result.output
@@ -4348,6 +5567,123 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertFalse(worker._should_run(targeted_start))
         self.assertTrue(worker._should_run({**targeted_start, "payload": {"roles": ["builder"]}}))
         self.assertFalse(worker._should_run({**targeted_start, "payload": {"wakeRoles": []}}))
+        self.assertFalse(worker._should_run({"actorId": "runtime", "type": "repo.test_run.completed", "payload": {}}))
+        reviewer = AgentWorker(
+            self.store, self.mission["id"], AgentDefinition("reviewer", "Reviewer", "Quality", "", ""),
+            None, threading.Event(),
+        )
+        self.assertFalse(reviewer._should_run({
+            "actorId": "runtime", "type": "repo.test_run.completed", "payload": {},
+        }))
+
+    def test_direct_messages_are_visible_only_to_sender_and_recipient_agent_context(self) -> None:
+        builder = AgentDefinition("builder", "Builder", "Implementation", "", "")
+        reviewer = AgentDefinition("reviewer", "Reviewer", "Quality", "", "")
+        message = {
+            "type": "agent.message.created", "actorId": "builder",
+            "payload": {"recipient": "reviewer", "text": "Please review the change."},
+        }
+
+        self.assertTrue(_agent_can_read_context_event(message, builder))
+        self.assertTrue(_agent_can_read_context_event(message, reviewer))
+        self.assertFalse(_agent_can_read_context_event(message, AgentDefinition(
+            "planner", "Planner", "Planning", "", "",
+        )))
+        self.assertTrue(_agent_can_read_context_event({
+            **message, "payload": {"text": "Public update."},
+        }, reviewer))
+
+    def test_worker_passes_the_selected_project_team_to_provider_context(self) -> None:
+        builder = AgentDefinition("builder", "Builder", "Implementation", "", "",
+                                  tool_permissions=("claim_work", "complete_work"))
+        reviewer = AgentDefinition("reviewer", "Reviewer", "Quality", "", "",
+                                   tool_permissions=("read_repository_file",))
+        team = _project_team_context([builder, reviewer], {"builder", "reviewer"})
+        worker = AgentWorker(
+            self.store, self.mission["id"], builder, None, threading.Event(), project_team=team,
+        )
+
+        self.assertEqual(worker._provider_event({"type": "message.created"})["projectTeam"], team)
+        self.assertTrue(team[0]["canClaimWork"])
+        self.assertFalse(team[1]["canClaimWork"])
+        self.assertIn("repository_read", team[1]["capabilities"])
+
+    def test_plan_item_rejects_intended_role_outside_selected_team_with_recovery_choices(self) -> None:
+        planner = next(item for item in discover_agents(ROOT / "agents") if item.id == "planner")
+        workspace = WorkspaceTools(self.store, self.mission["id"], planner.id)
+        team = _project_team_context([planner], {planner.id})
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], planner, workspace, SkillCatalog(self.repository),
+            project_team=team,
+        )
+        tool = _build_agent(planner, "openai:test-model")._function_toolset.tools["create_plan_item"]
+
+        result = tool.function(SimpleNamespace(deps=dependencies),
+                               "Run independent tests", "Intended role: Assistant. Run the tests.")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "intended_role_not_in_selected_team_or_cannot_claim_work")
+        self.assertIn("Planner", {item["name"] for item in result["availableRoles"]})
+        self.assertFalse(self.store.work_items(self.mission["id"]))
+
+    def test_work_items_wake_delivery_roles_before_optional_plan_finalization(self) -> None:
+        mission = self.store.create_mission(
+            self.project["id"], "Draft plan", "Build a small app",
+            {"id": "goal-driven-sdlc", "version": 7, "title": "Goal-driven SDLC"},
+        )
+        builder = AgentWorker(
+            self.store, mission["id"], AgentDefinition(
+                "builder", "Builder", "Implementation", "", "",
+                tool_permissions=("claim_work", "list_plan_items"),
+            ),
+            None, threading.Event(),
+        )
+        self.store.complete_discovery(
+            mission["id"], "planner", "Inspected the repository guidance and confirmed the fixture scope.", ["README.md"],
+        )
+        item = self.store.create_work_item(
+            mission["id"], "Implement app", "Intended role: Builder. Implement the requested change.",
+            actor_id="planner",
+        )
+        created = next(
+            event for event in reversed(self.store.events_after(mission["id"], 0))
+            if event["type"] == "plan.item.created"
+        )
+
+        self.assertTrue(builder._should_run(created))
+        self.assertEqual(self.store.work_items(mission["id"])[0]["id"], item["id"])
+
+    def test_claim_and_repository_edits_do_not_require_a_finalized_workflow_plan(self) -> None:
+        mission = self.store.create_mission(
+            self.project["id"], "Draft plan", "Build a small app",
+            {"id": "goal-driven-sdlc", "version": 7, "title": "Goal-driven SDLC"},
+        )
+        self.store.complete_discovery(
+            mission["id"], "planner", "Inspected the repository guidance and confirmed the fixture scope.", ["README.md"],
+        )
+        item = self.store.create_work_item(mission["id"], "Implement app", actor_id="planner")
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build", "builder.md",
+            capabilities=("task_coordination", "repository_write"),
+        )
+        workspace = WorkspaceTools(self.store, mission["id"], definition.id)
+        dependencies = AgentDependencies(
+            self.store, mission["id"], definition, workspace, SkillCatalog(self.repository),
+        )
+        tool = _build_agent(definition, "openai:test-model")._function_toolset.tools["update_state"]
+
+        result = tool.function(SimpleNamespace(deps=dependencies), "task", "claim", item["id"])
+
+        self.assertEqual(result["id"], item["id"])
+
+        write_tool = _build_agent(definition, "openai:test-model")._function_toolset.tools[
+            "write_repository_file"
+        ]
+        write_result = write_tool.function(
+            SimpleNamespace(deps=dependencies), "optional-plan.txt", "Plan checkpoints are optional.",
+        )
+        self.assertEqual(write_result["path"], "optional-plan.txt")
+        self.assertTrue((self.repository / "optional-plan.txt").exists())
 
     def test_interactive_access_is_project_scoped_and_off_by_default(self) -> None:
         self.assertEqual(self.store.project_interactive_access(self.project["id"]), {"enabled": False})
@@ -4409,8 +5745,10 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertIn("finished, task-specific mini-product", authoring_instructions)
         self.assertIn("browser-default buttons or fields", authoring_instructions)
         self.assertIn("available desktop width", authoring_instructions)
-        tool = agent._function_toolset.tools["create_interactive_artifact"]
-        self.assertIn("polished, responsive", tool.description)
+        tool = agent._function_toolset.tools["create_artifact"]
+        self.assertIn(
+            "interactive_app", tool.function_schema.json_schema["properties"]["artifact_type"]["enum"],
+        )
         dependencies = AgentDependencies(
             self.store, self.mission["id"], definition,
             WorkspaceTools(self.store, self.mission["id"], definition.id),
@@ -4420,23 +5758,23 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         html = "<!doctype html><html><head><title>Split</title><style>body{display:grid;gap:1rem}</style></head><body>Split calculator</body></html>"
 
         with self.assertRaisesRegex(PermissionError, "disabled for this project"):
-            tool.function(ctx, "Bill split", html)
+            tool.function(ctx, "interactive_app", "Bill split", html)
         self.store.set_project_interactive_access(self.project["id"], True)
         skill = dependencies.skills.find_builtin("interactive-app-authoring")
         self.assertIsNotNone(skill)
         with self.assertRaisesRegex(PermissionError, "Load Tribe's interactive-app-authoring skill"):
-            tool.function(ctx, "Bill split", html)
+            tool.function(ctx, "interactive_app", "Bill split", html)
         loaded = agent._function_toolset.tools["load_skill"].function(ctx, skill.id)
         self.assertIn("Visual standard", loaded)
         self.assertIn(skill.id, dependencies.loaded_skill_ids)
         with self.assertRaisesRegex(ValueError, "complete self-contained HTML"):
-            tool.function(ctx, "Bill split", "<p>fragment</p>")
+            tool.function(ctx, "interactive_app", "Bill split", "<p>fragment</p>")
         with self.assertRaisesRegex(ValueError, "smaller than 500 KB"):
-            tool.function(ctx, "Bill split", "<!doctype html>" + ("x" * 500_000))
+            tool.function(ctx, "interactive_app", "Bill split", "<!doctype html>" + ("x" * 500_000))
         with self.assertRaisesRegex(ValueError, "non-empty self-contained style block"):
-            tool.function(ctx, "Bill split", "<!doctype html><html><body>unstyled</body></html>")
+            tool.function(ctx, "interactive_app", "Bill split", "<!doctype html><html><body>unstyled</body></html>")
 
-        created = tool.function(ctx, "Bill split", html)
+        created = tool.function(ctx, "interactive_app", "Bill split", html)
         self.assertEqual(created["title"], "Bill split.html")
         self.assertEqual(dependencies.interactive_artifact_ids, [created["artifactId"]])
         artifact, content = self.store.artifact_content(created["artifactId"], self.mission["id"])
@@ -4469,11 +5807,11 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.store.set_project_interactive_access(self.project["id"], True)
 
         agent = _build_agent(definition, "openai:test-model")
-        tool_names = ("search_available_skills", "load_skill", "create_interactive_artifact")
+        tool_names = ("search_available_skills", "load_skill", "create_artifact")
         for name in tool_names:
             agent._function_toolset.tools[name].defer_loading = False
         agent._function_toolset.tools["load_skill"].sequential = True
-        agent._function_toolset.tools["create_interactive_artifact"].sequential = True
+        agent._function_toolset.tools["create_artifact"].sequential = True
         dependencies = AgentDependencies(
             self.store, self.mission["id"], definition,
             WorkspaceTools(self.store, self.mission["id"], definition.id), skills,
@@ -4486,8 +5824,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                     return {"query": "interactive-app-authoring"}
                 if tool_def.name == "load_skill":
                     return {"skill_id": skill.id}
-                if tool_def.name == "create_interactive_artifact":
-                    return {"title": "The Split Check", "html": example}
+                if tool_def.name == "create_artifact":
+                    return {"artifact_type": "interactive_app", "title": "The Split Check", "content": example}
                 return super().gen_tool_args(tool_def)
 
         async def run() -> str:
@@ -4623,6 +5961,83 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             "payload": {"hasInitialMessage": True},
         }))
 
+    def test_plan_events_only_wake_profiles_with_plan_or_work_capabilities(self) -> None:
+        events = [
+            {"actorId": "builder", "type": "plan.item.created", "payload": {"workItem": {}}},
+            {"actorId": "reviewer", "type": "plan.finalized", "payload": {}},
+            {"actorId": "builder", "type": "plan.item.completed", "payload": {"workItem": {}}},
+        ]
+        messaging_only = AgentWorker(
+            self.store, self.mission["id"], AgentDefinition(
+                "assistant", "Assistant", "Assistant", "", "",
+                tool_permissions=("post_update", "message_agent", "reply_to_agent"),
+            ), None, threading.Event(),
+        )
+        planner = AgentWorker(
+            self.store, self.mission["id"], AgentDefinition(
+                "planner", "Planner", "Planning", "", "",
+                tool_permissions=("list_plan_items", "claim_work", "finalize_plan"),
+            ), None, threading.Event(),
+        )
+
+        self.assertEqual([messaging_only._should_run(event) for event in events], [False, False, False])
+        self.assertEqual([planner._should_run(event) for event in events], [True, False, False])
+
+    def test_planned_work_wakes_only_the_intended_role(self) -> None:
+        builder = AgentWorker(
+            self.store, self.mission["id"], AgentDefinition(
+                "builder", "Builder", "Implementation", "", "",
+                tool_permissions=("claim_work", "list_plan_items"),
+            ), None, threading.Event(),
+        )
+        reviewer = AgentWorker(
+            self.store, self.mission["id"], AgentDefinition(
+                "reviewer", "Reviewer", "Quality", "", "",
+                tool_permissions=("claim_work", "list_plan_items"),
+            ), None, threading.Event(),
+        )
+        event = {
+            "actorId": "planner", "type": "plan.item.created",
+            "payload": {"workItem": {"status": "ready", "owner": None,
+                "detail": "Intended role: Builder. Implement the requested change."}},
+        }
+
+        self.assertTrue(builder._should_run(event))
+        self.assertFalse(reviewer._should_run(event))
+
+        self.store.create_work_item(
+            self.mission["id"], "Add the tracker tests", "Intended role: Builder. Add tests.",
+            actor_id="planner",
+        )
+        completed_by_builder = {
+            "actorId": "builder", "type": "plan.item.completed", "payload": {},
+        }
+        self.assertTrue(builder._should_run(completed_by_builder))
+        self.assertFalse(reviewer._should_run(completed_by_builder))
+
+    def test_completion_capable_role_wakes_after_last_work_item_finishes(self) -> None:
+        builder = AgentDefinition("builder", "Builder", "Implementation", "", "",
+                                  tool_permissions=("claim_work", "complete_work"))
+        planner = AgentDefinition("planner", "Planner", "Planning", "", "",
+                                  tool_permissions=("claim_work", "complete_work", "complete_mission"))
+        planner_worker = AgentWorker(
+            self.store, self.mission["id"], planner, None, threading.Event(),
+        )
+        item = self.store.create_work_item(
+            self.mission["id"], "Implement export", "Intended role: Builder.", actor_id="planner",
+        )
+        claimed = self.store.claim_work(self.mission["id"], builder.id, work_item_id=item["id"])
+        self.assertIsNotNone(claimed)
+        self.store.complete_work(item["id"], builder.id, "Export implemented and verified")
+        completed_event = {"actorId": builder.id, "type": "plan.item.completed", "payload": {}}
+
+        self.assertFalse(planner_worker._has_ready_work())
+        self.assertTrue(planner_worker._all_work_items_complete())
+        self.assertTrue(planner_worker._should_run(completed_event))
+
+        self_actor_event = {"actorId": planner.id, "type": "plan.item.completed", "payload": {}}
+        self.assertTrue(planner_worker._should_run(self_actor_event))
+
     def test_initial_question_runs_planner_once_and_does_not_wake_every_role(self) -> None:
         mission = self.store.create_mission(
             self.project["id"], "Explain this project", "Explain this project",
@@ -4674,8 +6089,10 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             supervisor.close()
 
     def test_resuming_unplanned_auto_chat_wakes_only_the_planner(self) -> None:
-        mission = self.store.create_mission(self.project["id"], "Explain this project", "Explain this project")
-        self.store.append("message.created", "user", mission["id"], {"text": "Explain this project"})
+        mission = self.store.create_mission(
+            self.project["id"], "Explain this project", "Explain this project",
+            initial_message="Explain this project",
+        )
         calls: list[str] = []
 
         class Provider:
@@ -4709,7 +6126,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                 item for item in self.store.events_after(mission["id"], 0)
                 if item["type"] == "agent.runtime.started"
             )
-            self.assertEqual(started["payload"]["wakeRoles"], ["planner"])
+            self.assertEqual(started["payload"]["wakeRoles"], [])
         finally:
             supervisor.close()
 
@@ -4719,7 +6136,10 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             None, threading.Event(),
         )
         reviewer = AgentWorker(
-            self.store, self.mission["id"], AgentDefinition("reviewer", "Reviewer", "Review", "", ""),
+            self.store, self.mission["id"], AgentDefinition(
+                "reviewer", "Reviewer", "Review", "", "",
+                tool_permissions=("claim_work", "list_plan_items"),
+            ),
             None, threading.Event(),
         )
         comment_event = {"actorId": "user", "type": "artifact.review.comment.created", "payload": {}}
@@ -4734,18 +6154,29 @@ with workspace._path_lock(Path(repository) / 'README.md'):
 
     def test_reviewer_wakes_on_work_milestones_not_each_repository_event(self) -> None:
         reviewer = AgentWorker(
-            self.store, self.mission["id"], AgentDefinition("reviewer", "Reviewer", "Review", "", ""),
+            self.store, self.mission["id"], AgentDefinition(
+                "reviewer", "Reviewer", "Review", "", "",
+                tool_permissions=("claim_work", "list_plan_items"),
+            ),
             None, threading.Event(),
         )
         for kind, payload in (
             ("repo.file.changed", {"path": "src/a.py"}),
-            ("repo.test_run.completed", {"exitCode": 0}),
             ("artifact.created", {"artifact": {"name": "a.diff"}}),
         ):
             with self.subTest(kind=kind):
                 self.assertFalse(reviewer._should_run({
                     "actorId": "builder", "type": kind, "payload": payload,
                 }))
+        test_event = {
+            "actorId": "builder", "type": "repo.test_run.completed", "payload": {"exitCode": 0},
+        }
+        self.assertFalse(reviewer._should_run(test_event))
+        self.store.create_work_item(
+            self.mission["id"], "Review implementation", "Intended role: Reviewer. Review the requested change.",
+            actor_id="planner",
+        )
+        self.assertTrue(reviewer._should_run(test_event))
         self.assertTrue(reviewer._should_run({
             "actorId": "builder", "type": "plan.item.completed", "payload": {
                 "workItem": {"id": "work-1"},
@@ -4775,18 +6206,16 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertTrue(builder._should_run(builder_comment))
         self.assertFalse(reviewer._should_run(builder_comment))
 
-    def test_direct_agent_reply_chains_have_one_message_per_run_and_three_hops(self) -> None:
-        first = _next_agent_reply_metadata(None, 0, False)
+    def test_direct_agent_reply_chains_allow_multiple_messages_and_stop_after_three_hops(self) -> None:
+        first = _next_agent_reply_metadata(None, 0)
         self.assertEqual(first["replyDepth"], 1)
         self.assertTrue(first["replyChainId"])
 
-        second = _next_agent_reply_metadata(first["replyChainId"], first["replyDepth"], False)
-        third = _next_agent_reply_metadata(second["replyChainId"], second["replyDepth"], False)
+        second = _next_agent_reply_metadata(first["replyChainId"], first["replyDepth"])
+        third = _next_agent_reply_metadata(second["replyChainId"], second["replyDepth"])
         self.assertEqual(third, {"replyChainId": first["replyChainId"], "replyDepth": 3})
         with self.assertRaisesRegex(ValueError, "three-hop limit"):
-            _next_agent_reply_metadata(third["replyChainId"], third["replyDepth"], False)
-        with self.assertRaisesRegex(ValueError, "one direct agent message per run"):
-            _next_agent_reply_metadata(None, 0, True)
+            _next_agent_reply_metadata(third["replyChainId"], third["replyDepth"])
 
     def test_registering_user_role_starts_its_active_mission_worker(self) -> None:
         invoked = threading.Event()
@@ -4805,6 +6234,10 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         definition = AgentDefinition(
             "security_auditor", "Security auditor", "Review security", "Inspect trust boundaries.", "user"
         )
+        trigger = self.store.append("message.created", "user", self.mission["id"], {
+            "text": "Review the repository security", "recipient": definition.id,
+        })
+        self.store.save_agent_offset(definition.id, self.mission["id"], trigger["sequence"] - 1)
         try:
             supervisor.register_agent(definition)
             self.assertTrue(invoked.wait(3))
@@ -4817,6 +6250,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.store.add_artifact(self.mission["id"], "overview.md", "text/markdown", "planner", b"plan")
         self.store.add_artifact(other_mission["id"], "review.json", "application/json", "reviewer", b"review")
         self.store.add_artifact(other_mission["id"], "notes.txt", "text/plain", "user", b"notes")
+        self.store.add_artifact(other_mission["id"], "test-results-abc.txt", "text/plain", "builder", b"output")
+        self.store.add_artifact(other_mission["id"], "notes.txt.diff", "text/x-diff", "builder", b"diff")
 
         first = self.store.project_artifacts(self.project["id"], limit=1)
         self.assertEqual(first["total"], 3)
@@ -5364,7 +6799,516 @@ class ScheduleCase(RuntimeCase):
         self.assertEqual(len(interrupted_tool_calls), 1)
         self.assertEqual(interrupted_tool_calls[0]["payload"]["toolCallId"], "call-interrupted")
         self.assertEqual(interrupted_tool_calls[0]["payload"]["outcome"], "unknown")
+        run_interruption = next(item for item in activity if item["type"] == "agent.run.interrupted")
+        self.assertEqual(run_interruption["payload"]["failureKind"], "unknown_side_effect")
         self.assertEqual(self.store.recover_interrupted_agent_runs(), 0)
+
+    def test_recovery_detects_unsettled_tribe_tool_calls_for_the_trigger(self) -> None:
+        event = self.store.append("message.created", "user", self.mission["id"], {"text": "Run tool"})
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        self.store.append("agent.tool.started", "builder", self.mission["id"], {
+            "toolName": "write_file", "toolCallId": "write-call",
+            "triggerSequence": event["sequence"],
+        })
+
+        self.assertTrue(self.store.agent_run_has_unresolved_tool_calls(
+            "builder", self.mission["id"], event["sequence"],
+            self.store.agent_event_run("builder", self.mission["id"], event["sequence"])["created_at"],
+        ))
+        self.assertTrue(self.store.agent_run_has_tool_activity(
+            "builder", self.mission["id"], event["sequence"],
+            self.store.agent_event_run("builder", self.mission["id"], event["sequence"])["created_at"],
+        ))
+
+        self.store.append("agent.tool.completed", "builder", self.mission["id"], {
+            "toolName": "write_file", "toolCallId": "write-call",
+            "triggerSequence": event["sequence"],
+        })
+        self.assertFalse(self.store.agent_run_has_unresolved_tool_calls(
+            "builder", self.mission["id"], event["sequence"],
+            self.store.agent_event_run("builder", self.mission["id"], event["sequence"])["created_at"],
+        ))
+
+    def test_recovery_reconciles_repository_writes_only_when_disk_matches_intent(self) -> None:
+        event = self.store.append("message.created", "user", self.mission["id"], {"text": "Write files"})
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        started_at = self.store.agent_event_run(
+            "builder", self.mission["id"], event["sequence"],
+        )["created_at"]
+        self.store.append("agent.tool.started", "builder", self.mission["id"], {
+            "toolName": "write_file", "toolCallId": "write-complete",
+            "triggerSequence": event["sequence"], "summary": "src/done.py",
+        })
+        self.store.append("repo.file.write.started", "builder", self.mission["id"], {
+            "toolCallId": "write-complete", "triggerSequence": event["sequence"],
+            "path": "src/done.py",
+        })
+        self.store.append("repo.file.changed", "builder", self.mission["id"], {
+            "toolCallId": "write-complete", "triggerSequence": event["sequence"],
+            "path": "src/done.py", "sha256": "a" * 64,
+        })
+        recovered_path = self.repository / "src" / "recovered.py"
+        recovered_path.parent.mkdir(parents=True, exist_ok=True)
+        recovered_content = "completed before process restart\n"
+        recovered_path.write_text(recovered_content, encoding="utf-8")
+        expected_hash = hashlib.sha256(recovered_content.encode("utf-8")).hexdigest()
+        self.store.append("agent.tool.started", "builder", self.mission["id"], {
+            "toolName": "write_file", "toolCallId": "write-after-crash",
+            "triggerSequence": event["sequence"], "summary": "src/recovered.py",
+        })
+        self.store.append("repo.file.write.started", "builder", self.mission["id"], {
+            "toolCallId": "write-after-crash", "triggerSequence": event["sequence"],
+            "path": "src/recovered.py", "sha256": expected_hash, "change": "created",
+        })
+        self.assertEqual(self.store.reconcile_completed_repository_writes(
+            "builder", self.mission["id"], event["sequence"], started_at,
+        ), 2)
+        activity = self.store.events_after(self.mission["id"], event["sequence"])
+        reconciled = next(
+            item for item in activity if item["type"] == "agent.tool.completed"
+            and item["payload"].get("toolCallId") == "write-after-crash"
+        )
+        self.assertEqual(reconciled["payload"]["outcome"], "reconciled")
+        recovered_change = next(
+            item for item in activity if item["type"] == "repo.file.changed"
+            and item["payload"].get("toolCallId") == "write-after-crash"
+        )
+        self.assertEqual(recovered_change["payload"]["sha256"], expected_hash)
+        self.assertFalse(self.store.agent_run_has_unresolved_tool_calls(
+            "builder", self.mission["id"], event["sequence"], started_at,
+        ))
+        self.assertFalse(self.store.has_unexpected_agent_effect_after(
+            self.mission["id"], event["sequence"], "builder",
+        ))
+        unknown_path = self.repository / "src" / "unknown.py"
+        unknown_path.parent.mkdir(parents=True, exist_ok=True)
+        unknown_path.write_text("contents changed after the agent intent\n", encoding="utf-8")
+        self.store.append("agent.tool.started", "builder", self.mission["id"], {
+            "toolName": "write_file", "toolCallId": "write-unknown",
+            "triggerSequence": event["sequence"], "summary": "src/unknown.py",
+        })
+        self.store.append("repo.file.write.started", "builder", self.mission["id"], {
+            "toolCallId": "write-unknown", "triggerSequence": event["sequence"],
+            "path": "src/unknown.py", "sha256": hashlib.sha256(
+                b"different intended content\n",
+            ).hexdigest(),
+        })
+        self.assertEqual(self.store.reconcile_completed_repository_writes(
+            "builder", self.mission["id"], event["sequence"], started_at,
+        ), 0)
+        self.assertTrue(self.store.agent_run_has_unresolved_tool_calls(
+            "builder", self.mission["id"], event["sequence"], started_at,
+        ))
+        self.assertTrue(self.store.has_unexpected_agent_effect_after(
+            self.mission["id"], event["sequence"], "builder",
+        ))
+
+    def test_completed_read_only_mcp_call_is_retry_safe_but_write_call_is_not(self) -> None:
+        event = self.store.append("message.created", "user", self.mission["id"], {"text": "Look up a record"})
+        cursor = event["sequence"]
+        self.store.append("agent.tool.started", "builder", self.mission["id"], {
+            "toolName": "docs_search", "toolCallId": "mcp-read-call",
+            "triggerSequence": cursor, "mcpReadOnly": True,
+        })
+        self.store.append("agent.tool.completed", "builder", self.mission["id"], {
+            "toolName": "docs_search", "toolCallId": "mcp-read-call",
+            "triggerSequence": cursor, "mcpReadOnly": True, "outcome": "success",
+        })
+        self.assertFalse(self.store.has_unexpected_agent_effect_after(
+            self.mission["id"], cursor, "builder",
+        ))
+        self.store.append("agent.tool.started", "builder", self.mission["id"], {
+            "toolName": "docs_update", "toolCallId": "mcp-write-call",
+            "triggerSequence": cursor, "mcpReadOnly": False,
+        })
+        self.store.append("agent.tool.completed", "builder", self.mission["id"], {
+            "toolName": "docs_update", "toolCallId": "mcp-write-call",
+            "triggerSequence": cursor, "mcpReadOnly": False, "outcome": "success",
+        })
+        self.assertTrue(self.store.has_unexpected_agent_effect_after(
+            self.mission["id"], cursor, "builder",
+        ))
+
+    def test_completed_post_update_is_retry_safe_when_tool_call_is_settled(self) -> None:
+        event = self.store.append("message.created", "user", self.mission["id"], {"text": "Continue planning"})
+        cursor = event["sequence"]
+        call_id = "post-update-call"
+        self.store.append("agent.tool.started", "planner", self.mission["id"], {
+            "toolName": "post_update", "toolCallId": call_id,
+            "triggerSequence": cursor,
+        })
+        self.store.append_agent_update(
+            self.mission["id"], "planner", "Discovery is complete; I am preparing the plan.",
+            metadata={"triggerSequence": cursor, "toolCallId": call_id},
+        )
+        self.assertTrue(self.store.has_unexpected_agent_effect_after(
+            self.mission["id"], cursor, "planner",
+        ))
+        self.store.append("agent.tool.completed", "planner", self.mission["id"], {
+            "toolName": "post_update", "toolCallId": call_id,
+            "triggerSequence": cursor, "outcome": "success",
+        })
+        self.assertFalse(self.store.has_unexpected_agent_effect_after(
+            self.mission["id"], cursor, "planner",
+        ))
+
+    def test_agent_tool_events_persist_the_configured_read_only_mcp_classification(self) -> None:
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition("builder", "Builder", "Implementation", "Build", "builder.md")
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition,
+            WorkspaceTools(self.store, self.mission["id"], definition.id),
+            SkillCatalog(self.repository), trigger_sequence=self.store.latest_sequence(self.mission["id"]),
+            mcp_read_only_tool_names={"docs_search"},
+        )
+        agent = _build_agent(definition, "openai:test-model")
+
+        @agent.tool(name="docs_search")
+        def docs_search(ctx) -> str:
+            del ctx
+            return "found"
+
+        async def run() -> str:
+            with agent.override(model=TestModel(call_tools=["docs_search"], custom_output_text="Done")):
+                result = await agent.run(
+                    "Search the documentation.", deps=dependencies,
+                    conversation_id=f"tribe:{self.mission['id']}:builder:mcp-classification",
+                )
+            return result.output
+
+        self.assertEqual(asyncio.run(run()), "Done")
+        events = [
+            item for item in self.store.events_after(self.mission["id"], 0)
+            if item["type"] in {"agent.tool.started", "agent.tool.completed"}
+            and item["payload"].get("toolName") == "docs_search"
+        ]
+        self.assertEqual(len(events), 2)
+        self.assertTrue(all(item["payload"]["mcpReadOnly"] for item in events))
+
+    def test_supervisor_recovers_abandoned_run_from_complete_harness_checkpoint(self) -> None:
+        event = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Continue work after a runtime restart", "recipient": "builder"},
+        )
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        step_database = self.store.data_dir / "agent_steps.sqlite3"
+        repository_file = self.repository / "src" / "crash-reconciled.py"
+        tool_call_id = "write-before-restart"
+        file_content = "durable before the completion event\n"
+        source = f'''\
+import asyncio
+import hashlib
+import os
+from pathlib import Path
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
+from pydantic_ai_harness.step_persistence import SqliteStepStore, StepPersistence
+from tribe_runtime.store import MissionStore
+
+async def main():
+    conversation_id = {f"tribe:{self.mission['id']}:builder"!r}
+    step_store = SqliteStepStore(database={str(step_database)!r})
+    agent = Agent("openai:test-model")
+    with agent.override(model=TestModel(call_tools=[], custom_output_text="checkpoint saved")):
+        await agent.run(
+            "Inspect the repository before continuing.",
+            capabilities=[StepPersistence(
+                store=step_store, agent_name=conversation_id,
+                metadata={{"trigger_sequence": {str(event["sequence"])!r}}},
+                capture_frontier=True,
+            )],
+            conversation_id=conversation_id,
+        )
+
+asyncio.run(main())
+store = MissionStore(Path({str(self.store.path)!r}))
+store.append("agent.tool.started", "builder", {self.mission["id"]!r}, {{
+    "toolName": "write_file", "toolCallId": {tool_call_id!r},
+    "triggerSequence": {event["sequence"]}, "summary": "src/crash-reconciled.py",
+}})
+content = {file_content!r}
+store.append("repo.file.write.started", "builder", {self.mission["id"]!r}, {{
+    "toolCallId": {tool_call_id!r}, "triggerSequence": {event["sequence"]},
+    "path": "src/crash-reconciled.py", "change": "created",
+    "sha256": hashlib.sha256(content.encode()).hexdigest(),
+}})
+target = Path({str(repository_file)!r})
+target.parent.mkdir(parents=True, exist_ok=True)
+with target.open("w", encoding="utf-8") as handle:
+    handle.write(content)
+    handle.flush()
+    os.fsync(handle.fileno())
+os._exit(23)
+'''
+        crashed_process = subprocess.run(
+            [sys.executable, "-c", source], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(crashed_process.returncode, 23, crashed_process.stderr)
+
+        restarted_store = MissionStore(self.store.path)
+        supervisor = AgentSupervisor(restarted_store, [])
+        recovered = supervisor.recover_interrupted_agent_runs()
+        run = restarted_store.agent_event_run("builder", self.mission["id"], event["sequence"])
+        reclaimed = restarted_store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(run["status"], "retrying")
+        self.assertTrue(reclaimed["claimed"])
+        self.assertTrue(reclaimed["resume_checkpoint"])
+        self.assertEqual(reclaimed["attempts"], 2)
+        activity = restarted_store.events_after(self.mission["id"], event["sequence"])
+        recovered_tool = next(
+            item for item in activity if item["type"] == "agent.tool.completed"
+            and item["payload"].get("toolCallId") == tool_call_id
+        )
+        recovered_file = next(
+            item for item in activity if item["type"] == "repo.file.changed"
+            and item["payload"].get("toolCallId") == tool_call_id
+        )
+        self.assertEqual(recovered_tool["payload"]["outcome"], "reconciled")
+        self.assertEqual(
+            recovered_file["payload"]["sha256"], hashlib.sha256(file_content.encode()).hexdigest(),
+        )
+        self.assertFalse(restarted_store.agent_run_has_unresolved_tool_calls(
+            "builder", self.mission["id"], event["sequence"], run["created_at"],
+        ))
+
+    def test_startup_recovery_starts_worker_on_saved_trigger_automatically(self) -> None:
+        event = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Continue from the saved progress", "recipient": "builder"},
+        )
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        self.store.save_agent_offset("builder", self.mission["id"], event["sequence"] - 1)
+        step_database = self.store.data_dir / "agent_steps.sqlite3"
+        source = f'''\
+import asyncio
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
+from pydantic_ai_harness.step_persistence import SqliteStepStore, StepPersistence
+
+async def save_checkpoint():
+    conversation_id = {f"tribe:{self.mission['id']}:builder"!r}
+    step_store = SqliteStepStore(database={str(step_database)!r})
+    agent = Agent("openai:test-model")
+    with agent.override(model=TestModel(call_tools=[], custom_output_text="saved frontier")):
+        await agent.run(
+            "Continue from the current repository state.",
+            capabilities=[StepPersistence(
+                store=step_store, agent_name=conversation_id,
+                metadata={{"trigger_sequence": {str(event["sequence"])!r}}},
+                capture_frontier=True,
+            )],
+            conversation_id=conversation_id,
+        )
+
+asyncio.run(save_checkpoint())
+'''
+        crashed_process = subprocess.run(
+            [sys.executable, "-c", source], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(crashed_process.returncode, 0, crashed_process.stderr)
+
+        restarted_store = MissionStore(self.store.path)
+        provider_events: list[dict[str, Any]] = []
+
+        class CheckpointProvider(PydanticAIProvider):
+            def __init__(self, definition, model):
+                self.definition = definition
+                self.model = model
+
+            async def run(self, store, mission_id, event, cancellation_token=None):
+                del store, mission_id, cancellation_token
+                provider_events.append(event)
+                return "Resumed the saved run automatically."
+
+        class EnabledSupervisor(AgentSupervisor):
+            @property
+            def enabled(self) -> bool:
+                return True
+
+        supervisor = EnabledSupervisor(
+            restarted_store,
+            [AgentDefinition("builder", "Builder", "Implementation", "Build", "builder.md")],
+            provider_factory=lambda definition, model: CheckpointProvider(definition, model),
+        )
+        try:
+            self.assertEqual(supervisor.recover_interrupted_agent_runs(), 1)
+            supervisor.start_mission(self.mission["id"])
+            deadline = time.monotonic() + 8
+            run = None
+            while time.monotonic() < deadline:
+                run = restarted_store.agent_event_run("builder", self.mission["id"], event["sequence"])
+                if run and run["status"] == "completed":
+                    break
+                time.sleep(0.02)
+            self.assertIsNotNone(run)
+            self.assertEqual(
+                run["status"], "completed",
+                f"provider_events={provider_events!r}; mission_events={restarted_store.events_after(self.mission['id'], event['sequence'])!r}; supervisor={supervisor.status!r}",
+            )
+            self.assertEqual(run["output_text"], "Resumed the saved run automatically.")
+            self.assertEqual(len(provider_events), 1)
+            self.assertTrue(provider_events[0].get("resumeCheckpoint"))
+            self.assertEqual(restarted_store.recover_interrupted_agent_runs(), 0)
+        finally:
+            supervisor.close()
+
+    def test_supervisor_replays_abandoned_turn_from_trigger_when_no_tool_started(self) -> None:
+        event = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Recover this request after restart", "recipient": "builder"},
+        )
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        self.store.reserve_agent_usage(
+            "builder", self.mission["id"], event["sequence"], attempt=10, default_limit=10_000,
+        )
+        restarted_store = MissionStore(self.store.path)
+        provider_events: list[dict[str, Any]] = []
+
+        class ReplayProvider:
+            async def run(self, store, mission_id, provider_event, cancellation_token=None):
+                del store, mission_id, cancellation_token
+                provider_events.append(provider_event)
+                return "Recovered from the original request."
+
+        class EnabledSupervisor(AgentSupervisor):
+            @property
+            def enabled(self) -> bool:
+                return True
+
+        provider = ReplayProvider()
+        supervisor = EnabledSupervisor(
+            restarted_store,
+            [AgentDefinition("builder", "Builder", "Implementation", "Build", "builder.md")],
+            provider_factory=lambda definition, model: provider,
+        )
+        try:
+            self.assertEqual(supervisor.recover_interrupted_agent_runs(), 1)
+            run = restarted_store.agent_event_run("builder", self.mission["id"], event["sequence"])
+            self.assertEqual(run["status"], "retrying")
+            self.assertEqual(run["retry_from_trigger"], 1)
+            self.assertEqual(restarted_store.agent_offset("builder", self.mission["id"]), 0)
+            with restarted_store._connect() as db:
+                reservation = db.execute(
+                    "SELECT status FROM usage_reservations WHERE agent_id='builder' AND mission_id=? "
+                    "AND trigger_sequence=? AND attempt=10",
+                    (self.mission["id"], event["sequence"]),
+                ).fetchone()
+            self.assertEqual(reservation["status"], "unknown")
+            self.assertTrue(any(item["type"] == "agent.run.retrying" and
+                                item["payload"].get("replayedFromTrigger") is True
+                                for item in restarted_store.events_after(self.mission["id"], event["sequence"])))
+
+            supervisor.start_mission(self.mission["id"])
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                run = restarted_store.agent_event_run("builder", self.mission["id"], event["sequence"])
+                if run and run["status"] == "completed":
+                    break
+                time.sleep(0.02)
+
+            self.assertEqual(run["status"], "completed")
+            self.assertEqual(run["output_text"], "Recovered from the original request.")
+            self.assertEqual(len(provider_events), 1)
+            self.assertNotIn("resumeCheckpoint", provider_events[0])
+            self.assertEqual(run["attempts"], 2)
+            self.assertEqual(restarted_store.recover_interrupted_agent_runs(), 0)
+        finally:
+            supervisor.close()
+
+    def test_process_death_during_partial_repository_write_is_quarantined(self) -> None:
+        event = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Write a repository file", "recipient": "builder"},
+        )
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        step_database = self.store.data_dir / "agent_steps.sqlite3"
+        repository_file = self.repository / "src" / "partial-write.py"
+        expected_content = "the complete intended file\n"
+        partial_content = "the incomplete"
+        tool_call_id = "partial-write-before-restart"
+        source = f'''\
+import asyncio
+import hashlib
+import os
+from pathlib import Path
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
+from pydantic_ai_harness.step_persistence import SqliteStepStore, StepPersistence
+from tribe_runtime.store import MissionStore
+
+async def save_checkpoint():
+    conversation_id = {f"tribe:{self.mission['id']}:builder"!r}
+    step_store = SqliteStepStore(database={str(step_database)!r})
+    agent = Agent("openai:test-model")
+    with agent.override(model=TestModel(call_tools=[], custom_output_text="checkpoint saved")):
+        await agent.run(
+            "Inspect and edit the target source file.",
+            capabilities=[StepPersistence(
+                store=step_store, agent_name=conversation_id,
+                metadata={{"trigger_sequence": {str(event["sequence"])!r}}},
+                capture_frontier=True,
+            )],
+            conversation_id=conversation_id,
+        )
+
+asyncio.run(save_checkpoint())
+store = MissionStore(Path({str(self.store.path)!r}))
+mission_id = {self.mission["id"]!r}
+tool_call_id = {tool_call_id!r}
+store.append("agent.tool.started", "builder", mission_id, {{
+    "toolName": "write_file", "toolCallId": tool_call_id,
+    "triggerSequence": {event["sequence"]}, "summary": "src/partial-write.py",
+}})
+store.append("repo.file.write.started", "builder", mission_id, {{
+    "toolCallId": tool_call_id, "triggerSequence": {event["sequence"]},
+    "path": "src/partial-write.py", "change": "created",
+    "sha256": hashlib.sha256({expected_content!r}.encode()).hexdigest(),
+}})
+target = Path({str(repository_file)!r})
+target.parent.mkdir(parents=True, exist_ok=True)
+with target.open("w", encoding="utf-8") as handle:
+    handle.write({partial_content!r})
+    handle.flush()
+    os.fsync(handle.fileno())
+os._exit(27)
+'''
+        crashed_process = subprocess.run(
+            [sys.executable, "-c", source], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(crashed_process.returncode, 27, crashed_process.stderr)
+
+        restarted_store = MissionStore(self.store.path)
+        supervisor = AgentSupervisor(restarted_store, [])
+        recovered = supervisor.recover_interrupted_agent_runs()
+        run = restarted_store.agent_event_run("builder", self.mission["id"], event["sequence"])
+        activity = restarted_store.events_after(self.mission["id"], event["sequence"])
+        interrupted_tool = next(
+            item for item in activity if item["type"] == "agent.tool.interrupted"
+            and item["payload"].get("toolCallId") == tool_call_id
+        )
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(run["status"], "interrupted")
+        self.assertEqual(restarted_store.agent_offset("builder", self.mission["id"]), event["sequence"])
+        self.assertEqual(repository_file.read_text(encoding="utf-8"), partial_content)
+        self.assertEqual(interrupted_tool["payload"]["outcome"], "unknown")
+        self.assertFalse(any(
+            item["type"] == "agent.tool.completed"
+            and item["payload"].get("toolCallId") == tool_call_id
+            for item in activity
+        ))
+        self.assertFalse(any(
+            item["type"] == "repo.file.changed"
+            and item["payload"].get("toolCallId") == tool_call_id
+            for item in activity
+        ))
+        self.assertEqual(supervisor.recover_interrupted_agent_runs(), 0)
 
     def test_startup_preserves_deferred_approval_frontier_for_safe_resume(self) -> None:
         event = self.store.append("message.created", "user", self.mission["id"], {"text": "Check this"})
@@ -5393,8 +7337,117 @@ class ScheduleCase(RuntimeCase):
             self.store.agent_event_run("builder", self.mission["id"], event["sequence"])["status"],
             "running",
         )
-        self.store.update_deferred_tool_approval(interaction["id"], "consumed")
+        self.assertEqual(self.store.agent_offset("builder", self.mission["id"]), event["sequence"])
+        self.store.resolve_interaction(interaction["id"], "approved_once")
+        self.assertEqual(
+            self.store.resume_resolved_deferred_tool_approval(interaction["id"]), event["sequence"],
+        )
+        self.assertEqual(
+            self.store.agent_event_run("builder", self.mission["id"], event["sequence"])["status"],
+            "retrying",
+        )
+        self.assertEqual(
+            self.store.agent_offset("builder", self.mission["id"]), event["sequence"] - 1,
+        )
+
+    def test_startup_quarantines_approval_consumed_before_tool_result(self) -> None:
+        event = self.store.append("message.created", "user", self.mission["id"], {"text": "Run command"})
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        source = f'''\
+import os
+from pathlib import Path
+from tribe_runtime.store import MissionStore
+
+store = MissionStore(Path({str(self.store.path)!r}))
+mission_id = {self.mission["id"]!r}
+trigger_sequence = {event["sequence"]}
+store.append("agent.tool.started", "builder", mission_id, {{
+    "toolName": "run_command", "toolCallId": "tool-call",
+    "triggerSequence": trigger_sequence, "summary": "pytest tests",
+}})
+interaction = store.create_deferred_tool_interaction(
+    mission_id=mission_id, requested_by="builder", title="Run command",
+    details="Run the approved command", target="pytest tests", trigger_sequence=trigger_sequence,
+    run_id="provider-run", conversation_id=f"tribe:{{mission_id}}:builder",
+    tool_call_id="tool-call", tool_name="run_command", tool_arguments={{"command": "pytest tests"}},
+    message_history="[]",
+)
+store.resolve_interaction(interaction["id"], "approved_once")
+assert store.consume_deferred_tool_approval(interaction["id"], "pytest tests")
+os._exit(24)
+'''
+        crashed_process = subprocess.run(
+            [sys.executable, "-c", source], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(crashed_process.returncode, 24, crashed_process.stderr)
+
+        restarted_store = MissionStore(self.store.path)
+        self.assertEqual(restarted_store.recover_interrupted_agent_runs(), 1)
+        run = restarted_store.agent_event_run("builder", self.mission["id"], event["sequence"])
+        deferred = restarted_store.deferred_tool_approvals(self.mission["id"], "builder")[0]
+        activity = restarted_store.events_after(self.mission["id"], event["sequence"])
+        interrupted = [item for item in activity if item["type"] == "agent.tool.interrupted"]
+
+        self.assertEqual(run["status"], "interrupted")
+        self.assertEqual(deferred["status"], "unknown_after_crash")
+        self.assertEqual(len(interrupted), 1)
+        self.assertEqual(interrupted[0]["payload"]["outcome"], "unknown")
+        self.assertEqual(restarted_store.recover_interrupted_agent_runs(), 0)
+
+    def test_worker_replays_original_trigger_after_approval_resolves_during_restart(self) -> None:
+        from tribe_runtime.agent_runtime import AgentWorker
+
+        trigger = self.store.append("message.created", "user", self.mission["id"], {
+            "text": "Run the approved check", "recipient": "builder",
+        })
+        self.store.begin_agent_event("builder", self.mission["id"], trigger["sequence"])
+        interaction = self.store.create_deferred_tool_interaction(
+            mission_id=self.mission["id"], requested_by="builder", title="Run command",
+            details="Run the approved command", target="pytest tests", trigger_sequence=trigger["sequence"],
+            run_id="provider-run", conversation_id=f"tribe:{self.mission['id']}:builder",
+            tool_call_id="tool-call", tool_name="run_command", tool_arguments={"command": "pytest tests"},
+            message_history="[]",
+        )
         self.assertEqual(self.store.recover_interrupted_agent_runs(), 0)
+        resolution = self.store.resolve_interaction(interaction["id"], "approved_once")
+        stop = threading.Event()
+        observed = []
+
+        class Provider:
+            async def run(inner_self, store, mission_id, event):
+                observed.append(event)
+                row = store.deferred_tool_approvals(mission_id, "builder", trigger["sequence"])[0]
+                self.assertEqual(row["interaction_status"], "resolved")
+                self.assertTrue(store.consume_deferred_tool_approval(row["interaction_id"], row["target"]))
+                return "The approved tool result was handled."
+
+        worker = AgentWorker(
+            self.store, self.mission["id"],
+            AgentDefinition("builder", "Builder", "Implementation", "Build", "builder.md"),
+            Provider(), stop,
+        )
+        save_agent_offset = self.store.save_agent_offset
+
+        def stop_after_resolution_offset(agent_id, mission_id, sequence):
+            save_agent_offset(agent_id, mission_id, sequence)
+            if sequence == resolution["event"]["sequence"]:
+                stop.set()
+
+        self.store.save_agent_offset = stop_after_resolution_offset
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        thread.join(timeout=3)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([event["sequence"] for event in observed], [trigger["sequence"]])
+        self.assertEqual(
+            self.store.agent_event_run("builder", self.mission["id"], trigger["sequence"])["status"],
+            "completed",
+        )
+        self.assertEqual(
+            self.store.agent_offset("builder", self.mission["id"]), resolution["event"]["sequence"],
+        )
 
     def test_provider_usage_is_durable_aggregated_and_idempotent(self) -> None:
         trigger = self.store.latest_sequence(self.mission["id"])
@@ -5500,10 +7553,347 @@ class ScheduleCase(RuntimeCase):
         self.assertIn("cost_usd", columns)
         self.assertEqual(version, SCHEMA_VERSION)
 
+    def test_schema_migrates_agent_run_retry_at_column(self) -> None:
+        with self.store._connect() as db:
+            db.execute("ALTER TABLE agent_event_runs DROP COLUMN retry_at")
+            db.execute("PRAGMA user_version = 29")
+        migrated = MissionStore(self.root / "tribe.sqlite3")
+        with migrated._connect() as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(agent_event_runs)")}
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+        self.assertIn("retry_at", columns)
+        self.assertIn("retry_deadline_at", columns)
+        self.assertEqual(version, SCHEMA_VERSION)
+
+    def test_schema_migrates_agent_run_retry_from_trigger_column(self) -> None:
+        with self.store._connect() as db:
+            db.execute("ALTER TABLE agent_event_runs DROP COLUMN retry_from_trigger")
+            db.execute("PRAGMA user_version = 33")
+
+        migrated = MissionStore(self.root / "tribe.sqlite3")
+
+        with migrated._connect() as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(agent_event_runs)")}
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+        self.assertIn("retry_from_trigger", columns)
+        self.assertEqual(version, SCHEMA_VERSION)
+
+    def test_schema_migrates_request_usage_ledger(self) -> None:
+        with self.store._connect() as db:
+            db.execute("ALTER TABLE agent_request_usage DROP COLUMN compaction_receipt_count")
+            db.execute("PRAGMA user_version = 32")
+
+        migrated = MissionStore(self.root / "tribe.sqlite3")
+
+        with migrated._connect() as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(agent_request_usage)")}
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+        self.assertIn("context_message_count", columns)
+        self.assertIn("compaction_receipt_count", columns)
+        self.assertIn("input_tokens", columns)
+        self.assertEqual(version, SCHEMA_VERSION)
+
+    def test_provider_hook_persists_usage_before_a_later_run_failure(self) -> None:
+        from pydantic_ai.capabilities import Hooks
+        from pydantic_ai.messages import ModelResponse, TextContent, TextPart, UserPromptPart
+        from pydantic_ai.usage import RequestUsage
+
+        model = "openai:test-model"
+        self.store.register_configured_model(model)
+        event = self.store.append("message.created", "user", self.mission["id"], {"text": "Start"})
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+
+        class AgentStub:
+            async def run(self, prompt, **kwargs):
+                hooks = next(item for item in kwargs["capabilities"] if isinstance(item, Hooks))
+                response = ModelResponse(
+                    parts=[TextPart(content="tool call")],
+                    usage=RequestUsage(input_tokens=540, output_tokens=24),
+                )
+                messages = ["older", SimpleNamespace(parts=[UserPromptPart(content=[TextContent(
+                    content="[History before this point (5 messages, ~100 tokens) was summarized"
+                )])])]
+                for _ in range(2):
+                    await hooks.after_model_request(
+                        SimpleNamespace(),
+                        request_context=SimpleNamespace(messages=messages),
+                        response=response,
+                    )
+                raise RuntimeError("later step failed")
+
+        with patch("tribe_runtime.agent_runtime._build_agent", return_value=AgentStub()):
+            provider = PydanticAIProvider(
+                AgentDefinition("builder", "Builder", "Implementation", "Build", "builder.md",
+                                model=model), model,
+            )
+            with self.assertRaisesRegex(RuntimeError, "later step failed"):
+                asyncio.run(provider.run(self.store, self.mission["id"], event))
+
+        restarted_store = MissionStore(self.store.path)
+        self.assertEqual(restarted_store.recover_interrupted_agent_runs(), 1)
+        self.assertEqual(restarted_store.recover_interrupted_agent_runs(), 0)
+        run = restarted_store.agent_event_run("builder", self.mission["id"], event["sequence"])
+        request = restarted_store.agent_request_usage_for_run(
+            "builder", self.mission["id"], event["sequence"],
+        )[0]
+        self.assertEqual(run["status"], "interrupted")
+        self.assertEqual((run["requests"], run["input_tokens"], run["output_tokens"]), (1, 540, 24))
+        self.assertEqual(request["context_message_count"], 2)
+        self.assertEqual(request["compaction_receipt_count"], 1)
+        mission_requests = restarted_store.agent_request_usage_for_mission(self.mission["id"])
+        self.assertEqual(len(mission_requests), 1)
+        self.assertNotIn("messages", mission_requests[0])
+
+    def test_compaction_receipt_counter_reads_harness_text_content(self) -> None:
+        from pydantic_ai.messages import TextContent, UserPromptPart
+
+        messages = [SimpleNamespace(parts=[UserPromptPart(content=[TextContent(
+            content="[History before this point (5 messages, ~100 tokens) was summarized"
+        )])])]
+        self.assertEqual(_count_compaction_receipts(messages), 1)
+
+    def test_process_death_before_model_response_quarantines_without_usage_or_replay(self) -> None:
+        event = self.store.append("message.created", "user", self.mission["id"], {"text": "Start"})
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        source = f'''\
+import asyncio
+import os
+from pathlib import Path
+from pydantic_ai import Agent
+from pydantic_ai.capabilities import Hooks
+from pydantic_ai.models.test import TestModel
+from tribe_runtime.store import MissionStore
+
+store = MissionStore(Path({str(self.store.path)!r}))
+async def before_model_request(ctx, request_context):
+    del ctx, request_context
+    os._exit(28)
+
+agent = Agent("openai:test-model", capabilities=[Hooks(before_model_request=before_model_request)])
+async def main():
+    with agent.override(model=TestModel(custom_output_text="This response must never be received")):
+        await agent.run("Answer briefly.", conversation_id="crash-before-response")
+asyncio.run(main())
+'''
+        crashed_process = subprocess.run(
+            [sys.executable, "-c", source], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(crashed_process.returncode, 28, crashed_process.stderr)
+
+        restarted_store = MissionStore(self.store.path)
+        self.assertEqual(restarted_store.recover_interrupted_agent_runs(), 1)
+        run = restarted_store.agent_event_run("builder", self.mission["id"], event["sequence"])
+        self.assertEqual(run["status"], "interrupted")
+        self.assertEqual(run["requests"], 0)
+        self.assertEqual(restarted_store.agent_request_usage_for_run(
+            "builder", self.mission["id"], event["sequence"],
+        ), [])
+        self.assertEqual(restarted_store.agent_offset("builder", self.mission["id"]), event["sequence"])
+        events = restarted_store.events_after(self.mission["id"], event["sequence"])
+        self.assertFalse(any(item["type"] in {
+            "agent.usage.recorded", "agent.tool.started", "agent.tool.completed",
+        } for item in events))
+        self.assertEqual(restarted_store.recover_interrupted_agent_runs(), 0)
+
+    def test_process_death_during_inflight_provider_request_replays_without_tool_effects(self) -> None:
+        event = self.store.append("message.created", "user", self.mission["id"], {"text": "Start"})
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        request_started = self.root / "provider-request-started"
+        source = f'''\
+import asyncio
+from pathlib import Path
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
+
+request_started = Path({str(request_started)!r})
+class InFlightModel(TestModel):
+    async def request(self, messages, model_settings, model_request_parameters):
+        del messages, model_settings, model_request_parameters
+        request_started.write_text("request entered", encoding="utf-8")
+        await asyncio.Event().wait()
+
+asyncio.run(Agent(InFlightModel()).run("Answer briefly.", conversation_id="crash-in-flight"))
+'''
+        process = subprocess.Popen(
+            [sys.executable, "-c", source], cwd=Path(__file__).resolve().parents[1],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while not request_started.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if not request_started.exists():
+                stdout, stderr = process.communicate(timeout=5)
+                self.fail(f"model request did not start; stdout={stdout!r}, stderr={stderr!r}")
+            process.kill()
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertNotEqual(process.returncode, 0, f"child exited normally; stdout={stdout!r}, stderr={stderr!r}")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=10)
+
+        restarted_store = MissionStore(self.store.path)
+        supervisor = AgentSupervisor(restarted_store, [])
+        self.assertEqual(supervisor.recover_interrupted_agent_runs(), 1)
+        run = restarted_store.agent_event_run("builder", self.mission["id"], event["sequence"])
+        self.assertEqual(run["status"], "retrying")
+        self.assertEqual(run["retry_from_trigger"], 1)
+        self.assertEqual(run["requests"], 0)
+        self.assertEqual(restarted_store.agent_request_usage_for_run(
+            "builder", self.mission["id"], event["sequence"],
+        ), [])
+        self.assertEqual(restarted_store.agent_offset("builder", self.mission["id"]), 0)
+        events = restarted_store.events_after(self.mission["id"], event["sequence"])
+        retry = next(item for item in events if item["type"] == "agent.run.retrying")
+        self.assertTrue(retry["payload"]["replayedFromTrigger"])
+        self.assertFalse(any(item["type"] in {
+            "agent.usage.recorded", "agent.tool.started", "agent.tool.completed",
+            "agent.run.interrupted",
+        } for item in events))
+        self.assertEqual(supervisor.recover_interrupted_agent_runs(), 0)
+        supervisor.close()
+
+    def test_process_death_during_partial_http_model_response_replays_without_tool_effects(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        event = self.store.append("message.created", "user", self.mission["id"], {"text": "Start"})
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        response_started = threading.Event()
+        finish_response = threading.Event()
+
+        class PartialResponseHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                body_length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(body_length)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "1024")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(b'{"id":"partial-response","choices":[{"index":0,')
+                self.wfile.flush()
+                response_started.set()
+                finish_response.wait(timeout=15)
+
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), PartialResponseHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        endpoint = f"http://127.0.0.1:{server.server_port}/v1"
+        source = f'''\
+import asyncio
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
+
+model = OpenAIChatModel("test-model", provider=OpenAIProvider(base_url={endpoint!r}, api_key="test"))
+asyncio.run(Agent(model).run("Answer briefly.", conversation_id="crash-partial-http-response"))
+'''
+        process = subprocess.Popen(
+            [sys.executable, "-c", source], cwd=Path(__file__).resolve().parents[1],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            if not response_started.wait(timeout=15):
+                stdout, stderr = process.communicate(timeout=5)
+                self.fail(f"partial HTTP response did not start; stdout={stdout!r}, stderr={stderr!r}")
+            process.kill()
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertNotEqual(process.returncode, 0, f"child exited normally; stdout={stdout!r}, stderr={stderr!r}")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=10)
+            finish_response.set()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=10)
+
+        restarted_store = MissionStore(self.store.path)
+        supervisor = AgentSupervisor(restarted_store, [])
+        self.assertEqual(supervisor.recover_interrupted_agent_runs(), 1)
+        run = restarted_store.agent_event_run("builder", self.mission["id"], event["sequence"])
+        self.assertEqual(run["status"], "retrying")
+        self.assertEqual(run["retry_from_trigger"], 1)
+        self.assertEqual(run["requests"], 0)
+        self.assertEqual(restarted_store.agent_request_usage_for_run(
+            "builder", self.mission["id"], event["sequence"],
+        ), [])
+        events = restarted_store.events_after(self.mission["id"], event["sequence"])
+        retry = next(item for item in events if item["type"] == "agent.run.retrying")
+        self.assertTrue(retry["payload"]["replayedFromTrigger"])
+        self.assertEqual(restarted_store.agent_offset("builder", self.mission["id"]), 0)
+        self.assertFalse(any(item["type"] in {
+            "agent.usage.recorded", "agent.tool.started", "agent.tool.completed",
+            "agent.run.interrupted",
+        } for item in events))
+        self.assertEqual(supervisor.recover_interrupted_agent_runs(), 0)
+        supervisor.close()
+
+    def test_process_death_after_provider_response_keeps_usage_and_quarantines_without_checkpoint(self) -> None:
+        event = self.store.append("message.created", "user", self.mission["id"], {"text": "Start"})
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        source = f'''\
+import asyncio
+import os
+from pathlib import Path
+from pydantic_ai import Agent
+from pydantic_ai.capabilities import Hooks
+from pydantic_ai.models.test import TestModel
+from tribe_runtime.store import MissionStore
+
+store = MissionStore(Path({str(self.store.path)!r}))
+async def after_model_request(ctx, request_context, response):
+    del ctx
+    usage = response.usage
+    values = {{
+        key: getattr(usage, key, 0)
+        for key in ("tool_calls", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+    }}
+    await asyncio.to_thread(
+        store.record_agent_request_usage, "builder", {self.mission["id"]!r},
+        {event["sequence"]}, "response-before-crash", "openai:test-model", values,
+        len(request_context.messages), 0,
+    )
+    os._exit(25)
+
+agent = Agent("openai:test-model", capabilities=[Hooks(after_model_request=after_model_request)])
+async def main():
+    with agent.override(model=TestModel(custom_output_text="Provider response received")):
+        await agent.run("Answer briefly.", conversation_id="crash-after-response")
+asyncio.run(main())
+'''
+        crashed_process = subprocess.run(
+            [sys.executable, "-c", source], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(crashed_process.returncode, 25, crashed_process.stderr)
+
+        restarted_store = MissionStore(self.store.path)
+        self.assertEqual(restarted_store.recover_interrupted_agent_runs(), 1)
+        run = restarted_store.agent_event_run("builder", self.mission["id"], event["sequence"])
+        requests = restarted_store.agent_request_usage_for_run(
+            "builder", self.mission["id"], event["sequence"],
+        )
+        self.assertEqual(run["status"], "interrupted")
+        self.assertEqual(run["requests"], 1)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["request_key"], "response-before-crash")
+        self.assertNotIn("messages", requests[0])
+
     def test_provider_uses_reserved_budget_in_pydantic_ai_limits(self) -> None:
         from pydantic_ai import CancellationToken, UsageLimits
+        from pydantic_ai_harness.compaction import SummarizingCompaction
 
         self.store.set_project_usage_budget(self.project["id"], 5_000, "0.25")
+        self.store.register_configured_model("openai:test-model")
+        self.store.update_model_metadata("openai:test-model", {
+            "contextWindow": 1_000_000, "maxOutputTokens": 4_096,
+        })
         event = self.store.append("message.created", "user", self.mission["id"], {"text": "Start"})
         self.assertEqual(
             self.store.reserve_agent_usage("builder", self.mission["id"], event["sequence"], 11),
@@ -5516,6 +7906,8 @@ class ScheduleCase(RuntimeCase):
             async def run(self, prompt, **kwargs):
                 captured["usage_limits"] = kwargs["usage_limits"]
                 captured["cancellation_token"] = kwargs["cancellation_token"]
+                captured["model_settings"] = kwargs.get("model_settings")
+                captured["capabilities"] = kwargs["capabilities"]
                 return type("Result", (), {"output": "no-op"})()
 
         with patch("tribe_runtime.agent_runtime._build_agent", return_value=AgentStub()):
@@ -5528,10 +7920,80 @@ class ScheduleCase(RuntimeCase):
         limits: UsageLimits = captured["usage_limits"]
         self.assertEqual(limits.total_tokens_limit, 5_000)
         self.assertEqual(limits.input_tokens_limit, 5_000)
-        self.assertEqual(limits.output_tokens_limit, 1_250)
+        self.assertEqual(limits.output_tokens_limit, 5_000)
         self.assertEqual(limits.cost_limit, Decimal("0.25"))
+        self.assertIsNone(limits.request_limit)
+        self.assertIsNone(limits.tool_calls_limit)
         self.assertTrue(limits.count_tokens_before_request)
         self.assertIs(captured["cancellation_token"], cancellation_token)
+        self.assertEqual(captured["model_settings"], {"max_tokens": 4_096})
+        compaction = next(
+            capability for capability in captured["capabilities"]
+            if isinstance(capability, SummarizingCompaction)
+        )
+        self.assertEqual(compaction.context_window, 1_000_000)
+        self.assertEqual(compaction.keep_tokens, 200_000)
+        self.assertEqual(compaction.max_fraction, 0.75)
+        self.assertTrue(compaction.keep_user_messages)
+        self.assertEqual(compaction.model_settings, {"max_tokens": 4_096})
+
+    def test_incremental_compaction_preserves_exact_context_across_multiple_summaries(self) -> None:
+        from pydantic_ai import RunContext, RunUsage
+        from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+        from pydantic_ai.models.function import FunctionModel
+        from pydantic_ai_harness.compaction import SummarizingCompaction
+
+        summary_prompts: list[str] = []
+
+        summary_content = (
+            "Goal: deliver the focus timer. Constraints: avoid new dependencies and run the tests. "
+            "Decision: keep persistence in localStorage. Exact paths: README.md and src/timer.py. "
+            "Unfinished work: implement pause/resume and verify keyboard controls."
+        )
+
+        def summarize(messages, _agent_info):
+            summary_prompts.append(str(messages))
+            return ModelResponse(parts=[TextPart(content=summary_content)])
+
+        model = FunctionModel(summarize, model_name="test-compaction")
+        history = [ModelRequest(parts=[UserPromptPart(
+            content=(
+                "Initial goal: deliver the focus timer; constraints: no new dependencies; "
+                "decision: localStorage; exact paths: README.md and src/timer.py; "
+                "unfinished: pause/resume and keyboard verification. "
+                f"Progress update {index}."
+            ),
+        )]) for index in range(8)]
+        context = RunContext(deps=None, model=model, usage=RunUsage(), messages=history)
+        compaction = SummarizingCompaction(
+            max_messages=4, keep_messages=2, keep_user_messages=True,
+            incremental=True, receipts=True,
+        )
+
+        first = asyncio.run(compaction.compact(history, context))
+        context.messages[:] = first
+        follow_up = ModelRequest(parts=[UserPromptPart(content="Implement pause/resume before verifying keyboard controls.")])
+        context.messages.append(follow_up)
+        second = asyncio.run(compaction.compact(context.messages.copy(), context))
+        context.messages[:] = second
+        final_follow_up = ModelRequest(parts=[UserPromptPart(content="Run the tests and report unfinished work.")])
+        context.messages.append(final_follow_up)
+        third = asyncio.run(compaction.compact(context.messages.copy(), context))
+
+        self.assertEqual(len(summary_prompts), 3)
+        self.assertIn("<previous-summary>", summary_prompts[1])
+        self.assertIn("<previous-summary>", summary_prompts[2])
+        for preserved in (
+            "deliver the focus timer", "avoid new dependencies", "localStorage",
+            "README.md", "src/timer.py", "pause/resume", "keyboard controls",
+        ):
+            self.assertIn(preserved, summary_content)
+            self.assertIn(preserved, str(third))
+        self.assertIn("Implement pause/resume", str(second))
+        self.assertIn("Run the tests", str(third))
+        self.assertIn("History before this point", str(first))
+        self.assertIn("History before this point", str(second))
+        self.assertIn("History before this point", str(third))
 
     def test_project_run_cost_limit_is_durable_and_preserved_by_legacy_budget_update(self) -> None:
         self.store.set_project_usage_budget(self.project["id"], 5_000, "0.1250")
@@ -5542,6 +8004,77 @@ class ScheduleCase(RuntimeCase):
         budget = self.store.project_usage(self.project["id"])["budget"]
         self.assertEqual(budget["monthlyTokenLimit"], 6_000)
         self.assertEqual(budget["maxRunCostUsd"], "0.125")
+
+    def test_default_agent_run_has_no_cumulative_token_limit(self) -> None:
+        event = self.store.append("message.created", "user", self.mission["id"], {"text": "Start"})
+        self.assertEqual(
+            self.store.reserve_agent_usage("builder", self.mission["id"], event["sequence"], 1),
+            0,
+        )
+        self.assertIsNone(self.store.usage_token_limit_for_run(
+            "builder", self.mission["id"], event["sequence"],
+        ))
+        self.store.set_project_usage_budget(self.project["id"], None, max_run_tokens=12_345)
+        limited_event = self.store.append("message.created", "user", self.mission["id"], {"text": "Start with explicit cap"})
+        self.assertEqual(
+            self.store.reserve_agent_usage("builder", self.mission["id"], limited_event["sequence"], 2),
+            12_345,
+        )
+        self.assertEqual(self.store.usage_token_limit_for_run(
+            "builder", self.mission["id"], limited_event["sequence"],
+        ), 12_345)
+
+    def test_failed_agent_run_preserves_partial_provider_usage(self) -> None:
+        event = self.store.append("message.created", "user", self.mission["id"], {"text": "Start"})
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        self.store.fail_agent_event(
+            "builder", self.mission["id"], event["sequence"], 2, "provider disconnected",
+            usage_attempt=21, usage_model="openai:test-model",
+            usage={"requests": 3, "tool_calls": 2, "input_tokens": 700,
+                   "output_tokens": 80, "cache_read_tokens": 100, "cost_usd": "0.04"},
+        )
+
+        run = self.store.agent_event_run("builder", self.mission["id"], event["sequence"])
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["requests"], 3)
+        self.assertEqual(run["input_tokens"], 700)
+        self.assertEqual(run["output_tokens"], 80)
+        usage = self.store.project_usage(self.project["id"])
+        self.assertGreaterEqual(usage["totals"]["requests"], 3)
+        self.assertGreaterEqual(usage["totals"]["input_tokens"], 700)
+
+    def test_completed_request_usage_is_idempotent_and_survives_interruption(self) -> None:
+        event = self.store.append("message.created", "user", self.mission["id"], {"text": "Start"})
+        self.store.begin_agent_event("builder", self.mission["id"], event["sequence"])
+        usage = {
+            "tool_calls": 1, "input_tokens": 420, "output_tokens": 31,
+            "cache_read_tokens": 20, "cache_write_tokens": 4, "cost_usd": "0.012",
+        }
+        self.assertTrue(self.store.record_agent_request_usage(
+            "builder", self.mission["id"], event["sequence"], "response-1",
+            "openai:test-model", usage, context_message_count=7,
+        ))
+        self.assertFalse(self.store.record_agent_request_usage(
+            "builder", self.mission["id"], event["sequence"], "response-1",
+            "openai:test-model", usage, context_message_count=7,
+        ))
+        active_usage = self.store.project_usage(self.project["id"])["totals"]
+        self.assertEqual(active_usage["requests"], 1)
+        self.assertEqual(active_usage["input_tokens"], 420)
+        self.assertTrue(self.store.interrupt_agent_event(
+            "builder", self.mission["id"], event["sequence"], "worker stopped",
+        ))
+
+        run = self.store.agent_event_run("builder", self.mission["id"], event["sequence"])
+        self.assertEqual(run["status"], "interrupted")
+        self.assertEqual(run["requests"], 1)
+        self.assertEqual(run["input_tokens"], 420)
+        request_rows = self.store.agent_request_usage_for_run(
+            "builder", self.mission["id"], event["sequence"],
+        )
+        self.assertEqual(request_rows[0]["context_message_count"], 7)
+        project_usage = self.store.project_usage(self.project["id"])
+        self.assertGreaterEqual(project_usage["totals"]["input_tokens"], 420)
 
     def test_schema_migrates_project_run_cost_limit(self) -> None:
         with self.store._connect() as db:
@@ -5577,9 +8110,9 @@ class ScheduleCase(RuntimeCase):
 
         limits: UsageLimits = captured["usage_limits"]
         self.assertFalse(limits.count_tokens_before_request)
-        self.assertEqual(limits.request_limit, 8)
-        self.assertEqual(limits.tool_calls_limit, 24)
-        self.assertGreater(limits.total_tokens_limit, 0)
+        self.assertIsNone(limits.request_limit)
+        self.assertIsNone(limits.tool_calls_limit)
+        self.assertIsNone(limits.total_tokens_limit)
 
     def test_cancel_requested_before_agent_result_quarantines_run_instead_of_publishing(self) -> None:
         event = self.store.append("message.created", "user", self.mission["id"], {"text": "Make a change"})
@@ -5666,7 +8199,7 @@ class ScheduleCase(RuntimeCase):
             thread.join(timeout=2)
 
     def test_monthly_budget_reservations_are_atomic_and_recovered_conservatively(self) -> None:
-        self.store.set_project_usage_budget(self.project["id"], 200_000)
+        self.store.set_project_usage_budget(self.project["id"], 200_000, None, 128_000)
         barrier = threading.Barrier(2)
         reservations: list[int | None] = [None, None]
 
@@ -5915,9 +8448,16 @@ class ScheduleCase(RuntimeCase):
 
 
 class SupervisorResumeCase(unittest.TestCase):
-    setUp = RuntimeCase.setUp
     tearDown = RuntimeCase.tearDown
     git = RuntimeCase.git
+
+    def setUp(self) -> None:
+        RuntimeCase.setUp(self)
+        message = self.store.append("message.created", "user", self.mission["id"], {
+            "text": "Exercise builder worker lifecycle", "recipient": "builder",
+        })
+        self.store.save_agent_offset("builder", self.mission["id"], message["sequence"] - 1)
+        self.store.create_work_item(self.mission["id"], "Keep the worker lifecycle task active")
 
     def test_resume_waits_for_in_flight_worker_then_restarts(self) -> None:
         started = threading.Event()

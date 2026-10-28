@@ -141,7 +141,7 @@ class OAuthMcpRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 registry.save_config(project["id"], {"mcpServers": {
                     "docs": {"url": endpoint, "oauth": {"scopes": []}, "readOnlyTools": ["read_document"]},
                 }})
-                toolsets = registry.load_toolsets(project["id"])
+                toolsets = registry.load_toolsets(project["id"], ("mcp:*",))
                 self.assertEqual(len(toolsets), 1)
                 context = RunContext(deps=None, model=None, usage=RunUsage())
                 async with toolsets[0]:
@@ -180,7 +180,7 @@ class OAuthMcpRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "Publish the document now.",
                     deps=None,
                     capabilities=capabilities,
-                    toolsets=registry.load_toolsets(project["id"]),
+                    toolsets=registry.load_toolsets(project["id"], ("mcp:*",)),
                     conversation_id=f"test:{_mission['id']}:tester",
                 ))
                 pending = None

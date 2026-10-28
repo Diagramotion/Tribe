@@ -13,7 +13,12 @@ function focusableElements(dialog) {
 
 function focusInitial(dialog) {
   const focusables = focusableElements(dialog);
-  const target = dialog.querySelector("[autofocus], [data-dialog-initial-focus]") ?? focusables[0] ?? dialog;
+  const active = dialog.ownerDocument.activeElement;
+  const focusedInside = active instanceof HTMLElement && active !== dialog && dialog.contains(active);
+  const target = dialog.querySelector("[data-dialog-initial-focus], [autofocus]")
+    ?? (focusedInside ? active : null)
+    ?? focusables[0]
+    ?? dialog;
   target.focus({ preventScroll: true });
 }
 

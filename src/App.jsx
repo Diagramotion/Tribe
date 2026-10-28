@@ -14,6 +14,7 @@ import {
   CircleNotch,
   Code,
   DownloadSimple,
+  DotsThreeVertical,
   DotsSixVertical,
   DesktopTower,
   FileText,
@@ -28,6 +29,7 @@ import {
   PaperPlaneRight,
   Pause,
   Play,
+  Plus,
   ShieldCheck,
   SquaresFour,
   SidebarSimple,
@@ -57,9 +59,9 @@ import { IconButton, Sidebar } from "./components/WorkspaceSidebar.jsx";
 import { AddRemoteServiceForm } from "./components/AddRemoteServiceForm.jsx";
 import { useDialogFocus } from "./hooks/useDialogFocus.js";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary.jsx";
-import { ArtifactList, MissionView } from "./views/MissionView.jsx";
+import { AgentActivityView, ArtifactList, MissionView } from "./views/MissionView.jsx";
 import {
-  filterTimelineMessages, formatTime, mapArtifact, mapInteraction, mapTestRun, mapWorkItem,
+  filterConversationMessages, filterTimelineMessages, formatTime, mapArtifact, mapInteraction, mapTestRun, mapTestRuns, mapWorkItem,
   mergeTimelineMessages, restoreAgentActivity, timelineEntries, timelineEntry, updateWorkItems,
 } from "./domain/activity.js";
 
@@ -88,20 +90,47 @@ const InteractiveAccessView = lazy(() => import("./views/InteractiveAccessView.j
 const TestRunsView = lazy(() => import("./views/TestRunsView.jsx").then((module) => ({ default: module.TestRunsView })));
 const WorkflowsView = lazy(() => import("./views/WorkflowsView.jsx").then((module) => ({ default: module.WorkflowsView })));
 const secondaryPaneTools = [
+  { id: "Activity", label: "Agent activity", icon: UsersThree },
+  { id: "Plan", label: "Plan", icon: ListChecks },
+  { id: "Tests", label: "Tests", icon: Flask },
+  { id: "Runs", label: "Runs", icon: ClockCounterClockwise },
   { id: "Code", label: "Repository", icon: FolderSimple },
   { id: "Git", label: "Git changes", icon: GitBranch },
-  { id: "Artifacts", label: "Project artifacts", icon: SquaresFour },
+  { id: "Artifacts", label: "Artifacts", icon: SquaresFour },
   { id: "Preview", label: "Artifact preview", icon: FileText },
 ];
+function MissionWorkflowProgress({ stages, currentStageId, currentTitle, title, state, completed }) {
+  if (!Array.isArray(stages) || stages.length === 0) return null;
+  const completedStages = new Set(state?.values?.completed_stage_ids ?? []);
+  return <section aria-label={`${title} workflow · ${completed ? "Chat complete" : currentTitle}`} className="mission-workflow-progress">
+    <div className="mission-workflow-progress-heading"><GitBranch size={14} /><span>{title}</span><strong>{completed ? "Chat complete" : currentTitle}</strong></div>
+    <ol aria-label="Workflow stages">
+      {stages.map((stage, index) => {
+        const complete = completedStages.has(stage.id);
+        const current = !completed && stage.id === currentStageId;
+        return <li aria-current={current ? "step" : undefined} className={`${complete ? "mission-workflow-step--complete" : ""} ${current ? "mission-workflow-step--current" : ""}`.trim()} key={stage.id}>
+          <span aria-hidden="true" className="mission-workflow-step-marker">{complete ? <Check size={11} weight="bold" /> : index + 1}</span>
+          <span>{stage.title}</span>
+          {stage.transitions?.length > 0 && <small>Next: {stage.transitions.map((edge) => typeof edge === "string" ? edge : edge.to).join(", ")}</small>}
+        </li>;
+      })}
+    </ol>
+  </section>;
+}
+
 function initialSecondaryPaneWidth() {
   if (typeof window === "undefined") return 480;
   try {
     const value = Number(window.localStorage.getItem("tribe.secondary-pane-width"));
-    return Number.isFinite(value) && value >= 320 && value <= 820 ? value : 480;
+    const sidebarWidth = Number.parseFloat(window.getComputedStyle(document.documentElement).getPropertyValue("--sidebar-width")) || 248;
+    const availableWidth = Math.max(640, window.innerWidth - sidebarWidth);
+    const maxWidth = maxSecondaryPaneWidth(availableWidth);
+    if (Number.isFinite(value) && value >= 320) return value === 820 && maxWidth > 820 ? maxWidth : value;
+    return maxWidth;
   } catch { return 480; }
 }
 function maxSecondaryPaneWidth(availableWidth) {
-  return Math.max(320, Math.min(820, availableWidth - 360, availableWidth * 0.6));
+  return Math.max(320, Math.min(availableWidth - 360, availableWidth * 0.6, 820));
 }
 function modelProvider(model) {
   return model.trim().toLowerCase().split(":", 1)[0];
@@ -130,20 +159,27 @@ function Toast({ text, onDismiss }) {
   return <div className="toast" role="status"><Check size={16} />{text}<IconButton label="Dismiss" onClick={onDismiss}><X size={15} /></IconButton></div>;
 }
 
-function SecondaryPaneTabs({ selected, onSelect, badges = {}, tools = secondaryPaneTools }) {
+function SecondaryPaneTabs({ selected, openTabs, onSelect, onClose, badges = {}, tools = secondaryPaneTools }) {
+  const selectedTabRef = useRef(null);
+  useLayoutEffect(() => {
+    selectedTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [selected, openTabs]);
+
   return <nav aria-label="Workspace tools" className="secondary-pane-tabs" role="tablist">
-    {tools.map(({ id, label, icon: Icon }) => <IconButton
-      aria-selected={selected === id}
-      className={`secondary-pane-tab ${selected === id ? "secondary-pane-tab--selected" : ""}`}
-      key={id}
-      label={label}
-      onClick={() => onSelect(id)}
-      role="tab"
-    >
-      <Icon size={19} weight={selected === id ? "fill" : "regular"} />
-      <span>{label}</span>
-      {badges[id] > 0 && <span aria-label={`${badges[id]} ${label.toLowerCase()}`} className="secondary-tool-badge">{badges[id] > 99 ? "99+" : badges[id]}</span>}
-    </IconButton>)}
+    {openTabs.map((id) => {
+      const tool = tools.find((item) => item.id === id);
+      if (!tool) return null;
+      const { label, icon: Icon } = tool;
+      const isSelected = selected === id;
+      return <div className={`secondary-pane-tab-item ${isSelected ? "secondary-pane-tab-item--selected" : ""}`} key={id} ref={isSelected ? selectedTabRef : null}>
+        <button aria-label={label} aria-selected={isSelected} className={`icon-button secondary-pane-tab ${isSelected ? "secondary-pane-tab--selected" : ""}`} onClick={() => onSelect(id)} role="tab" type="button">
+          <Icon size={17} weight={isSelected ? "fill" : "regular"} />
+          <span>{label}</span>
+          {badges[id] > 0 && <span aria-label={`${badges[id]} ${label.toLowerCase()}`} className="secondary-tool-badge">{badges[id] > 99 ? "99+" : badges[id]}</span>}
+        </button>
+        <IconButton className="secondary-pane-tab-close" label={`Close ${label}`} onClick={() => onClose(id)}><X size={13} /></IconButton>
+      </div>;
+    })}
   </nav>;
 }
 
@@ -205,6 +241,7 @@ export function App() {
   const [hasOlderEvents, setHasOlderEvents] = useState(false);
   const [loadingOlderEvents, setLoadingOlderEvents] = useState(false);
   const [agents, setAgents] = useState([]);
+  const [capabilityCatalog, setCapabilityCatalog] = useState([]);
   const [agentDirectory, setAgentDirectory] = useState("");
   const [artifacts, setArtifacts] = useState([]);
   const [projectArtifacts, setProjectArtifacts] = useState([]);
@@ -232,10 +269,12 @@ export function App() {
   const [computerCaptureBusy, setComputerCaptureBusy] = useState(false);
   const [computerCaptureAction, setComputerCaptureAction] = useState("");
   const [requestsOpen, setRequestsOpen] = useState(false);
+  const [chatViewsOpen, setChatViewsOpen] = useState(false);
   const [workItemsState, setWorkItems] = useState([]);
   const [isolatedWorkspaces, setIsolatedWorkspaces] = useState([]);
   const [selectedArtifact, setSelectedArtifact] = useState(null);
   const [projectPaneTab, setProjectPaneTab] = useState("Code");
+  const [openProjectPaneTabs, setOpenProjectPaneTabs] = useState([]);
   const [projectGitEnabled, setProjectGitEnabled] = useState(false);
   const [projectGitChangeCount, setProjectGitChangeCount] = useState(0);
   const [projectPaneOpen, setProjectPaneOpen] = useState(false);
@@ -243,6 +282,7 @@ export function App() {
   const [workspacePaneAvailableWidth, setWorkspacePaneAvailableWidth] = useState(0);
   const [paneResizing, setPaneResizing] = useState(false);
   const projectPaneTools = projectGitEnabled ? secondaryPaneTools : secondaryPaneTools.filter((tool) => tool.id !== "Git");
+  const chatViewMenuTools = projectPaneTools.filter((tool) => tool.id !== "Preview");
   const paneResizeRef = useRef(null);
   const workspacePaneRef = useRef(null);
   useLayoutEffect(() => {
@@ -259,22 +299,66 @@ export function App() {
     : 820;
   const visibleWorkspacePaneWidth = Math.min(secondaryPaneWidth, maxWorkspacePaneWidth);
   useEffect(() => {
+    if (!projectPaneOpen || workspacePaneAvailableWidth <= 0) return;
+    const previousWorkspaceMaximum = maxSecondaryPaneWidth(workspacePaneAvailableWidth);
+    const previousCollapsedSidebarMaximum = maxSecondaryPaneWidth(window.innerWidth - 48);
+    if (Math.abs(secondaryPaneWidth - previousWorkspaceMaximum) <= 4
+        || Math.abs(secondaryPaneWidth - previousCollapsedSidebarMaximum) <= 4) {
+      setSecondaryPaneWidth(maxSecondaryPaneWidth(workspacePaneAvailableWidth));
+    }
+  }, [projectPaneOpen, secondaryPaneWidth, workspacePaneAvailableWidth]);
+  useEffect(() => {
     try { window.localStorage.setItem("tribe.secondary-pane-width", String(Math.round(secondaryPaneWidth))); } catch { /* Layout preferences are optional. */ }
   }, [secondaryPaneWidth]);
-
-  function toggleSecondaryPane() {
-    if (projectPaneOpen) setProjectPaneOpen(false);
-    else { setProjectPaneTab((current) => current ?? "Code"); setProjectPaneOpen(true); }
-  }
 
   function chooseSecondaryPane(tab) {
     if (tab === "Code") {
       setSelectedArtifact(null);
       setSelectedCanvasDocument(null);
     }
+    setOpenProjectPaneTabs((current) => current.includes(tab) ? current : [...current, tab]);
     setProjectPaneTab(tab);
     setProjectPaneOpen(true);
   }
+
+  function closeSecondaryPaneTab(tab) {
+    const index = openProjectPaneTabs.indexOf(tab);
+    const nextTabs = openProjectPaneTabs.filter((item) => item !== tab);
+    setOpenProjectPaneTabs(nextTabs);
+    if (tab === "Preview") {
+      setSelectedArtifact(null);
+      setSelectedCanvasDocument(null);
+    }
+    if (projectPaneTab === tab) {
+      const nextTab = nextTabs[Math.min(index, nextTabs.length - 1)] ?? "";
+      setProjectPaneTab(nextTab);
+      if (!nextTab) setProjectPaneOpen(false);
+    }
+  }
+
+  function openMissionWorkspaceTool(tab) {
+    chooseSecondaryPane(tab);
+    setChatViewsOpen(false);
+  }
+
+  function openAgentActivity() {
+    openMissionWorkspaceTool("Activity");
+  }
+
+  useEffect(() => {
+    if (!chatViewsOpen) return undefined;
+    const dismiss = (event) => {
+      if (event.type === "pointerdown" && event.target.closest?.(".chat-views-menu-wrap")) return;
+      setChatViewsOpen(false);
+    };
+    const dismissOnEscape = (event) => { if (event.key === "Escape") setChatViewsOpen(false); };
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("keydown", dismissOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("keydown", dismissOnEscape);
+    };
+  }, [chatViewsOpen]);
 
   function startSecondaryPaneResize(event) {
     if (event.button !== 0) return;
@@ -322,7 +406,9 @@ export function App() {
   const [missions, setMissions] = useState([]);
   const [projects, setProjects] = useState([]);
   const [createProjectOpen, setCreateProjectOpen] = useState(false);
+  const projectCreateReturnFocusRef = useRef(null);
   const [projectSettingsOpen, setProjectSettingsOpen] = useState(false);
+  const projectSettingsReturnFocusRef = useRef(null);
   const [projectSettingsSection, setProjectSettingsSection] = useState("team");
   const [projectGoalInput, setProjectGoalInput] = useState("");
   const [projectGoalReferenceFilesInput, setProjectGoalReferenceFilesInput] = useState("");
@@ -368,14 +454,22 @@ export function App() {
     return () => { active = false; window.clearInterval(timer); };
   }, [project.id]);
   useEffect(() => {
-    if (!projectGitEnabled && projectPaneTab === "Git") setProjectPaneTab("Code");
-  }, [projectGitEnabled, projectPaneTab]);
+    if (projectGitEnabled || !openProjectPaneTabs.includes("Git")) return;
+    const nextTabs = openProjectPaneTabs.filter((tab) => tab !== "Git");
+    setOpenProjectPaneTabs(nextTabs);
+    if (projectPaneTab === "Git") {
+      const nextTab = nextTabs.at(-1) ?? "";
+      setProjectPaneTab(nextTab);
+      if (!nextTab) setProjectPaneOpen(false);
+    }
+  }, [projectGitEnabled, projectPaneTab, openProjectPaneTabs]);
   const [runtimeStatus, setRuntimeStatus] = useState("connecting");
   const [agentRuntime, setAgentRuntime] = useState({ enabled: false });
   const [toast, setToast] = useState("");
   const [activeWork, setActiveWork] = useState(null);
   const [runs, setRuns] = useState([]);
   const [commandRuns, setCommandRuns] = useState([]);
+  const [agentRequests, setAgentRequests] = useState([]);
   const [schedules, setSchedules] = useState([]);
   const [webAccess, setWebAccess] = useState({ enabled: false, allowedDomains: [] });
   const [interactiveAccess, setInteractiveAccess] = useState({ enabled: false });
@@ -383,7 +477,6 @@ export function App() {
   const [recipes, setRecipes] = useState([]);
   const [usage, setUsage] = useState(emptyUsage);
   const [query, setQuery] = useState("");
-  const [selectedWorkFilter, setSelectedWorkFilter] = useState("");
   const [missionControlPending, setMissionControlPending] = useState(false);
   const fileInputRef = useRef(null);
   const pendingAttachmentCallbackRef = useRef(null);
@@ -443,7 +536,7 @@ export function App() {
     Git: "Git changes",
     Artifacts: "Artifacts",
     Schedules: "Schedules",
-    Knowledge: "Project knowledge",
+    Knowledge: "Project memory",
     Skills: "Skills",
     Recipes: "Workflows",
     Agents: "Agent roles",
@@ -498,9 +591,15 @@ export function App() {
     () => missionPhase(mission, workItemsState, mission?.workflow_context),
     [mission, workItemsState],
   );
-  const runtimeSurface = window.__TAURI_INTERNALS__ ? "Desktop app" : "Local preview";
-  const runtimeConnection = runtimeStatus === "connected" ? "Ready" : runtimeStatus === "offline" ? "Offline" : runtimeStatus === "reconnecting" ? "Reconnecting" : "Starting";
-
+  const workflowSnapshot = useMemo(() => {
+    try {
+      const snapshot = typeof mission?.recipe_snapshot === "string"
+        ? JSON.parse(mission.recipe_snapshot) : mission?.recipe_snapshot;
+      return snapshot?.id ? snapshot : recipes.find((recipe) => recipe.id === mission?.recipe_id) ?? null;
+    } catch {
+      return recipes.find((recipe) => recipe.id === mission?.recipe_id) ?? null;
+    }
+  }, [mission?.recipe_id, mission?.recipe_snapshot, recipes]);
   async function refreshPendingRequests() {
     const [interactionsResult, observationsResult] = await Promise.allSettled([
       runtime.listPendingInteractions(), runtime.listComputerRequests(),
@@ -622,7 +721,19 @@ export function App() {
 
   function applyEvent(event) {
     cursorRef.current = Math.max(cursorRef.current, event.sequence ?? 0);
-    setMission((current) => current?.id === event.missionId && current.recipe_id === "goal-driven-sdlc"
+    if (event.type === "mission.workflow.selected") {
+      const workflow = event.payload?.workflow;
+      if (workflow?.id) {
+        const workflowMission = {
+          recipe_id: workflow.id, recipe_version: workflow.version,
+          recipe_snapshot: JSON.stringify(workflow), workflow_context: null,
+        };
+        setMission((current) => current?.id === event.missionId ? { ...current, ...workflowMission } : current);
+        setMissions((current) => current.map((item) => item.id === event.missionId
+          ? { ...item, ...workflowMission } : item));
+      }
+    }
+    setMission((current) => current?.id === event.missionId && current.recipe_id
       ? { ...current, workflow_context: advanceMissionWorkflowContext(current.workflow_context, event) }
       : current);
     const message = timelineEntry(event, agentDefinitionsRef.current);
@@ -810,14 +921,34 @@ export function App() {
       try {
         const data = await runtime.bootstrap(project.id, mission?.id, showNewChat);
         if (!alive) return;
+        let initialEvents = data.events ?? [];
+        let hasMoreEvents = Boolean(data.hasMoreEvents);
+        let earliestSequence = initialEvents[0]?.sequence ?? null;
+        while (data.mission?.id && earliestSequence !== null && hasMoreEvents
+            && !initialEvents.some((event) => event.type === "message.created" && event.actorId === "user")) {
+          try {
+            const page = await runtime.eventsBefore(data.mission.id, earliestSequence);
+            const nextEarliestSequence = page.events?.[0]?.sequence;
+            if (!Number.isSafeInteger(nextEarliestSequence) || nextEarliestSequence >= earliestSequence) {
+              hasMoreEvents = false;
+              break;
+            }
+            initialEvents = [...page.events, ...initialEvents];
+            earliestSequence = nextEarliestSequence;
+            hasMoreEvents = Boolean(page.hasMore);
+          } catch {
+            break;
+          }
+        }
+        if (!alive) return;
         setProject(data.project ?? { id: undefined, name: "" });
         setMission(data.mission);
         missionPausedRef.current = data.mission?.status === "paused";
         missionCompletedRef.current = data.mission?.status === "completed" || Boolean(data.mission?.archived_at);
-        setSelectedWorkFilter("");
         setProjects(data.projects);
         setAgentRuntime(data.agentRuntime);
         setAgentDirectory(data.agentDirectory ?? "");
+        setCapabilityCatalog(data.capabilityCatalog ?? []);
         setMissions(data.missions);
         const pendingByAgent = new Map();
         for (const item of data.interactions) {
@@ -837,12 +968,12 @@ export function App() {
           initialAgents, data.events, new Set(pendingByAgent.keys()), data.mission?.status,
         ));
         agentDefinitionsRef.current = data.agents;
-        setMessages(timelineEntries(data.events, data.agents));
-        oldestEventSequenceRef.current = data.events[0]?.sequence ?? null;
+        setMessages(timelineEntries(initialEvents, data.agents));
+        oldestEventSequenceRef.current = earliestSequence;
         loadedMissionIdRef.current = data.mission?.id ?? null;
-        setHasOlderEvents(Boolean(data.hasMoreEvents));
+        setHasOlderEvents(hasMoreEvents);
         setLoadingOlderEvents(false);
-        setRuns(data.events.filter((event) => event.type === "repo.test_run.started" || event.type === "repo.test_run.completed").map(mapTestRun).reverse());
+        setRuns(mapTestRuns(data.events));
         setCommandRuns(data.commandRuns ?? []);
         const mappedInteractions = data.interactions.map(mapInteraction);
         const preferredInteractionId = preferredInteractionRef.current;
@@ -876,19 +1007,24 @@ export function App() {
   }, [project.id, mission?.id, showNewChat]);
 
   useEffect(() => {
-    if (!mission?.id) { setCommandRuns([]); return undefined; }
+    if (!mission?.id) { setCommandRuns([]); setAgentRequests([]); return undefined; }
     let alive = true;
     const refresh = async () => {
       try {
-        const { runs: current } = await runtime.listCommands(mission.id);
-        if (alive) setCommandRuns(current);
+        const [{ runs: current }, { requests }] = await Promise.all([
+          runtime.listCommands(mission.id), runtime.listAgentRequests(mission.id),
+        ]);
+        if (alive) {
+          setCommandRuns(current);
+          setAgentRequests(requests);
+        }
       } catch { /* Command history will refresh when the runtime reconnects. */ }
     };
     refresh();
-    if (activeTab !== "Runs") return () => { alive = false; };
+    if (activeTab !== "Runs" && !(projectPaneOpen && projectPaneTab === "Runs")) return () => { alive = false; };
     const timer = window.setInterval(refresh, 1200);
     return () => { alive = false; window.clearInterval(timer); };
-  }, [mission?.id, activeTab]);
+  }, [mission?.id, activeTab, projectPaneOpen, projectPaneTab]);
 
   useEffect(() => {
     if (!project.id) { setSchedules([]); return undefined; }
@@ -972,12 +1108,14 @@ export function App() {
 
   const visibleMessages = useMemo(() => {
     const titles = new Map(workItemsState.map((item) => [item.workItemId, item.title]));
-    return filterTimelineMessages(messages, {
-      workItemId: selectedWorkFilter,
-      query,
-    })
-      .map((message) => ({ ...message, workItemTitle: titles.get(message.workItemId) }));
-  }, [messages, query, selectedWorkFilter, workItemsState]);
+    return filterTimelineMessages(messages, { query })
+      .map((message) => ({ ...message, workItemTitle: titles.get(message.workItemId) ?? message.workItemTitle }));
+  }, [messages, query, workItemsState]);
+  const conversationMessages = useMemo(() => filterConversationMessages(visibleMessages, messages), [visibleMessages, messages]);
+  const executionMessages = useMemo(() => {
+    const titles = new Map(workItemsState.map((item) => [item.workItemId, item.title]));
+    return messages.map((message) => ({ ...message, workItemTitle: titles.get(message.workItemId) ?? message.workItemTitle }));
+  }, [messages, workItemsState]);
 
   function notify(text) {
     setToast(text);
@@ -1092,7 +1230,6 @@ export function App() {
       setProjectPaneOpen(false);
       setMission(created);
       setActiveTab("Mission");
-      setSelectedWorkFilter("");
       notify("Chat started.");
       return true;
     } catch (error) {
@@ -1188,10 +1325,29 @@ export function App() {
     }
   }
 
-  async function selectMission(missionId) {
+  async function selectMission(missionId, selectedProject) {
     if (!missionId) return;
+    const switchingProject = selectedProject && selectedProject.id !== project.id;
+    if (switchingProject) {
+      setProjectPaneOpen(false);
+      setOpenProjectPaneTabs([]);
+      setProjectPaneTab("");
+      setCanvasDiscussionSplit(false);
+      setSelectedCanvasDocument(null);
+      setComposerDraft(null);
+      setShowNewChat(false);
+      setProject(selectedProject);
+      setMissions(selectedProject.missions ?? []);
+      setActiveTab("Mission");
+    }
     if (composerDraft?.canvasDocument?.missionId !== missionId) setComposerDraft(null);
-    const target = missions.find((item) => item.id === missionId);
+    const target = switchingProject
+      ? (selectedProject.missions ?? []).find((item) => item.id === missionId)
+      : missions.find((item) => item.id === missionId);
+    if (switchingProject && !target) {
+      notify("This chat is no longer available in that project.");
+      return false;
+    }
     if (target?.archived_at) {
       missionPausedRef.current = target.status === "paused";
       missionCompletedRef.current = true;
@@ -1506,18 +1662,18 @@ export function App() {
       setWorkItems([]);
       setInteractions([]);
       setActiveTab("Mission");
-      setCreateProjectOpen(false);
+      closeProjectCreate();
       notify(agentRuntime.enabled
         ? "Project added. Start a chat whenever you’re ready."
         : "Project added. Connect a model to start your first chat.");
     } catch (error) {
       const message = projectSetupError(error);
-      notify(`Project was not created: ${message}`);
       throw new Error(message, { cause: error });
     }
   }
 
-  function openProjectSettings(targetProject = project, section = "team") {
+  function openProjectSettings(targetProject = project, section = "team", returnFocusElement = document.activeElement) {
+    projectSettingsReturnFocusRef.current = returnFocusElement;
     if (targetProject?.id && targetProject.id !== project.id) {
       setProjectPaneOpen(false);
       setCanvasDiscussionSplit(false);
@@ -1532,6 +1688,29 @@ export function App() {
     setProjectGoalError("");
     setProjectSettingsSection(section);
     setProjectSettingsOpen(true);
+  }
+
+  function openProjectCreate(returnFocusElement = document.activeElement) {
+    projectCreateReturnFocusRef.current = returnFocusElement;
+    setCreateProjectOpen(true);
+  }
+
+  function closeProjectCreate() {
+    setCreateProjectOpen(false);
+    window.requestAnimationFrame(() => {
+      const target = projectCreateReturnFocusRef.current;
+      if (target instanceof HTMLElement && target.isConnected) target.focus({ preventScroll: true });
+      projectCreateReturnFocusRef.current = null;
+    });
+  }
+
+  function closeProjectSettings() {
+    setProjectSettingsOpen(false);
+    window.requestAnimationFrame(() => {
+      const target = projectSettingsReturnFocusRef.current;
+      if (target instanceof HTMLElement && target.isConnected) target.focus({ preventScroll: true });
+      projectSettingsReturnFocusRef.current = null;
+    });
   }
 
   function openWorkspaceSettings(section = "workspace", modelId = null) {
@@ -1906,7 +2085,7 @@ export function App() {
       setKnowledge((current) => current.some((item) => item.id === entry.id)
         ? current.map((item) => item.id === entry.id ? entry : item)
         : [...current, entry]);
-      notify("Project knowledge saved");
+      notify("Project memory saved");
       return true;
     } catch (error) {
       notify(`Knowledge was not saved: ${error.message}`);
@@ -1920,7 +2099,7 @@ export function App() {
       setKnowledgeProposals((current) => current.map((item) => item.id === proposal.id ? proposal : item));
       if (entry) setKnowledge((current) => current.some((item) => item.id === entry.id)
         ? current.map((item) => item.id === entry.id ? entry : item) : [...current, entry]);
-      notify(decision === "accept" ? "Added to project knowledge." : "Suggestion dismissed.");
+      notify(decision === "accept" ? "Added to project memory." : "Suggestion dismissed.");
     } catch (error) {
       notify(`Memory proposal could not be reviewed: ${error.message}`);
     }
@@ -1931,9 +2110,9 @@ export function App() {
     try {
       const { entry } = await runtime.archiveKnowledge(entryId, mission.id);
       setKnowledge((current) => current.map((item) => item.id === entry.id ? entry : item));
-      notify("Project knowledge archived.");
+      notify("Project memory archived.");
     } catch (error) {
-      notify(`Project knowledge could not be archived: ${error.message}`);
+      notify(`Project memory could not be archived: ${error.message}`);
     }
   }
 
@@ -1942,9 +2121,9 @@ export function App() {
     try {
       const { entry } = await runtime.restoreKnowledge(entryId, mission.id);
       setKnowledge((current) => current.map((item) => item.id === entry.id ? entry : item));
-      notify("Project knowledge restored.");
+      notify("Project memory restored.");
     } catch (error) {
-      notify(`Project knowledge could not be restored: ${error.message}`);
+      notify(`Project memory could not be restored: ${error.message}`);
     }
   }
 
@@ -2084,7 +2263,7 @@ export function App() {
       const { document } = await runtime.createCanvasDocument(mission.id);
       const sharedDocument = { ...document, mission_title: mission.title, project_id: project.id, access_mission_id: mission.id };
       setCanvasDocuments((current) => [sharedDocument, ...current.filter((item) => item.id !== document.id)]);
-      setSelectedCanvasDocument(sharedDocument);
+      openCanvasDocument(sharedDocument);
     } catch (error) {
       notify(`Document could not be created: ${error.message}`);
     }
@@ -2281,7 +2460,8 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
       agents={projectAgents}
       agentDefinitions={agents}
       artifacts={artifacts}
-      messages={visibleMessages}
+      messages={conversationMessages}
+      onOpenAgentActivity={openAgentActivity}
       query={query}
       hasOlderEvents={hasOlderEvents}
       loadingOlderEvents={loadingOlderEvents}
@@ -2309,12 +2489,21 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
       onDiscardIsolation={discardIsolation}
       onReviewOutcome={reviewMissionOutcome}
       workItems={workItemsState}
-      selectedWorkFilter={selectedWorkFilter}
-      onSelectWorkFilter={setSelectedWorkFilter}
     />;
   }
 
   function renderProjectTool(tab) {
+    if (tab === "Activity") return <AgentActivityView
+      agents={projectAgents}
+      messages={executionMessages}
+      missionId={mission?.id}
+      hasOlderEvents={hasOlderEvents}
+      loadingOlderEvents={loadingOlderEvents}
+      onLoadOlderEvents={loadOlderEvents}
+    />;
+    if (tab === "Plan") return <PlanView agents={projectAgents} project={project} mission={mission} agentConfigured={agentRuntime.enabled} workItems={workItemsState} onSelectWork={selectWork} onEditProjectGoal={openProjectGoalEditor} onConnectModel={() => openAgentSettings("model")} />;
+    if (tab === "Tests") return <TestRunsView runs={runs} />;
+    if (tab === "Runs") return <RunsView agentRequests={agentRequests} mission={mission} onStop={stopBackgroundCommand} runs={commandRuns} />;
     if (tab === "Code") return <RepositoryView artifact={selectedArtifact} agents={agents} project={project} reviewRevision={artifactReviewRevision} onBrowseRepository={() => { setSelectedArtifact(null); setSelectedCanvasDocument(null); }} />;
     if (tab === "Git") return <GitChangesView project={project} />;
     if (tab === "Preview" && selectedCanvasDocument) return <ViewErrorBoundary backLabel="Back to artifacts" key={`preview:${selectedCanvasDocument.id}`} onBack={() => { setSelectedCanvasDocument(null); chooseSecondaryPane("Artifacts"); }} title="Document preview couldn't be opened"><Suspense fallback={<div className="tab-panel column-empty">Opening shared document…</div>}><CanvasView
@@ -2328,7 +2517,7 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
     if (tab === "Preview") return <div className="project-preview-empty"><FileText size={22} /><strong>No preview selected</strong><span>Select a file in Project artifacts to view it beside the chat.</span></div>;
     if (tab === "Schedules") return <SchedulesView agentsConfigured={agentRuntime.enabled} project={project} schedules={schedules} onCreate={createSchedule} onAction={updateSchedule} onLoadMoreRuns={loadScheduleRuns} />;
     if (tab === "Knowledge") return <ProjectKnowledgeView entries={knowledge} proposals={knowledgeProposals} onSave={saveKnowledge} onReview={reviewKnowledgeProposal} onArchive={archiveKnowledge} onRestore={restoreKnowledge} />;
-    if (tab === "Artifacts" && selectedCanvasDocument) return <ViewErrorBoundary backLabel="Back to artifacts" key={`artifacts:${selectedCanvasDocument.id}`} onBack={() => setSelectedCanvasDocument(null)} title="Document preview couldn't be opened"><Suspense fallback={<div className="tab-panel column-empty">Opening shared document…</div>}><CanvasView
+    if (tab === "Artifacts" && selectedCanvasDocument && !projectPaneOpen) return <ViewErrorBoundary backLabel="Back to artifacts" key={`artifacts:${selectedCanvasDocument.id}`} onBack={() => setSelectedCanvasDocument(null)} title="Document preview couldn't be opened"><Suspense fallback={<div className="tab-panel column-empty">Opening shared document…</div>}><CanvasView
       document={selectedCanvasDocument}
       refreshKey={canvasRefreshNonce}
       requestConfirmation={requestConfirmation}
@@ -2365,11 +2554,11 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
   }
 
   function renderProjectSettingsSection(section) {
-    if (section === "team") return <AgentRolesView agents={agents} projectAgentIds={project.agentIds ?? agents.map((agent) => agent.id)} agentConfigured={agentRuntime.enabled} onCreate={(definition) => createAgentDefinition(definition, project.id)} onUpdate={updateAgentDefinition} onArchive={archiveAgentDefinition} onUpdateProjectTeam={updateProjectTeam} onConnectModel={() => openAgentSettings("model")} onManageModels={() => { setProjectSettingsOpen(false); openWorkspaceSettings("models"); }} />;
+    if (section === "team") return <AgentRolesView agents={agents} capabilityCatalog={capabilityCatalog} projectAgentIds={project.agentIds ?? agents.map((agent) => agent.id)} agentConfigured={agentRuntime.enabled} onCreate={(definition) => createAgentDefinition(definition, project.id)} onUpdate={updateAgentDefinition} onArchive={archiveAgentDefinition} onUpdateProjectTeam={updateProjectTeam} onConnectModel={() => openAgentSettings("model")} onManageModels={() => { setProjectSettingsOpen(false); openWorkspaceSettings("models"); }} />;
     if (section === "interactive") return <InteractiveAccessView onSave={saveInteractiveAccess} policy={interactiveAccess} projectName={project.name} />;
     if (section === "guidance") return <form className="project-settings-guidance" onSubmit={saveProjectGoal}>
       <label>Project goal<textarea autoFocus maxLength={10000} onChange={(event) => setProjectGoalInput(event.target.value)} rows={5} value={projectGoalInput} /></label>
-      <div className="reference-files-heading"><label htmlFor="project-reference-files">Repository files<small id="project-reference-files-help">One repository-relative path per line.{!window.__TAURI_INTERNALS__ && " In the browser preview, enter paths here; file selection is available in the desktop app."}</small></label><div><button className="button button--quiet" onClick={() => setProjectGoalReferenceFilesInput((current) => addReferenceFile(current, "README.md"))} type="button">Add README.md</button>{window.__TAURI_INTERNALS__ && project.repository && <button className="button button--quiet" onClick={() => chooseProjectReferenceFiles(project.repository, setProjectGoalReferenceFilesInput)} type="button">Choose files</button>}</div></div>
+      <div className="reference-files-heading"><label htmlFor="project-reference-files">Repository files<small id="project-reference-files-help">One repository-relative path per line.{!window.__TAURI_INTERNALS__ && " In the browser preview, enter paths here; file selection is available in the desktop app."}</small></label><div><IconButton label="Add README.md" onClick={() => setProjectGoalReferenceFilesInput((current) => addReferenceFile(current, "README.md"))}><Plus size={15} /></IconButton>{window.__TAURI_INTERNALS__ && project.repository && <IconButton label="Choose repository files" onClick={() => chooseProjectReferenceFiles(project.repository, setProjectGoalReferenceFilesInput)}><FolderSimple size={15} /></IconButton>}</div></div>
       <textarea aria-describedby="project-reference-files-help" className="project-reference-files" id="project-reference-files" maxLength={2000} onChange={(event) => setProjectGoalReferenceFilesInput(event.target.value)} placeholder={"README.md\nAGENTS.md\ndocs/architecture.md"} rows={3} value={projectGoalReferenceFilesInput} />
       {projectGoalError && <p className="settings-error" role="alert">{projectGoalError}</p>}
       <div className="dialog-actions"><button className="button button--primary" disabled={!projectGoalInput.trim()} type="submit">Save project guidance</button></div>
@@ -2402,10 +2591,8 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
 
   function renderTab() {
     if (isMissionTab && !mission) return renderMissionView();
-    if (activeTab === "Plan") return <PlanView agents={projectAgents} project={project} mission={mission} agentConfigured={agentRuntime.enabled} workItems={workItemsState} onSelectWork={selectWork} onEditProjectGoal={openProjectGoalEditor} onConnectModel={() => openAgentSettings("model")} />;
+    if (isMissionTab && mission) return renderMissionView();
     if (["Code", "Git", "Artifacts", "Schedules", "Knowledge"].includes(activeTab)) return renderProjectTool(activeTab);
-    if (activeTab === "Tests") return <TestRunsView runs={runs} />;
-    if (activeTab === "Runs") return <RunsView mission={mission} onStop={stopBackgroundCommand} runs={commandRuns} />;
     if (activeTab === "Mission" && canvasDiscussionSplit && selectedCanvasDocument) return <div className="canvas-discussion-split">
       <div className="canvas-discussion-channel">{renderMissionView()}</div>
       <div className="canvas-discussion-document"><ViewErrorBoundary backLabel="Return to chat" key={`discussion:${selectedCanvasDocument.id}`} onBack={() => { setCanvasDiscussionSplit(false); setSelectedCanvasDocument(null); }} title="Document couldn't be opened"><Suspense fallback={<div className="tab-panel column-empty">Opening shared document…</div>}><CanvasView
@@ -2418,7 +2605,7 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
       /></Suspense></ViewErrorBoundary></div>
     </div>;
     if (activeTab === "Skills") return <SkillsView skills={skills} />;
-    if (activeTab === "Agents") return <AgentRolesView agents={agents} agentConfigured={agentRuntime.enabled} onCreate={createAgentDefinition} onUpdate={updateAgentDefinition} onArchive={archiveAgentDefinition} onConnectModel={() => openAgentSettings("model")} onManageModels={() => openWorkspaceSettings("models")} />;
+    if (activeTab === "Agents") return <AgentRolesView agents={agents} capabilityCatalog={capabilityCatalog} agentConfigured={agentRuntime.enabled} onCreate={createAgentDefinition} onUpdate={updateAgentDefinition} onArchive={archiveAgentDefinition} onConnectModel={() => openAgentSettings("model")} onManageModels={() => openWorkspaceSettings("models")} />;
     if (activeTab === "Knowledge") return <ProjectKnowledgeView entries={knowledge} proposals={knowledgeProposals} onSave={saveKnowledge} onReview={reviewKnowledgeProposal} onArchive={archiveKnowledge} onRestore={restoreKnowledge} />;
     if (activeTab === "Recipes") return <WorkflowsView recipes={recipes} onSave={saveWorkflowRecipe} />;
     return renderMissionView();
@@ -2445,19 +2632,17 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
           setProjectPaneOpen(false);
           setActiveTab(tab);
         }}
-        onSelectProject={(selected) => { setProjectPaneOpen(false); setCanvasDiscussionSplit(false); setSelectedCanvasDocument(null); setComposerDraft(null); setShowNewChat(false); setProject(selected); setMissions(selected.missions ?? []); setMission(null); setActiveTab("Mission"); }}
-        onSelectMission={(missionId) => { setCanvasDiscussionSplit(false); setSelectedCanvasDocument(null); setActiveTab("Mission"); void selectMission(missionId); }}
-        onCreateProject={() => setCreateProjectOpen(true)}
-        onCreateMission={(selected = project) => { setProjectPaneOpen(false); if (selected.id !== project.id) { setProject(selected); setMissions(selected.missions ?? []); } setShowNewChat(true); setMission(null); setActiveTab("Mission"); setSelectedWorkFilter(""); }}
-        onOpenProjectSettings={(target) => openProjectSettings(target)}
+        onSelectProject={(selected) => { setProjectPaneOpen(false); setOpenProjectPaneTabs([]); setProjectPaneTab(""); setCanvasDiscussionSplit(false); setSelectedCanvasDocument(null); setComposerDraft(null); setShowNewChat(false); setProject(selected); setMissions(selected.missions ?? []); setMission(null); setActiveTab("Mission"); }}
+        onSelectMission={(missionId, selectedProject) => { setCanvasDiscussionSplit(false); setSelectedCanvasDocument(null); setActiveTab("Mission"); void selectMission(missionId, selectedProject); }}
+        onCreateProject={(event) => openProjectCreate(event.currentTarget)}
+        onCreateMission={(selected = project) => { setProjectPaneOpen(false); if (selected.id !== project.id) { setProject(selected); setMissions(selected.missions ?? []); } setShowNewChat(true); setMission(null); setActiveTab("Mission"); }}
+        onOpenProjectSettings={(target, returnFocusElement) => openProjectSettings(target, "team", returnFocusElement)}
         onArchiveMission={archiveCurrentMission}
         onRestoreMission={restoreCurrentMission}
               onDeleteMission={deleteMissionWithConfirmation}
         onDeleteProject={deleteProject}
         project={{ ...project, missions }}
         projects={projects.map((item) => item.id === project.id ? { ...item, missions } : item)}
-        gitEnabled={projectGitEnabled}
-        gitChangeCount={projectGitChangeCount}
       />
       <main className={`main-area ${isMissionTab && mission ? "main-area--mission-workspace" : ""} ${isProjectWorkspace ? "main-area--project-workspace" : ""} ${activeTab === "Code" ? "main-area--repository" : ""} ${isMissionTab && mission && activeTab === "Mission" ? "main-area--conversation" : ""} ${projectPaneOpen && mission && isMissionTab ? "main-area--project-pane-open" : ""} ${isMissionTab && mission && activeTab === "Mission" && canvasDiscussionSplit && selectedCanvasDocument ? "main-area--canvas-discussion" : ""} ${isMissionTab && !mission && activeTab === "Mission" ? "main-area--project-home" : ""}`}>
         <header className="topbar">
@@ -2486,58 +2671,50 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
               </div>}
             </div>
             {isMissionTab && mission && <label className="search-box"><MagnifyingGlass size={16} /><input aria-label="Search channel" onChange={(event) => setQuery(event.target.value)} placeholder="Search channel" value={query} /><kbd>⌘ K</kbd></label>}
-          <span aria-label={`${runtimeSurface} · ${runtimeConnection}`} className={`preview-pill ${runtimeStatus === "offline" ? "preview-pill--offline" : ""}`} title={`${runtimeSurface} · ${runtimeStatus === "connected" ? "Ready for work" : "Connection unavailable"}`}><i />{runtimeSurface}</span>
+            {isMissionTab && mission && <div className="mission-header-controls">
+              {mission.status === "completed" && !mission.archived_at && <span className="mission-status mission-status--completed" role="status"><i className="status-pulse" />Completed</span>}
+              {noAgentsReady && <IconButton className="mission-control-button mission-control-button--setup" label={`Connect a model · ${readyAgentCount} of ${agents.length} agents ready`} onClick={() => openAgentSettings("model")}><WarningCircle size={16} /></IconButton>}
+              {!mission.archived_at && mission.status !== "completed" && <IconButton className="mission-control-button" disabled={missionControlPending} label={missionControlPending ? "Updating chat" : mission.status === "paused" ? "Resume chat" : "Pause agents"} onClick={mission.status === "paused" ? resumeCurrentMission : pauseCurrentMission}>
+                {missionControlPending ? <CircleNotch className="spin" size={16} /> : mission.status === "paused" ? <Play size={16} weight="fill" /> : <Pause size={16} weight="fill" />}
+              </IconButton>}
+              {mission.archived_at ? <IconButton className="mission-control-button" disabled={missionControlPending} label={missionControlPending ? "Restoring chat" : "Restore chat"} onClick={restoreCurrentMission}>{missionControlPending ? <CircleNotch className="spin" size={16} /> : <ArrowCounterClockwise size={16} />}</IconButton>
+                : mission.status !== "active" && <IconButton className="mission-control-button" disabled={missionControlPending} label="Archive chat" onClick={archiveCurrentMission}><Archive size={16} /></IconButton>}
+            </div>}
+            {isMissionTab && mission && <div className="chat-views-menu-wrap">
+              <IconButton aria-expanded={chatViewsOpen} aria-haspopup="menu" className="chat-views-menu-button" label="Open chat views" onClick={() => setChatViewsOpen((value) => !value)}><DotsThreeVertical size={18} weight="bold" /></IconButton>
+              {chatViewsOpen && <div className="chat-views-menu" role="menu">
+                <div className="chat-views-menu-heading">Open in pane</div>
+                {chatViewMenuTools.map(({ id, label, icon: Icon }) => <button aria-current={openProjectPaneTabs.includes(id) ? "true" : undefined} className="chat-views-menu-item" key={id} onClick={() => openMissionWorkspaceTool(id)} role="menuitem" type="button">
+                  <Icon size={16} />
+                  <span>{label}</span>
+                  {openProjectPaneTabs.includes(id) && <Check aria-label="Open" size={15} />}
+                </button>)}
+              </div>}
+            </div>}
           </div>
         </header>
 
         <div className={`workspace-body ${projectPaneOpen && mission && isMissionTab ? "workspace-body--split" : ""} ${paneResizing ? "workspace-body--resizing" : ""}`} ref={workspacePaneRef} style={{ "--secondary-pane-width": `${visibleWorkspacePaneWidth}px` }}>
         <div className="workspace-primary">
 
-        {isMissionTab && mission && <div className="mission-tab-rail">
-          <nav className="top-tabs" aria-label="Chat workspace" role="tablist">
-            {tabs.map((tab) => (
-              <button
-                aria-selected={activeTab === tab}
-                aria-label={tab === "Mission" ? "Channel" : tab}
-                className={`top-tab ${activeTab === tab ? "top-tab--active" : ""}`}
-                key={tab}
-                onClick={() => setActiveTab(tab)}
-                role="tab"
-                title={tab === "Mission" ? "Channel" : tab}
-                type="button"
-              >
-                {tab === "Mission" && <ChatCircleDots size={16} />}
-                {tab === "Plan" && <ListChecks size={16} />}
-                {tab === "Tests" && <Flask size={16} />}
-                {tab === "Runs" && <ClockCounterClockwise size={16} />}
-                <span className="top-tab-label">{tab === "Mission" ? "Channel" : tab}</span>
-              </button>
-            ))}
-          </nav>
-          <div className="mission-tab-actions">
-            {noAgentsReady && <IconButton className="mission-control-button mission-control-button--setup" label={`Connect a model · ${readyAgentCount} of ${agents.length} agents ready`} onClick={() => openAgentSettings("model")}><WarningCircle size={16} /></IconButton>}
-            {mission && !mission.archived_at && mission.status !== "completed" && <IconButton className="mission-control-button" disabled={missionControlPending} label={missionControlPending ? "Updating chat" : mission.status === "paused" ? "Resume chat" : "Pause agents"} onClick={mission.status === "paused" ? resumeCurrentMission : pauseCurrentMission}>
-              {missionControlPending ? <CircleNotch className="spin" size={16} /> : mission.status === "paused" ? <Play size={16} weight="fill" /> : <Pause size={16} weight="fill" />}
-            </IconButton>}
-            {mission?.archived_at ? <IconButton className="mission-control-button" disabled={missionControlPending} label={missionControlPending ? "Restoring chat" : "Restore chat"} onClick={restoreCurrentMission}>{missionControlPending ? <CircleNotch className="spin" size={16} /> : <ArrowCounterClockwise size={16} />}</IconButton>
-              : mission && mission.status !== "active" && <IconButton className="mission-control-button" disabled={missionControlPending} label="Archive chat" onClick={archiveCurrentMission}><Archive size={16} /></IconButton>}
-            <IconButton aria-controls="secondary-workspace-pane" aria-expanded={projectPaneOpen} aria-pressed={projectPaneOpen} className={`mission-control-button workspace-pane-toggle ${projectPaneOpen ? "workspace-pane-toggle--active" : ""}`} label={projectPaneOpen ? "Hide workspace pane" : "Show workspace pane"} onClick={toggleSecondaryPane}><SidebarSimple size={18} /></IconButton>
-          </div>
-        </div>}
-
         {mission && (mission.blocked_reason || mission.recipe_id || workflowPhase) && <div className="mission-context-row">
           {mission.blocked_reason && <div className="mission-blocked-notice"><WarningCircle size={15} /><span>{mission.blocked_reason}</span><small>Waiting for your response</small></div>}
-          {(mission.recipe_id || workflowPhase) && <div className="mission-metadata">
-            {mission.recipe_id && <span className="mission-workflow-chip">Workflow · {recipes.find((recipe) => recipe.id === mission.recipe_id)?.title ?? mission.recipe_id} v{mission.recipe_version}</span>}
-            {workflowPhase && <span aria-label={`Workflow stage: ${workflowPhase.label}`} className="mission-phase-chip" title={workflowPhase.detail}>{workflowPhase.label}</span>}
-          </div>}
+          {mission.recipe_id && <MissionWorkflowProgress
+            completed={mission.status === "completed"}
+            currentStageId={workflowPhase?.stageId ?? mission.workflow_context?.stage?.stageId}
+            currentTitle={workflowPhase?.label ?? mission.workflow_context?.stage?.title ?? "Not started"}
+            stages={workflowSnapshot?.stages}
+            state={workflowPhase?.state ?? mission.workflow_context?.state?.state}
+            title={workflowSnapshot?.title ?? recipes.find((recipe) => recipe.id === mission.recipe_id)?.title ?? mission.recipe_id}
+          />}
+          {mission.recipe_id && !workflowSnapshot?.stages?.length && <span className="mission-workflow-chip">Workflow · {workflowSnapshot?.title ?? mission.recipe_id}</span>}
         </div>}
 
         <div className="tab-content">{requiresProject && !project.id ? <section className="empty-workspace">
           <span className="eyebrow">A local workspace for engineering work</span>
           <h2>Start with a repository</h2>
           <p>Bring a Git repository to plan work, collaborate with agents and keep project history together on this device.</p>
-          <button className="button button--primary" onClick={() => setCreateProjectOpen(true)} type="button"><FolderSimple size={16} /> Add a Git project</button>
+          <button className="button button--primary" onClick={(event) => openProjectCreate(event.currentTarget)} type="button"><FolderSimple size={16} /> Add a Git project</button>
           <div className="empty-workspace-links">
             <button className="empty-workspace-link" onClick={() => openWorkspaceSettings("models")} type="button"><Gear size={16} /><span><strong>Connect a model</strong><small>Choose a hosted or local model before starting agents.</small></span><CaretRight size={15} /></button>
             <button className="empty-workspace-link" onClick={() => setActiveTab("Recipes")} type="button"><ListChecks size={16} /><span><strong>Explore workflows</strong><small>The default workflow plans, builds, verifies and reviews mission work.</small></span><CaretRight size={15} /></button>
@@ -2548,13 +2725,13 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
         {projectPaneOpen && mission && isMissionTab && <>
           <div aria-label="Resize chat and workspace pane" aria-orientation="vertical" aria-valuemax={maxWorkspacePaneWidth} aria-valuemin={320} aria-valuenow={Math.round(visibleWorkspacePaneWidth)} aria-valuetext={`Workspace pane ${Math.round(visibleWorkspacePaneWidth)} pixels wide`} className="secondary-pane-resizer" onKeyDown={nudgeSecondaryPaneWidth} onLostPointerCapture={stopSecondaryPaneResize} onPointerCancel={stopSecondaryPaneResize} onPointerDown={startSecondaryPaneResize} onPointerMove={moveSecondaryPaneResize} onPointerUp={stopSecondaryPaneResize} role="separator" tabIndex={0}><DotsSixVertical aria-hidden="true" size={16} weight="bold" /></div>
           <aside aria-label={`${projectPaneTools.find((tool) => tool.id === projectPaneTab)?.label ?? "Workspace tools"} pane`} className="project-tool-pane" id="secondary-workspace-pane">
-            <div className="project-tool-pane-heading"><SecondaryPaneTabs badges={{ Git: projectGitChangeCount, Artifacts: artifactTotal, Preview: selectedArtifact ? 1 : 0 }} onSelect={chooseSecondaryPane} selected={projectPaneTab} tools={projectPaneTools} /></div>
+            <div className="project-tool-pane-heading"><SecondaryPaneTabs badges={{ Git: projectGitChangeCount, Artifacts: artifactTotal, Preview: selectedArtifact ? 1 : 0 }} onClose={closeSecondaryPaneTab} onSelect={chooseSecondaryPane} openTabs={openProjectPaneTabs} selected={projectPaneTab} tools={projectPaneTools} /></div>
             <div className="project-tool-pane-body">{renderProjectTool(projectPaneTab)}</div>
           </aside>
         </>}
         </div>
         {activeWork && <div className="work-selection" role="status">Selected task: {activeWork.title}<button onClick={() => setActiveWork(null)} type="button" aria-label="Dismiss"><X size={14} /></button></div>}
-        <input ref={fileInputRef} className="visually-hidden" onChange={handleFile} type="file" />
+        <input aria-hidden="true" ref={fileInputRef} className="visually-hidden" onChange={handleFile} tabIndex={-1} type="file" />
         {activeComputerRequest && <div className="dialog-backdrop computer-observation-backdrop" role="presentation">
           <section aria-labelledby="computer-observation-heading" aria-modal="true" className="mission-dialog computer-observation-dialog" ref={computerRequestDialogRef} role="dialog" tabIndex={-1}>
             <div className="dialog-heading"><div><span className="eyebrow">Window request</span><h2 id="computer-observation-heading">Share one window</h2></div><IconButton disabled={computerCaptureBusy} label="Close request" onClick={() => cancelComputerObservation(activeComputerRequest)}><X size={17} /></IconButton></div>
@@ -2574,7 +2751,7 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
             <div className="computer-observation-actions"><button className="button button--quiet" disabled={computerCaptureBusy} onClick={discardComputerObservation} type="button">{computerCaptureAction === "discarding" ? "Cancelling…" : "Discard and cancel"}</button><button className="button button--quiet" disabled={computerCaptureBusy || Boolean(pendingComputerObservation.artifactId)} onClick={saveComputerObservationAsArtifact} type="button">{computerCaptureAction === "saving" ? "Saving…" : pendingComputerObservation.artifactId ? "Saved to artifacts" : "Save to artifacts"}</button><button className="button button--primary" disabled={computerCaptureBusy} onClick={shareComputerObservation} type="button">{computerCaptureAction === "sharing" ? "Sharing…" : "Share with agent"}</button></div>
           </section>
         </div>}
-        {createProjectOpen && <Suspense fallback={null}><ProjectCreateDialog onClose={() => setCreateProjectOpen(false)} onCreate={createProject} /></Suspense>}
+        {createProjectOpen && <Suspense fallback={null}><ProjectCreateDialog onClose={closeProjectCreate} onCreate={createProject} /></Suspense>}
         {settingsOpen && (
           <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeAgentSettings(); }}>
             <section className="mission-dialog agent-settings-dialog" ref={agentSettingsDialogRef} role="dialog" aria-modal="true" aria-labelledby="agent-settings-heading" tabIndex={-1}>
@@ -2635,7 +2812,7 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
             </section>
           </div>
         )}
-        {projectSettingsOpen && <Suspense fallback={null}><ProjectSettingsDialog onClose={() => setProjectSettingsOpen(false)} onSectionChange={setProjectSettingsSection} project={project} section={projectSettingsSection}>{renderProjectSettingsSection}</ProjectSettingsDialog></Suspense>}
+        {projectSettingsOpen && <Suspense fallback={null}><ProjectSettingsDialog onClose={closeProjectSettings} onSectionChange={setProjectSettingsSection} project={project} section={projectSettingsSection}>{renderProjectSettingsSection}</ProjectSettingsDialog></Suspense>}
         {workspaceSettingsOpen && <Suspense fallback={null}><SettingsView agentRuntime={agentRuntime} usage={usage} webAccess={webAccess} computerAccess={computerAccess} onSaveUsageBudget={saveUsageBudget} onSaveWebAccess={saveWebAccess} onSaveComputerAccess={saveComputerAccess} onConfigureModel={(modelId, baseUrl, apiKey) => openAgentSettings("model", modelId, baseUrl, apiKey)} onSetWorkspaceDefault={setWorkspaceDefaultModel} onManageMcp={() => openAgentSettings("mcp")} onExportBackup={exportBackup} onImportBackup={importBackup} onExportAudit={exportProjectAudit} onClose={closeWorkspaceSettings} initialSection={workspaceSettingsSection} initialModelId={workspaceSettingsModelId} project={project} runtimeStatus={runtimeStatus} /></Suspense>}
       </main>
       <Toast onDismiss={() => setToast("")} text={toast} />

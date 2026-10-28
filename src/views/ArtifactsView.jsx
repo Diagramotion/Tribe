@@ -1,19 +1,23 @@
-import { ArrowClockwise, ArrowSquareOut, CircleNotch, FileText, LinkBreak, LinkSimple, MagnifyingGlass, X } from "@phosphor-icons/react";
+import { ArrowClockwise, ArrowSquareOut, CircleNotch, FileText, LinkBreak, LinkSimple, MagnifyingGlass, Plus, X } from "@phosphor-icons/react";
 import { ArtifactList } from "./MissionView.jsx";
+import { IconButton } from "../components/WorkspaceSidebar.jsx";
+import { shareableArtifacts } from "../domain/artifacts.js";
 
 export function ArtifactsView({ artifacts, total, query, loading, loadingMore, hasMore, error,
   canvasDocuments = [], missionId, linkedCanvasDocumentIds = [], linkingCanvasDocumentId, onToggleCanvasLink,
   onQueryChange, onLoadMore, onRefresh, onSelectArtifact, onSelectCanvas, onCreateCanvas, projectName }) {
   const linkedDocuments = new Set(linkedCanvasDocumentIds);
-  const hasContent = artifacts.length > 0 || canvasDocuments.length > 0;
+  const visibleArtifacts = shareableArtifacts(artifacts);
+  const hasContent = visibleArtifacts.length > 0 || canvasDocuments.length > 0;
   const showSearch = hasContent || Boolean(query.trim()) || loading;
   return (
     <section className={`tab-panel detail-view artifacts-view ${artifacts.length === 0 && canvasDocuments.length === 0 ? "artifacts-view--empty" : ""}`}>
       <div className="detail-heading artifacts-heading">
         <div><p>Documents, files and results shared across chats in {projectName}.</p></div>
         <div className="artifact-heading-actions">
-          <button className="button button--primary" disabled={!onCreateCanvas} onClick={onCreateCanvas} type="button">New document</button>
-          {total > 0 && <span className="artifact-count">Showing {artifacts.length} of {total}</span>}
+          {!missionId && <span className="artifact-action-hint">Open a chat to create a shared document.</span>}
+          <IconButton className="button--primary" disabled={!onCreateCanvas || !missionId} label="New document" onClick={onCreateCanvas} title={missionId ? "New document" : "Open a chat to create a shared document"}><Plus size={16} /></IconButton>
+          {total > 0 && <span className="artifact-count">Files &amp; results · {artifacts.length} of {total}</span>}
           <button aria-label="Refresh artifacts" className="artifact-refresh" disabled={loading} onClick={onRefresh} type="button"><ArrowClockwise size={16} /></button>
         </div>
       </div>
@@ -47,12 +51,12 @@ export function ArtifactsView({ artifacts, total, query, loading, loadingMore, h
           </div>;
         })}
       </section>}
-      {loading && artifacts.length === 0
+      {loading && visibleArtifacts.length === 0
         ? <div className="artifact-search-empty" role="status"><strong>Loading artifacts…</strong><span>Looking across this project’s chats.</span></div>
-        : error && artifacts.length === 0
+        : error && visibleArtifacts.length === 0
           ? null
-        : artifacts.length > 0
-          ? <ArtifactList artifacts={artifacts} onSelect={onSelectArtifact} />
+        : visibleArtifacts.length > 0
+          ? <ArtifactList artifacts={visibleArtifacts} onSelect={onSelectArtifact} />
           : query.trim()
             ? <div className="artifact-search-empty"><strong>No matching artifacts</strong><span>Try a different search.</span></div>
             : !hasContent && <div className="artifact-empty-state"><FileText aria-hidden="true" size={25} /><strong>No shared artifacts yet</strong><span>Documents and files shared in chats will appear here.</span></div>}

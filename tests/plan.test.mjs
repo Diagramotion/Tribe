@@ -40,120 +40,76 @@ test("team summary keeps work owned by roles that are no longer registered", () 
   assert.equal(summary[0].completedCount, 1);
 });
 
-const sdlcMission = { recipe_id: "goal-driven-sdlc", recipe_version: 6, status: "active" };
-const phaseLabel = (mission, work, context) => missionPhase(mission, work, context)?.label ?? null;
+const researchWorkflow = {
+  id: "research-map", version: 3, objective: "Produce a supported recommendation.",
+  stages: [
+    { id: "frame", title: "Frame the question", objective: "Set scope.", guide: "Agree the question." },
+    { id: "gather", title: "Gather evidence", objective: "Collect useful sources.",
+      transitions: [{ to: "frame", when: "A material gap appears" }] },
+    { id: "deliver", title: "Deliver findings", guide: "Explain the result." },
+  ],
+};
+const workflowChat = {
+  recipe_id: researchWorkflow.id, recipe_version: researchWorkflow.version,
+  recipe_snapshot: researchWorkflow, status: "active",
+};
+const phaseLabel = (mission, context = {}) => missionPhase(mission, [], context)?.label ?? null;
 
-test("mission stage follows the current finalized plan and unfinished team work", () => {
-  assert.equal(phaseLabel(sdlcMission, [], {}), "Planning");
-  const plan = { planFinalizedSequence: 4 };
-  assert.equal(phaseLabel(sdlcMission, [{ owner: "builder", status: "Ready" }], plan), "Building");
-  assert.equal(phaseLabel(sdlcMission, [], { ...plan, latestPlanChangeSequence: 5 }), "Planning");
+test("workflow progress comes from its selected definition, not a fixed SDLC tracker", () => {
+  const phase = missionPhase(workflowChat, [], {});
+  assert.equal(phase.stageId, null);
+  assert.equal(phase.label, "Not started");
+  assert.equal(phase.detail, researchWorkflow.objective);
+  assert.equal(phaseLabel({ recipe_id: "", status: "active" }), null);
 });
 
-test("v7 goal-driven missions require durable discovery before planning", () => {
-  const mission = { ...sdlcMission, recipe_version: 7 };
-  assert.equal(phaseLabel(mission, [], {}), "Discovery");
-  assert.equal(phaseLabel(mission, [], { discovery: { id: "discovery-1", sequence: 2 } }), "Planning");
-  assert.equal(phaseLabel(mission, [], {
-    discovery: { id: "discovery-2", sequence: 5 }, planFinalizedSequence: 4,
-  }), "Planning");
-});
-
-test("mission stage waits for verification after implementation completes", () => {
-  const work = [{ owner: "builder", status: "Done" }];
-  const plan = { planFinalizedSequence: 1 };
-  assert.equal(phaseLabel(sdlcMission, work, plan), "Checking");
-  assert.equal(phaseLabel(sdlcMission, work, {
-    ...plan,
-    latestChange: { id: "change-1", sequence: 2 },
-    latestSuccessfulTest: { id: "test-1", sequence: 3 },
-  }), "Review");
-});
-
-test("mission stage requires review after the latest successful test and change", () => {
-  const work = [{ owner: "builder", status: "Done" }];
-  const context = {
-    planFinalizedSequence: 1,
-    latestChange: { id: "change-1", sequence: 2 },
-    latestSuccessfulTest: { id: "test-1", sequence: 3 },
-    latestReview: {
-      id: "review-1", sequence: 4, disposition: "approved",
-      verificationEventId: "test-1", changeEventId: "change-1",
-    },
-  };
-  assert.equal(phaseLabel(sdlcMission, work, context), "Ready to finish");
-  assert.equal(phaseLabel(sdlcMission, work, {
-    ...context, latestChange: { id: "change-2", sequence: 5 },
-  }), "Checking");
-});
-
-test("reviewer-owned work remains in review and other recipes have no SDLC stage", () => {
-  const context = {
-    planFinalizedSequence: 1,
-    latestSuccessfulTest: { id: "test-1", sequence: 2 },
-  };
-  assert.equal(phaseLabel(sdlcMission, [{ owner: "reviewer", status: "Ready" }], context), "Review");
-  assert.equal(phaseLabel({ recipe_id: "bug-fix", status: "active" }, [], {}), null);
-  assert.equal(phaseLabel({ ...sdlcMission, status: "completed" }, [], {}), "Complete");
-});
-
-test("live SDLC evidence advances the compact context without retaining event history", () => {
-  let context = {};
-  const add = (type, sequence, id, payload = {}) => {
-    context = advanceMissionWorkflowContext(context, { type, sequence, id, payload });
-  };
-  add("sdlc.discovery.completed", 0, "discovery", {
-    summary: "The repository has a Python API and a small React application.", evidence: [],
+test("workflow state updates select the workflow-defined stage and guidance", () => {
+  const context = advanceMissionWorkflowContext({}, {
+    type: "workflow.state.updated", id: "event-1", sequence: 4,
+    payload: { revision: 2, state: { stage_id: "gather", values: { sources: 3 } } },
   });
-  assert.equal(context.discovery.id, "discovery");
-  add("plan.finalized", 1, "plan");
-  add("repo.file.changed", 2, "change");
-  add("repo.test_run.completed", 3, "failed-test", { exitCode: 1 });
-  assert.equal(context.latestSuccessfulTest, undefined);
-  add("repo.test_run.completed", 4, "test", { exitCode: 0 });
-  assert.equal(context.latestTest.id, "test");
-  add("review.checkpoint.recorded", 5, "review", {
-    disposition: "approved", verificationEventId: "test", changeEventId: "change",
-  });
-  assert.equal(phaseLabel(sdlcMission, [], context), "Ready to finish");
-  add("repo.test_run.completed", 6, "failed-after-review", { exitCode: 2 });
-  assert.equal(phaseLabel(sdlcMission, [], context), "Checking");
-  add("repo.test_run.completed", 7, "recheck", { exitCode: 0 });
-  assert.equal(phaseLabel(sdlcMission, [], context), "Review");
-  add("repo.worktree.integrated", 8, "integrated");
-  assert.equal(phaseLabel(sdlcMission, [], context), "Checking");
+  const phase = missionPhase(workflowChat, [], context);
+  assert.equal(phase.stageId, "gather");
+  assert.equal(phase.label, "Gather evidence");
+  assert.equal(phase.detail, "Collect useful sources.");
+  assert.deepEqual(phase.state, { stage_id: "gather", values: { sources: 3 } });
+  assert.equal(phase.revision, 2);
 });
 
-test("mission refreshes preserve newer workflow evidence when responses omit or lag it", () => {
-  const current = {
-    id: "mission-1",
-    status: "active",
-    recipe_id: "goal-driven-sdlc",
-    workflow_context: {
-      planFinalizedSequence: 4,
-      latestPlanChangeSequence: 3,
-      latestChange: { id: "change-2", sequence: 8 },
-      latestTest: { id: "test-2", sequence: 9, exitCode: 0 },
-      latestSuccessfulTest: { id: "test-2", sequence: 9 },
-      latestReview: {
-        id: "review-1", sequence: 10, disposition: "approved",
-        verificationEventId: "test-2", changeEventId: "change-2",
-      },
-    },
-  };
-  const omitted = preserveMissionWorkflowContext(current, {
-    id: "mission-1", status: "paused", recipe_id: current.recipe_id,
+test("legacy stage events and unknown workflow stage IDs remain readable", () => {
+  const context = advanceMissionWorkflowContext({}, {
+    type: "workflow.stage.changed", id: "event-1", sequence: 4,
+    payload: { stageId: "deliver", title: "Deliver findings" },
   });
-  assert.equal(phaseLabel(omitted, [], omitted.workflow_context), "Ready to finish");
+  assert.equal(phaseLabel(workflowChat, context), "Deliver findings");
+  const unknown = advanceMissionWorkflowContext({}, {
+    type: "workflow.state.updated", id: "event-2", sequence: 5,
+    payload: { revision: 1, state: { stage_id: "future-stage" } },
+  });
+  assert.equal(phaseLabel(workflowChat, unknown), "Unknown workflow stage");
+});
 
-  const lagging = mergeMissionWorkflowContext(current.workflow_context, {
-    planFinalizedSequence: 4,
-    latestChange: { id: "change-1", sequence: 7 },
-    latestTest: { id: "test-failed", sequence: 11, exitCode: 1 },
+test("workflow context merges by event sequence and stays scoped to one chat", () => {
+  const older = advanceMissionWorkflowContext({}, {
+    type: "workflow.state.updated", id: "event-old", sequence: 4,
+    payload: { revision: 1, state: { stage_id: "frame" } },
   });
-  assert.equal(lagging.latestChange.id, "change-2");
-  assert.equal(lagging.latestTest.id, "test-failed");
-  assert.equal(phaseLabel(sdlcMission, [], lagging), "Checking");
-  assert.equal(lagging.latestReview.id, "review-1");
-  assert.equal(preserveMissionWorkflowContext(current, { id: "mission-2" }).workflow_context, undefined);
+  const newer = advanceMissionWorkflowContext({}, {
+    type: "workflow.state.updated", id: "event-new", sequence: 8,
+    payload: { revision: 2, state: { stage_id: "gather" } },
+  });
+  const merged = mergeMissionWorkflowContext(newer, older);
+  assert.equal(merged.state.id, "event-new");
+  assert.equal(phaseLabel(workflowChat, merged), "Gather evidence");
+
+  const current = { id: "chat-1", recipe_id: workflowChat.recipe_id, workflow_context: newer };
+  const omitted = preserveMissionWorkflowContext(current, { id: "chat-1", status: "paused" });
+  assert.equal(phaseLabel(workflowChat, omitted.workflow_context), "Gather evidence");
+  assert.equal(preserveMissionWorkflowContext(current, { id: "chat-2" }).workflow_context, undefined);
+});
+
+test("chat completion does not infer progress or require a terminal workflow stage", () => {
+  const phase = missionPhase({ ...workflowChat, status: "completed" }, [], {});
+  assert.equal(phase.label, "Not started");
+  assert.equal(phase.chatCompleted, true);
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { filterTimelineMessages, groupActivityMessages, mapTestRun, mergeTimelineMessages, restoreAgentActivity, timelineEntries, timelineEntry, timelineMessage } from "../src/domain/activity.js";
+import { deduplicateAgentActivityMessages, filterConversationMessages, filterTimelineMessages, groupActivityMessages, mapTestRun, mapTestRuns, mergeTimelineMessages, restoreAgentActivity, timelineEntries, timelineEntry, timelineMessage } from "../src/domain/activity.js";
 
 function event(sequence, type, payload, actorId = "builder") {
   return {
@@ -14,7 +14,49 @@ function event(sequence, type, payload, actorId = "builder") {
   };
 }
 
-test("mission completion keeps acceptance criteria linked to their evidence", () => {
+test("agent chat copy hides internal run and tool identifiers", () => {
+  const message = timelineMessage(event(1, "agent.message.created", {
+    text: "The tests pass (run `7a8d9474-e130-42fe-afdd-9914ee3789a4`) after call_abcdefghijklmnop.",
+  }), []);
+  assert.equal(message.text, "The tests pass (run) after.");
+  assert.doesNotMatch(message.text, /7a8d9474|call_abcdefghijklmnop/);
+});
+
+test("shared chat keeps user posts and final agent replies out of the execution trace", () => {
+  const human = timelineEntry(event(1, "message.created", { text: "Please add CSV export." }, "user"));
+  const finalReply = timelineEntry(event(2, "agent.message.created", {
+    text: "CSV export is ready.", triggerSequence: 1, channelAudience: "conversation",
+  }));
+  const teammateDm = timelineEntry(event(3, "agent.message.created", {
+    text: "Please review the parser.", recipient: "reviewer", toolCallId: "call_123456789012",
+    channelAudience: "conversation",
+  }));
+  const activityDm = timelineEntry(event(9, "agent.message.created", {
+    text: "Internal coordination detail.", recipient: "reviewer", channelAudience: "activity",
+  }));
+  const progressPost = timelineEntry(event(4, "agent.message.created", {
+    text: "I am checking the parser.", toolCallId: "call_abcdefghijklmnop",
+  }));
+  const unclassifiedLegacyPost = timelineEntry(event(7, "agent.message.created", {
+    text: "I am still checking the parser.",
+  }));
+  const agentTriggeredReply = timelineEntry(event(8, "agent.message.created", {
+    text: "I found the parser issue.", triggerSequence: 3,
+  }));
+  const testEvent = timelineEntry(event(5, "repo.test_run.completed", { argv: ["npm", "test"], exitCode: 0 }));
+  const failedRun = timelineEntry(event(6, "agent.run.failed", { error: "Provider unavailable" }));
+
+  assert.deepEqual(filterConversationMessages([
+    human, finalReply, teammateDm, activityDm, progressPost, testEvent, failedRun,
+    unclassifiedLegacyPost, agentTriggeredReply,
+  ]).map((message) => message.id), [human.id, finalReply.id, teammateDm.id, failedRun.id]);
+  assert.equal(timelineEntry(event(3, "agent.message.created", {
+    text: "Please review the parser.", recipient: "reviewer", toolCallId: "call_123456789012",
+    triggerSequence: 1,
+  })).triggerSequence, 1);
+});
+
+test("mission completion appears as a final chat reply instead of a status card", () => {
   const checks = [{
     criterion: "The export is downloadable",
     planItems: [{ id: "task-1", title: "Create the export" }],
@@ -27,9 +69,32 @@ test("mission completion keeps acceptance criteria linked to their evidence", ()
     evidenceRefs: checks[0].evidence,
   }, "reviewer"), []);
 
-  assert.deepEqual(message.acceptanceChecks, checks);
-  assert.equal(message.acceptanceChecks[0].planItems[0].title, "Create the export");
-  assert.equal(message.acceptanceChecks[0].evidence[0].id, "artifact-1");
+  assert.equal(message.kind, "message");
+  assert.equal(message.finalSummary, true);
+  assert.equal(message.actorType, "agent");
+  assert.equal(message.text, "Export is ready");
+  assert.deepEqual(filterConversationMessages([message]), [message]);
+
+  const human = timelineEntry(event(1, "message.created", { text: "Add export support." }, "user"));
+  const completion = timelineEntry(event(3, "mission.completed", { summary: "Export support is ready." }, "planner"));
+  const response = timelineEntry(event(4, "agent.message.created", {
+    text: "Export support is ready.", triggerSequence: 1, channelAudience: "conversation",
+  }, "planner"));
+  assert.deepEqual(filterConversationMessages([human, completion, response]), [human, response]);
+  assert.deepEqual(filterConversationMessages([human, completion]), [human, completion]);
+
+  const planActivity = timelineEntry(event(2, "plan.item.created", {
+    workItem: { id: "task-1", title: "Implement export" },
+  }, "planner"));
+  const intakeAck = timelineEntry(event(3, "agent.message.created", {
+    text: "I created a plan for this work.", triggerSequence: 1, channelAudience: "conversation",
+  }, "planner"));
+  const taskReply = timelineEntry(event(4, "agent.message.created", {
+    text: "Export support is implemented.", triggerSequence: 2, channelAudience: "conversation",
+  }, "builder"));
+  const taskCompletion = timelineEntry(event(5, "mission.completed", { summary: "Export support is ready." }, "planner"));
+  assert.deepEqual(filterConversationMessages([human, planActivity, intakeAck, taskReply, taskCompletion]),
+    [human, intakeAck, taskReply, taskCompletion]);
 });
 
 test("review checkpoints show outcome and findings in mission activity", () => {
@@ -77,6 +142,21 @@ test("provider retry status is readable in mission activity", () => {
 
   assert.equal(message.text, "Builder will retry after a temporary model issue · attempt 2 of 3 in 3s");
   assert.equal(message.actorId, "builder");
+
+  const scheduled = timelineMessage(event(4, "agent.run.retrying", {
+    attempt: 4,
+    maxAttempts: 24,
+    retryDelaySeconds: 120,
+  }));
+  assert.equal(scheduled.text, "Builder will retry after a temporary model issue · attempt 4 of 24 in 2m");
+
+  const [builder] = restoreAgentActivity([{ id: "builder", status: "Ready" }], [
+    event(5, "agent.activity", {
+      status: "Retry scheduled", detail: "Temporary provider issue. Tribe will retry automatically.",
+    }, "builder"),
+  ]);
+  assert.equal(builder.status, "Retrying");
+  assert.equal(builder.next, "Temporary provider issue. Tribe will retry automatically.");
 });
 
 test("agent lanes restore in-progress work from the loaded mission events", () => {
@@ -103,17 +183,51 @@ test("failed agent activity uses product language and keeps diagnostics expandab
   assert.equal(message.canContinue, true);
 });
 
+test("failed agent activity explains the durable recovery category", () => {
+  const cases = [
+    ["transient_provider", "Builder couldn’t reach the model after retries"],
+    ["invalid_request", "Builder sent a request the model could not accept"],
+    ["usage_limit", "Builder reached a usage limit"],
+    ["tool_failure", "Builder hit a tool error"],
+    ["policy_denial", "Builder was blocked by a permission or policy check"],
+    ["unknown_side_effect", "Builder stopped with a tool effect that needs review"],
+  ];
+  for (const [failureKind, expected] of cases) {
+    const message = timelineMessage(event(3, "agent.run.failed", { failureKind }, "builder"));
+    assert.equal(message.failureKind, failureKind);
+    assert.equal(message.text, expected);
+  }
+});
+
+test("provider policy refusals are clear and do not offer a futile agent recovery action", () => {
+  const [message] = timelineEntries([
+    event(4, "agent.run.failed", {
+      error: "Invalid prompt: prompt was flagged as potentially violating our usage policy",
+    }, "planner"),
+  ]);
+
+  assert.equal(message.failureKind, "policy_denial");
+  assert.equal(message.text, "Planner's model refused this request under its usage policy");
+  assert.equal(message.canContinue, false);
+  assert.equal(message.recoveryGuidance, "Review the request wording and send a revised prompt to continue.");
+});
+
 test("mission activity distinguishes a user stop from an unexpected interruption", () => {
   const [stopped] = timelineEntries([
     event(20, "agent.run.interrupted", { cancelledByUser: true, error: "Stopped by you" }, "builder"),
   ]);
   const [interrupted] = timelineEntries([
-    event(21, "agent.run.interrupted", { cancelledByUser: false, error: "Runtime exited" }, "builder"),
+    event(21, "agent.run.interrupted", { cancelledByUser: false, error: "Runtime exited", failureKind: "unknown" }, "builder"),
+  ]);
+  const [unknownEffect] = timelineEntries([
+    event(22, "agent.run.interrupted", { cancelledByUser: false, error: "Tool stopped", failureKind: "unknown_side_effect" }, "builder"),
   ]);
 
   assert.match(stopped.text, /You stopped Builder/);
   assert.doesNotMatch(stopped.text, /unexpectedly/);
   assert.match(interrupted.text, /Builder stopped unexpectedly/);
+  assert.match(unknownEffect.text, /stopped during an action/);
+  assert.equal(unknownEffect.failureKind, "unknown_side_effect");
 });
 
 test("agent test runs distinguish cancellation and timeout from failures", () => {
@@ -126,6 +240,18 @@ test("agent test runs distinguish cancellation and timeout from failures", () =>
 
   assert.equal(cancelled.status, "Stopped");
   assert.equal(timedOut.status, "Timed out");
+});
+
+test("loaded test history merges start and completion events for one run", () => {
+  const started = event(1, "repo.test_run.started", { runId: "run-1", argv: ["pnpm", "test"] });
+  const completed = event(2, "repo.test_run.completed", {
+    runId: "run-1", argv: ["pnpm", "test"], exitCode: 1, stdout: "", stderr: "No package.json",
+  });
+
+  assert.deepEqual(mapTestRuns([started, completed]), [{
+    id: "run-1", name: "pnpm test", status: "Failed", actor: "builder", exitCode: 1,
+    output: "No package.json",
+  }]);
 });
 
 test("live tool start and finish update one timeline row in completion order", () => {
@@ -145,6 +271,36 @@ test("live tool start and finish update one timeline row in completion order", (
   assert.match(messages[1].text, /wrote a file/);
   assert.equal(messages[1].toolState, "finished");
   assert.equal(messages[1].sequence, 7);
+});
+
+test("agent activity keeps a direct message and removes its duplicate messaging tool row", () => {
+  const entries = timelineEntries([
+    event(5, "agent.tool.started", {
+      toolCallId: "tool-start", toolName: "message_agent", triggerSequence: 2,
+    }, "planner"),
+    event(6, "agent.message.created", {
+      text: "Can you implement the settings view?", recipient: "builder", triggerSequence: 2,
+      toolCallId: "message-event-call",
+    }, "planner"),
+    event(7, "agent.tool.completed", {
+      toolCallId: "tool-finish", toolName: "message_agent", triggerSequence: 2,
+    }, "planner"),
+  ]);
+
+  const visible = deduplicateAgentActivityMessages(entries);
+  assert.equal(visible.length, 1);
+  assert.equal(visible[0].recipient, "Builder");
+  assert.equal(visible[0].text, "Can you implement the settings view?");
+});
+
+test("an unfinished or unsuccessful teammate message stays visible until the DM exists", () => {
+  const entries = timelineEntries([
+    event(8, "agent.tool.started", {
+      toolCallId: "tool-pending", toolName: "message_agent", triggerSequence: 3,
+    }, "planner"),
+  ]);
+
+  assert.deepEqual(deduplicateAgentActivityMessages(entries), entries);
 });
 
 test("activity loaded across history pages merges into the original tool row", () => {
@@ -315,6 +471,51 @@ test("consecutive updates from one agent collapse under their claimed task", () 
   assert.equal(rows[0].messages.length, 3);
   assert.equal(rows[1].kind, "timeline-entry");
   assert.equal(rows[1].message.actor, "You");
+});
+
+test("agent run metadata appears only on the last message from that run", () => {
+  const entries = timelineEntries([
+    event(1, "agent.activity", { status: "Working", triggerSequence: 40 }, "planner"),
+    event(2, "agent.message.created", {
+      text: "I am assigning the implementation work.", recipient: "builder", triggerSequence: 40,
+    }, "planner"),
+    event(3, "agent.message.created", {
+      text: "The plan is ready.", triggerSequence: 40,
+    }, "planner"),
+    event(4, "agent.usage.recorded", {
+      triggerSequence: 40, input_tokens: 12_000, output_tokens: 300,
+    }, "planner"),
+    event(5, "agent.activity", { status: "Ready", triggerSequence: 40 }, "planner"),
+  ]).filter((entry) => entry.kind === "message");
+
+  assert.equal(entries[0].showRunMetrics, false);
+  assert.equal(entries[0].inputTokens, undefined);
+  assert.equal(entries[1].showRunMetrics, true);
+  assert.equal(entries[1].inputTokens, 12_000);
+  assert.equal(entries[1].outputTokens, 300);
+});
+
+test("plan activity keeps the task title separate from the action copy", () => {
+  const [entry] = timelineEntries([
+    event(6, "plan.item.created", {
+      workItem: { id: "work-3", title: "Implement the shopping list" },
+    }, "planner"),
+  ]);
+
+  assert.equal(entry.text, "Planner added task");
+  assert.equal(entry.workItemTitle, "Implement the shopping list");
+});
+
+test("a released work claim is shown as a release, not a new task", () => {
+  const [message] = timelineEntries([
+    event(20, "plan.item.released", {
+      workItem: { id: "work-2", title: "Independent review" },
+      reason: "This task belongs to the reviewer",
+    }, "builder"),
+  ]);
+
+  assert.equal(message.text, "Builder released task");
+  assert.equal(message.workItemTitle, "Independent review");
 });
 
 test("repository activity distinguishes created files and folders from edits", () => {

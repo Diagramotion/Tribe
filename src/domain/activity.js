@@ -22,6 +22,18 @@ export function formatDay(timestamp) {
   return new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric" }).format(date);
 }
 
+function userFacingAgentText(value) {
+  return String(value ?? "")
+    .replace(/(?<![A-Za-z0-9_-])(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|call_[A-Za-z0-9_-]{12,})(?![A-Za-z0-9_-])/gi, "")
+    .replace(/\s+([,.;:!?])/g, "$1")
+    .replace(/\(\s*\)|\[\s*\]/g, "")
+    .replace(/(`)\s*\1|(``)\s*\2|(```)\s*\3/g, "")
+    .replace(/\s+\)/g, ")")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 export function timelineMessage(event, agentDefinitions = initialAgents) {
   const actorType = event.actorId === "user" ? "human" : "agent";
   const actor = actorType === "human"
@@ -33,14 +45,18 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
       ? agentDefinitions.find((agent) => agent.id === recipientId || agent.role === recipientId)?.name ?? recipientId
       : null;
     return { id: event.id, kind: "message", actor, actorId: event.actorId, actorType, recipient, recipientId,
+      channelAudience: event.payload.channelAudience,
       workItemId: event.payload.workItemId, triggerSequence: event.payload.triggerSequence,
+      toolCallId: event.payload.toolCallId,
       durationMs: event.payload.durationMs,
       inputTokens: event.payload.inputTokens,
       outputTokens: event.payload.outputTokens,
       canvasDocument: event.payload.canvasDocument ?? null,
       attachments: event.payload.attachments ?? [],
       interactiveArtifactIds: event.payload.interactiveArtifactIds ?? [],
-      time: formatTime(event.createdAt), text: event.payload.text };
+      time: formatTime(event.createdAt), text: actorType === "agent"
+        ? userFacingAgentText(event.payload.text) || "Update available."
+        : event.payload.text };
   }
   if (event.type === "interactive_artifact.action.created") {
     const recipient = agentDefinitions.find((item) => item.id === event.payload.recipient)?.name
@@ -57,9 +73,10 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
   }
   if (event.type.startsWith("plan.item.")) {
     const item = event.payload.workItem;
-    const action = event.type.endsWith("claimed") ? "started" : event.type.endsWith("completed") ? "completed" : event.type.endsWith("updated") ? "updated" : "added";
-    return { id: event.id, kind: "change", actor, actorId: event.actorId, groupable: true, workItemId: item.id,
-      time: formatTime(event.createdAt), text: `${actor} ${action} task · ${item.title}` };
+    const action = event.type.endsWith("claimed") ? "started" : event.type.endsWith("completed") ? "completed" : event.type.endsWith("updated") ? "updated" : event.type.endsWith("released") ? "released" : "added";
+    return { id: event.id, kind: "change", actor, actorId: event.actorId, groupable: true,
+      workItemId: item.id, workItemTitle: item.title,
+      time: formatTime(event.createdAt), text: `${actor} ${action} task` };
   }
   if (event.type === "plan.finalized") {
     const planCriteria = (event.payload.acceptanceCriteria ?? []).map((item) =>
@@ -76,27 +93,48 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
   }
   if (event.type === "agent.run.retrying") {
     const attempt = Number.isInteger(event.payload.attempt) ? event.payload.attempt : 2;
-    const maxAttempts = Number.isInteger(event.payload.maxAttempts) ? event.payload.maxAttempts : 3;
+    const maxAttempts = Number.isInteger(event.payload.maxAttempts) ? event.payload.maxAttempts : null;
     const delay = Number.isFinite(Number(event.payload.retryDelaySeconds))
       ? Math.max(1, Math.ceil(Number(event.payload.retryDelaySeconds))) : 1;
+    const delayLabel = delay >= 60 ? `${Math.ceil(delay / 60)}m` : `${delay}s`;
     return { id: event.id, kind: "change", actor, actorId: event.actorId,
       time: formatTime(event.createdAt),
-      text: `${actor} will retry after a temporary model issue · attempt ${attempt} of ${maxAttempts} in ${delay}s` };
+      text: `${actor} will retry after a temporary model issue · attempt ${attempt}${maxAttempts ? ` of ${maxAttempts}` : ""} in ${delayLabel}` };
   }
   if (event.type === "agent.run.failed") {
     const error = String(event.payload.error ?? "");
+    const providerPolicyRefusal = /prompt was flagged|usage policy|potentially violating|content filter|safety policy/i.test(error);
+    const failureKind = String(event.payload.failureKind ?? (providerPolicyRefusal ? "policy_denial" : "unknown"));
     const tokenLimitMatch = error.match(/(?:input|total)_tokens_limit\s+(?:of\s+)?([\d,]+)/i);
     const runTokenLimit = tokenLimitMatch ? Number(tokenLimitMatch[1].replaceAll(",", "")) : null;
+    const failureText = {
+      transient_provider: `${actor} couldn’t reach the model after retries`,
+      invalid_request: `${actor} sent a request the model could not accept`,
+      usage_limit: `${actor} reached a usage limit`,
+      tool_failure: `${actor} hit a tool error`,
+      policy_denial: providerPolicyRefusal
+        ? `${actor}'s model refused this request under its usage policy`
+        : `${actor} was blocked by a permission or policy check`,
+      unknown_side_effect: `${actor} stopped with a tool effect that needs review`,
+    };
     return { id: event.id, kind: "change", actor, actorId: event.actorId,
       time: formatTime(event.createdAt),
-      text: runTokenLimit ? `${actor} reached the ${new Intl.NumberFormat().format(runTokenLimit)}-token run limit` : `${actor} couldn’t finish this response`,
-      detail: event.payload.error, runTokenLimit, canContinue: true };
+      text: runTokenLimit ? `${actor} reached the ${new Intl.NumberFormat().format(runTokenLimit)}-token run limit`
+        : failureText[failureKind] ?? `${actor} couldn’t finish this response`,
+      detail: event.payload.error, failureKind, runTokenLimit,
+      canContinue: failureKind !== "policy_denial",
+      recoveryGuidance: failureKind === "policy_denial"
+        ? "Review the request wording and send a revised prompt to continue."
+        : null };
   }
   if (event.type === "agent.run.interrupted") {
+    const failureKind = String(event.payload.failureKind ?? "unknown");
     const text = event.payload.cancelledByUser
       ? `You stopped ${actor} · review recent changes before continuing`
-      : `${actor} stopped unexpectedly · review recent changes before continuing`;
-    return { id: event.id, kind: "change", actor, actorId: event.actorId, time: formatTime(event.createdAt), text, detail: event.payload.error, canContinue: true };
+      : failureKind === "unknown_side_effect"
+        ? `${actor} stopped during an action · review its outcome before continuing`
+        : `${actor} stopped unexpectedly · review recent changes before continuing`;
+    return { id: event.id, kind: "change", actor, actorId: event.actorId, time: formatTime(event.createdAt), text, detail: event.payload.error, failureKind, canContinue: true };
   }
   if (event.type === "agent.run.cancellation.requested") {
     const stoppedAgent = agentDefinitions.find((agent) => agent.id === event.payload.agentId)?.name ?? event.payload.agentId;
@@ -119,15 +157,30 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
       create_directory: { working: "creating a folder", finished: "created a folder" },
       run_command: { working: "running a command", finished: "ran a command" },
       start_command: { working: "starting a command", finished: "started a command" },
+      read_repository_file: { working: "Reading project file", finished: "Read project file" },
+      search_repository: { working: "Searching project files", finished: "Searched project files" },
+      record_review_checkpoint: { working: "Reviewing changes", finished: "Recorded review" },
+      claim_work: { working: "Taking on a task", finished: "Took on a task" },
+      complete_work: { working: "Finishing a task", finished: "Completed a task" },
+      release_work_claim: { working: "Releasing a task", finished: "Released a task" },
+      list_plan_items: { working: "Checking the task plan", finished: "Checked the task plan" },
+      message_agent: { working: "Messaging a teammate", finished: "Messaged a teammate" },
+      reply_to_agent: { working: "Replying to a teammate", finished: "Replied to a teammate" },
+      post_update: { working: "Sharing a progress update", finished: "Shared a progress update" },
     };
-    const labels = actionLabels[tool] ?? event.payload.activityLabels
-      ?? (event.type === "agent.tool.interrupted" || event.type === "agent.tool.waiting_for_user"
-        ? { working: "using a tool" } : null);
-    if (!labels) return null;
+    const genericTool = String(tool ?? "tool").replaceAll("_", " ");
+    const normalizedTool = String(tool ?? "").toLowerCase().replaceAll(".", "_");
+    const knownLabels = actionLabels[tool]
+      ?? Object.entries(actionLabels).find(([name]) => normalizedTool.endsWith(name))?.[1];
+    const labels = knownLabels ?? event.payload.activityLabels
+      ?? { working: `Using ${genericTool}`, finished: `Finished ${genericTool}` };
     const toolState = event.type === "agent.tool.started" ? "working"
       : event.type === "agent.tool.waiting_for_user" ? "waiting"
         : event.type === "agent.tool.interrupted" ? "unknown"
           : event.payload.outcome === "denied" ? "denied" : "finished";
+    const activityTitle = toolState === "unknown" ? `Interrupted · ${labels.working}`
+      : toolState === "waiting" ? `Waiting for approval · ${labels.working}`
+        : toolState === "denied" ? `Declined · ${labels.working}` : labels[toolState];
     const detail = event.payload.summary ? ` · ${event.payload.summary}` : "";
     const text = toolState === "unknown"
       ? `${actor} was interrupted while ${labels.working}${detail} · outcome unknown`
@@ -135,11 +188,26 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
         ? `${actor} is waiting for your approval · ${labels.working}${detail}`
         : toolState === "denied"
           ? `${actor} did not run this action${detail} · approval declined`
-        : `${actor} ${labels[toolState]}${detail}`;
+          : `${actor} ${labels[toolState]}${detail}`;
     return { id: event.id, kind: "change", actor, workItemId: event.payload.workItemId,
       actorId: event.actorId, groupable: Boolean(event.payload.workItemId),
       toolCallId: event.payload.toolCallId, toolState,
+      activityTitle: activityTitle.replace(/^./, (first) => first.toLocaleUpperCase()),
+      activityDetail: userFacingAgentText(event.payload.summary),
       time: formatTime(event.createdAt), text };
+  }
+  if (event.type === "agent.activity") {
+    const status = String(event.payload.status ?? "");
+    const text = {
+      "Retry scheduled": `${actor} will retry · ${event.payload.detail ?? "temporary model issue"}`,
+      "Waiting for budget": `${actor} is waiting for the usage budget`,
+      "Waiting for you": `${actor} is waiting for your response`,
+      "Needs attention": `${actor} needs attention`,
+      Paused: `${actor} paused`,
+    }[status];
+    if (!text) return null;
+    return { id: event.id, kind: "change", actor, actorId: event.actorId,
+      triggerSequence: event.payload.triggerSequence ?? null, time: formatTime(event.createdAt), text };
   }
   if (event.type === "repo.file.changed") {
     const change = event.payload.change === "integrated" ? "Integrated"
@@ -267,6 +335,11 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
   if (event.type === "mission.created") {
     return { id: event.id, kind: "change", actor: "Tribe", time: formatTime(event.createdAt), text: "Chat started" };
   }
+  if (event.type === "mission.workflow.selected") {
+    const workflow = event.payload?.workflow;
+    return { id: event.id, kind: "change", actor, time: formatTime(event.createdAt),
+      text: `Workflow selected · ${workflow?.title ?? workflow?.id ?? "Workflow"}` };
+  }
   if (event.type === "mission.paused") {
     const text = event.payload.reason === "another mission was resumed"
       ? "Paused · another chat resumed"
@@ -292,7 +365,9 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
     return { id: event.id, kind: "change", actor: "You", time: formatTime(event.createdAt), text: "All questions and approvals resolved · team resumed" };
   }
   if (event.type === "mission.completed") {
-    return { id: event.id, kind: "change", actor, time: formatTime(event.createdAt), text: `Chat completed · ${event.payload.summary}`, acceptanceEvidence: event.payload.acceptanceEvidence ?? [], acceptanceChecks: event.payload.acceptanceChecks ?? [], evidenceRefs: event.payload.evidenceRefs ?? [] };
+    return { id: event.id, kind: "message", actor, actorId: event.actorId, actorType: "agent",
+      channelAudience: "conversation", finalSummary: true, time: formatTime(event.createdAt),
+      text: userFacingAgentText(event.payload.summary) || "The work is complete." };
   }
   if (event.type === "mission.outcome.reviewed") {
     const outcome = { accepted: "accepted", follow_up: "needs follow-up", rejected: "rejected" }[event.payload.outcome] ?? event.payload.outcome;
@@ -315,6 +390,7 @@ export function timelineEntry(event, agentDefinitions = initialAgents) {
   return {
     ...message,
     eventType: event.type,
+    triggerSequence: message.triggerSequence ?? event.payload?.triggerSequence ?? null,
     testSucceeded: event.type === "repo.test_run.completed" && event.payload.exitCode === 0,
     reviewDisposition: event.type === "review.checkpoint.recorded" ? event.payload.disposition : undefined,
     reviewVerificationEventId: event.type === "review.checkpoint.recorded"
@@ -327,6 +403,35 @@ export function timelineEntry(event, agentDefinitions = initialAgents) {
   };
 }
 
+const ACTIONABLE_CHANNEL_EVENTS = new Set([
+  "agent.run.failed",
+  "agent.run.interrupted",
+]);
+
+export function filterConversationMessages(messages, triggerContext = messages) {
+  const userTriggerSequences = new Set(triggerContext
+    .filter((message) => message.actorType === "human" || message.actorId === "user")
+    .map((message) => message.sequence)
+    .filter(Number.isInteger));
+  return messages.filter((message) => {
+    if (message.kind === "message") {
+      if (message.actorType === "human") return true;
+      if (message.finalSummary) return !messages.some((entry) =>
+        entry.kind === "message" && entry.actorType === "agent" && !entry.finalSummary
+        && entry.actorId === message.actorId && entry.sequence > message.sequence
+        && entry.channelAudience === "conversation" && !entry.recipientId && !entry.toolCallId);
+      // New events declare their audience. Legacy events are accepted only when
+      // their run was triggered by a user-authored event in this history page.
+      if (message.channelAudience) return message.channelAudience === "conversation";
+      if (message.recipientId || message.toolCallId
+          || !userTriggerSequences.has(message.triggerSequence)) return false;
+      return true;
+    }
+    return message.eventType === "interactive_artifact.action.created"
+      || ACTIONABLE_CHANNEL_EVENTS.has(message.eventType);
+  });
+}
+
 export function mergeTimelineMessages(current, incoming) {
   const merged = [...current];
   for (const message of incoming) {
@@ -336,7 +441,9 @@ export function mergeTimelineMessages(current, incoming) {
         && item.actorId === message.actorId && item.text.trim() === message.text.trim()
         && (item.triggerSequence === message.triggerSequence
           || (!Number.isInteger(item.triggerSequence) && Math.abs(item.timestamp - message.timestamp) <= 10_000)))) continue;
-    const pairedIndex = message.toolCallId
+    // Pair only lifecycle updates. A DM may share the tool call ID that sent
+    // it; merging that message into the tool row would discard its content.
+    const pairedIndex = message.kind === "change" && message.toolState && message.toolCallId
       ? merged.findIndex((item) => item.toolCallId === message.toolCallId)
       : -1;
     if (pairedIndex < 0) {
@@ -365,9 +472,14 @@ export function timelineEntries(events, agentDefinitions = initialAgents) {
   const runKey = (event) => Number.isInteger(event.payload?.triggerSequence)
     ? `${event.actorId}:${event.payload.triggerSequence}` : null;
   const runMetrics = new Map();
+  const lastMessageByRun = new Map();
   for (const event of events) {
     const key = runKey(event);
     if (!key) continue;
+    if ((event.type === "message.created" || event.type === "agent.message.created")
+      && event.actorId !== "user") {
+      lastMessageByRun.set(key, event.id);
+    }
     const metrics = runMetrics.get(key) ?? {};
     if (event.type === "agent.usage.recorded") {
       metrics.inputTokens = event.payload.input_tokens;
@@ -382,11 +494,15 @@ export function timelineEntries(events, agentDefinitions = initialAgents) {
     const entry = timelineEntry(event, agentDefinitions);
     if (!entry) return messages;
     if (entry.kind === "message" && entry.actorType === "agent" && Number.isInteger(entry.triggerSequence)) {
-      const metrics = runMetrics.get(`${event.actorId}:${entry.triggerSequence}`) ?? {};
-      entry.inputTokens ??= metrics.inputTokens;
-      entry.outputTokens ??= metrics.outputTokens;
-      if (!Number.isFinite(entry.durationMs) && Number.isFinite(metrics.startedAt) && Number.isFinite(metrics.finishedAt)) {
-        entry.durationMs = Math.max(0, metrics.finishedAt - metrics.startedAt);
+      const key = `${event.actorId}:${entry.triggerSequence}`;
+      entry.showRunMetrics = lastMessageByRun.get(key) === event.id;
+      if (entry.showRunMetrics) {
+        const metrics = runMetrics.get(key) ?? {};
+        entry.inputTokens ??= metrics.inputTokens;
+        entry.outputTokens ??= metrics.outputTokens;
+        if (!Number.isFinite(entry.durationMs) && Number.isFinite(metrics.startedAt) && Number.isFinite(metrics.finishedAt)) {
+          entry.durationMs = Math.max(0, metrics.finishedAt - metrics.startedAt);
+        }
       }
     }
     return mergeTimelineMessages(messages, [entry]);
@@ -404,9 +520,10 @@ export function restoreAgentActivity(agents, events, pendingAgentIds = new Set()
     if (agent.status === "Not configured" || agent.status === "Provider setup failed") continue;
     const payload = event.payload ?? {};
     if (event.type === "agent.activity") {
-      agent.status = payload.status;
+      agent.status = payload.status === "Retry scheduled" ? "Retrying" : payload.status;
       agent.next = payload.status === "Working" ? "Working on this chat"
         : payload.status === "Waiting for budget" ? "Monthly usage limit reached. Review the limit in Settings."
+          : payload.status === "Retry scheduled" ? payload.detail ?? "Waiting to retry a temporary model issue"
           : payload.status === "Needs attention" ? "Review the activity for details"
             : payload.status === "Paused" ? "Mission paused by you" : "Ready for the next task";
     } else if (event.type === "agent.tool.started") {
@@ -442,6 +559,24 @@ export function restoreAgentActivity(agents, events, pendingAgentIds = new Set()
     }
   }
   return agents.map((agent) => restored.get(agent.id));
+}
+
+export function deduplicateAgentActivityMessages(entries) {
+  const messageCalls = new Set(entries
+    .filter((entry) => entry.kind === "message" && entry.toolCallId)
+    .map((entry) => entry.toolCallId));
+  const directMessagesByTurn = new Set(entries
+    .filter((entry) => entry.kind === "message" && entry.recipientId && Number.isInteger(entry.triggerSequence))
+    .map((entry) => `${entry.actorId}:${entry.triggerSequence}`));
+  return entries.filter((entry) => {
+    if (!entry.eventType?.startsWith("agent.tool.") || !/messag|repl/i.test(entry.activityTitle ?? "")) return true;
+    // A direct message is the meaningful result of these tools. Their
+    // lifecycle row repeats that result, especially when legacy events did
+    // not persist the same toolCallId on both records.
+    const sameTurnHasMessage = Number.isInteger(entry.triggerSequence)
+      && directMessagesByTurn.has(`${entry.actorId}:${entry.triggerSequence}`);
+    return !messageCalls.has(entry.toolCallId) && !sameTurnHasMessage;
+  });
 }
 
 export function groupActivityMessages(messages, groupWindowMs = 180_000) {
@@ -540,5 +675,16 @@ export function mapTestRun(event) {
     exitCode: result.exitCode,
     output: [result.stdout, result.stderr].filter(Boolean).join("\n"),
   };
+}
+
+export function mapTestRuns(events) {
+  const runsById = new Map();
+  for (const event of events) {
+    if (event.type !== "repo.test_run.started" && event.type !== "repo.test_run.completed") continue;
+    const run = mapTestRun(event);
+    const previous = runsById.get(run.id);
+    if (!previous || previous.status === "Running" || run.status !== "Running") runsById.set(run.id, run);
+  }
+  return [...runsById.values()].reverse();
 }
 

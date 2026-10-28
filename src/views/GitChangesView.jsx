@@ -48,6 +48,7 @@ export function GitChangesView({ project }) {
   const [diffLoading, setDiffLoading] = useState(false);
   const [error, setError] = useState("");
   const lastDiffTarget = useRef({ projectId: "", path: "" });
+  const wrapDiffLines = /\.(?:md|markdown|mdx|txt|text|rst)$/i.test(selectedPath);
 
   const refresh = useCallback(async () => {
     if (!project?.id) return;
@@ -102,7 +103,7 @@ export function GitChangesView({ project }) {
           </nav>
           <div className="git-diff-panel">
             <div className="git-diff-heading"><span title={selectedPath}>{selectedPath || "Select a file"}</span>{selectedPath && <small>{status.files.find((file) => file.path === selectedPath)?.staged ? "Staged" : "Unstaged"}</small>}</div>
-            {diffLoading ? <div className="git-changes-empty">Loading diff…</div> : <div aria-label={`${selectedPath} diff`} className="git-diff-content" role="region" tabIndex={0}>{diff
+            {diffLoading ? <div className="git-changes-empty">Loading diff…</div> : <div aria-label={`${selectedPath} diff`} className={`git-diff-content${wrapDiffLines ? " git-diff-content--wrap" : ""}`} role="region" tabIndex={0}>{diff
               ? decorateDiff(diff).map((line) => <div className={`git-diff-line ${line.kind ? `git-diff-line--${line.kind}` : ""}`} key={line.index}>
                 <span aria-hidden="true" className="git-diff-number">{line.oldLine}</span>
                 <span aria-hidden="true" className="git-diff-number">{line.newLine}</span>

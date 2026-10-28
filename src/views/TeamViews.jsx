@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { MagnifyingGlass, Plug, Plus, Sparkle, X } from "@phosphor-icons/react";
+import { Archive, MagnifyingGlass, PencilSimple, Plug, Plus, Sparkle, X } from "@phosphor-icons/react";
 import { AgentIcon } from "./MissionView.jsx";
 import { IconButton } from "../components/WorkspaceSidebar.jsx";
 import { runtime } from "../api/runtime.js";
@@ -112,7 +112,7 @@ export function SkillsView({ skills }) {
   );
 }
 
-export function AgentRolesView({ agents, agentConfigured, projectAgentIds, onCreate, onUpdate, onArchive, onUpdateProjectTeam, onConnectModel, onManageModels }) {
+export function AgentRolesView({ agents, capabilityCatalog = [], agentConfigured, projectAgentIds, onCreate, onUpdate, onArchive, onUpdateProjectTeam, onConnectModel, onManageModels }) {
   const [id, setId] = useState("");
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
@@ -120,6 +120,7 @@ export function AgentRolesView({ agents, agentConfigured, projectAgentIds, onCre
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState("");
   const [repositoryAccess, setRepositoryAccess] = useState("workspace_write");
+  const [capabilities, setCapabilities] = useState([]);
   const [editingId, setEditingId] = useState(null);
   const [formOpen, setFormOpen] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -163,9 +164,9 @@ export function AgentRolesView({ agents, agentConfigured, projectAgentIds, onCre
     if (saving) return;
     setSaving(true);
     try {
-      const definition = { id: id.trim(), name: name.trim(), role: role.trim(), instructions: instructions.trim(), model: model.trim(), effort, repositoryAccess };
+      const definition = { id: id.trim(), name: name.trim(), role: role.trim(), instructions: instructions.trim(), model: model.trim(), effort, repositoryAccess, capabilities };
       const saved = editingId
-        ? await onUpdate(editingId, { name: definition.name, role: definition.role, instructions: definition.instructions, model: definition.model, effort: definition.effort, repositoryAccess: definition.repositoryAccess })
+        ? await onUpdate(editingId, { name: definition.name, role: definition.role, instructions: definition.instructions, model: definition.model, effort: definition.effort, repositoryAccess: definition.repositoryAccess, capabilities: definition.capabilities })
         : await onCreate(definition);
       if (saved) {
         setId("");
@@ -175,6 +176,7 @@ export function AgentRolesView({ agents, agentConfigured, projectAgentIds, onCre
         setModel("");
         setEffort("");
         setRepositoryAccess("workspace_write");
+        setCapabilities([]);
         setEditingId(null);
         setFormOpen(false);
       }
@@ -193,6 +195,7 @@ export function AgentRolesView({ agents, agentConfigured, projectAgentIds, onCre
     setModel(agent.model ?? "");
     setEffort(agent.effort ?? "");
     setRepositoryAccess(agent.repository_access ?? "workspace_write");
+    setCapabilities(agent.capabilities ?? []);
     window.requestAnimationFrame(() => document.getElementById("agent-role-form")?.scrollIntoView({ behavior: "smooth", block: "start" }));
   }
 
@@ -205,6 +208,7 @@ export function AgentRolesView({ agents, agentConfigured, projectAgentIds, onCre
     setModel("");
     setEffort("");
     setRepositoryAccess("workspace_write");
+    setCapabilities([]);
     setFormOpen(false);
   }
 
@@ -212,7 +216,7 @@ export function AgentRolesView({ agents, agentConfigured, projectAgentIds, onCre
     <section className="tab-panel detail-view">
       <div className="detail-heading">
         <div><span className="eyebrow">{projectScoped ? "Project team" : "Workspace roles"}</span><h2>{projectScoped ? "Project team" : "Agent roles"}</h2><p>{projectScoped ? "Choose which reusable roles can work in this project. Role instructions and model overrides apply anywhere the role is used." : "Create reusable roles with a clear responsibility and the right level of repository access."}</p></div>
-        <div className="agent-role-heading-actions"><span className="artifact-count">{projectScoped ? `${projectAgentIds.length} of ${agents.length} in team` : `${agents.length} roles`}</span>{!formOpen && !agentConfigured && <button className="button button--quiet" onClick={onConnectModel} type="button"><Plug size={15} /> Connect model</button>}{!formOpen && <IconButton className="agent-role-add" label="Add role" onClick={() => setFormOpen(true)}><Plus size={17} /></IconButton>}</div>
+        <div className="agent-role-heading-actions"><span className="artifact-count">{projectScoped ? `${projectAgentIds.length} of ${agents.length} in team` : `${agents.length} roles`}</span>{!formOpen && !agentConfigured && <button className="button button--quiet" onClick={onConnectModel} type="button"><Plug size={15} /> Connect model</button>}{!formOpen && <IconButton className="agent-role-add" label="Add role" onClick={() => { setCapabilities(capabilityCatalog.map((item) => item.id)); setFormOpen(true); }}><Plus size={17} /></IconButton>}</div>
       </div>
       {formOpen && <form className="knowledge-form agent-role-form" id="agent-role-form" onSubmit={submit}>
         <strong>{editingId ? `Edit ${name || editingId}` : "Create a role"}</strong>
@@ -221,6 +225,24 @@ export function AgentRolesView({ agents, agentConfigured, projectAgentIds, onCre
           <label>Name<input maxLength={200} onChange={(event) => setName(event.target.value)} placeholder="Security auditor" required value={name} /></label>
           <label>Role<input maxLength={200} onChange={(event) => setRole(event.target.value)} placeholder="Review security risks" required value={role} /></label>
         </div>
+        <fieldset className="agent-tool-permissions">
+          <legend>Capabilities</legend>
+          <p>Grant groups of related tools. The role’s repository access and approval rules still apply.</p>
+          <div className="agent-tool-permission-actions">
+            <button className="text-button" onClick={() => setCapabilities(capabilityCatalog.map((item) => item.id))} type="button">Allow all</button>
+            <button className="text-button" onClick={() => setCapabilities([])} type="button">Clear all</button>
+            <span>{capabilities.length} of {capabilityCatalog.length} allowed</span>
+          </div>
+          <div className="agent-tool-permission-grid">
+            {capabilityCatalog.map((capability) => {
+              const checked = capabilities.includes(capability.id);
+              return <label className="agent-tool-permission" key={capability.id} title={capability.description}>
+                <input aria-label={`Allow ${capability.name}`} checked={checked} onChange={() => setCapabilities((current) => checked ? current.filter((item) => item !== capability.id) : [...current, capability.id])} type="checkbox" />
+                <span>{capability.name}</span>
+              </label>;
+            })}
+          </div>
+        </fieldset>
         <div className="agent-role-fields">
           <label>Model override (optional)<select onChange={(event) => {
             const nextModel = event.target.value;
@@ -251,8 +273,9 @@ export function AgentRolesView({ agents, agentConfigured, projectAgentIds, onCre
         {agents.map((agent) => (
           <article className={`agent-role-card${projectScoped ? " agent-role-card--project-team" : ""}`} key={agent.id}>
             <span className={`agent-icon agent-icon--${agent.color}`}><AgentIcon agent={agent} size={18} /></span>
-            <div><div className="agent-role-heading"><strong>{agent.name}</strong>{agent.source === "user" && <><button className="text-button" onClick={() => edit(agent)} type="button">Edit</button><button aria-label={`Archive ${agent.name}`} className="text-button agent-archive-button" onClick={() => onArchive(agent)} type="button">Archive</button></>}</div>{agent.role?.trim() && agent.role.trim().toLocaleLowerCase() !== agent.name.trim().toLocaleLowerCase() && <p>{agent.role}</p>}<small>{agent.source === "user" ? "Custom role" : "Built-in role"} · {agent.model || "Chat or workspace model"}{agent.effort ? ` · ${agent.effort === "xhigh" ? "Extra high" : agent.effort[0].toUpperCase() + agent.effort.slice(1)} effort` : ""} · {agent.repository_access === "read_only" ? "Read only" : "Can edit repository"}</small>
+            <div><div className="agent-role-heading"><strong>{agent.name}</strong>{agent.source === "user" && <div className="agent-role-actions"><IconButton className="agent-role-edit-button" label={`Edit ${agent.name}`} onClick={() => edit(agent)}><PencilSimple size={15} /></IconButton><IconButton aria-label={`Archive ${agent.name}`} className="agent-archive-button" label={`Archive ${agent.name}`} onClick={() => onArchive(agent)}><Archive size={15} /></IconButton></div>}</div>{agent.role?.trim() && agent.role.trim().toLocaleLowerCase() !== agent.name.trim().toLocaleLowerCase() && <p>{agent.role}</p>}<small>{agent.source === "user" ? "Custom role" : "Built-in role"} · {agent.model || "Chat or workspace model"}{agent.effort ? ` · ${agent.effort === "xhigh" ? "Extra high" : agent.effort[0].toUpperCase() + agent.effort.slice(1)} effort` : ""} · {agent.repository_access === "read_only" ? "Read only" : "Can edit repository"}</small>
               {agent.instructions && <details><summary>Instructions</summary><pre>{agent.instructions}</pre></details>}
+              <details><summary>Capabilities ({agent.capabilities?.length ?? 0})</summary><p>{(agent.capabilities ?? []).map((capabilityId) => capabilityCatalog.find((item) => item.id === capabilityId)?.name ?? capabilityId).join(", ") || "No capabilities are enabled for this role."}</p></details>
             </div>
             {projectScoped && (() => {
               const required = agent.id === "planner" || agent.role.trim().toLowerCase() === "planner";

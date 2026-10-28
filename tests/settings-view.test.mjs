@@ -3,6 +3,7 @@ import test, { after, before } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
+import { isSupportedGitRemote } from "../src/domain/project-setup.js";
 
 let vite;
 const hmrPort = 40_000 + (process.pid % 5_000) * 3 + 2;
@@ -60,6 +61,21 @@ test("project creation stays limited to repository source and project name", () 
   assert.doesNotMatch(html, /Project goal|First mission|Mission goal|Workflow/);
 });
 
+test("project cloning accepts supported HTTPS and SSH remotes only", () => {
+  for (const remote of [
+    "https://github.com/owner/repository.git",
+    "ssh://git@github.com/owner/repository.git",
+    "git@github.com:owner/repository.git",
+  ]) assert.equal(isSupportedGitRemote(remote), true, remote);
+
+  for (const remote of [
+    "not-a-repository",
+    "http://github.com/owner/repository.git",
+    "https://user:password@github.com/owner/repository.git",
+    "ssh://root@github.com/owner/repository.git",
+  ]) assert.equal(isSupportedGitRemote(remote), false, remote);
+});
+
 test("usage settings show month-to-date spend and disclose unpriced runs", () => {
   const html = renderToStaticMarkup(React.createElement(SettingsView, {
     project: { id: "project-1", name: "Example", repository: "/tmp/example" },
@@ -87,4 +103,6 @@ test("usage settings show month-to-date spend and disclose unpriced runs", () =>
   assert.match(html, /By role/);
   assert.match(html, /openai:gpt-test/);
   assert.match(html, /builder/);
+  assert.match(html, /No cumulative limit by default/);
+  assert.match(html, /placeholder="No limit"/);
 });
