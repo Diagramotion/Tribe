@@ -32,9 +32,13 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
     const width = 220;
     setOpenMenu({ key, trigger: event.currentTarget, left: Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8)), top: Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - 190)) });
   }
-  useEffect(() => {
-    if (project?.id) setExpandedProjects((current) => new Set(current).add(project.id));
-  }, [project?.id]);
+  function toggleProject(itemId) {
+    setExpandedProjects((current) => {
+      const next = new Set(current);
+      next.has(itemId) ? next.delete(itemId) : next.add(itemId);
+      return next;
+    });
+  }
   useEffect(() => {
     function dismissMenu(event) {
       if (event.type === "pointerdown" && event.target.closest?.(".explorer-menu-trigger, .explorer-context-menu")) return;
@@ -71,14 +75,13 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
         {project.id && <button className="explorer-new-mission project-new-mission" onClick={() => onCreateMission(project)} type="button"><ChatCircleDots size={15} /> New chat</button>}
         <div className="project-explorer-list">
           {visibleProjects.map((item) => <div className="explorer-project" key={item.id}>
-            <div className={`explorer-project-row ${project.id === item.id ? "explorer-project-row--selected" : ""}`}>
-              <button aria-label={`${expandedProjects.has(item.id) ? "Collapse" : "Expand"} ${item.name}`} aria-expanded={expandedProjects.has(item.id)} className="explorer-disclosure" onClick={() => setExpandedProjects((current) => { const next = new Set(current); next.has(item.id) ? next.delete(item.id) : next.add(item.id); return next; })} type="button">{expandedProjects.has(item.id) ? <FolderOpen size={15} /> : <FolderSimple size={15} />}</button>
+            <div className={`explorer-project-row ${project.id === item.id ? "explorer-project-row--selected" : ""}`} onClick={() => toggleProject(item.id)}>
+              <button aria-label={`${expandedProjects.has(item.id) ? "Collapse" : "Expand"} ${item.name}`} aria-expanded={expandedProjects.has(item.id)} className="explorer-disclosure" type="button">{expandedProjects.has(item.id) ? <FolderOpen size={15} /> : <FolderSimple size={15} />}</button>
               <button aria-current={project.id === item.id ? "page" : undefined} className={`explorer-project-button ${project.id === item.id ? "explorer-project-button--selected" : ""}`} onClick={() => onSelectProject(item)} title={item.repository} type="button"><span>{item.name}</span><small>{item.missions?.length ?? 0}</small></button>
               <div className="explorer-menu-wrap">
-                <button aria-expanded={openMenu?.key === `project-${item.id}`} aria-label={`More actions for ${item.name}`} className="explorer-menu-trigger" onClick={(event) => toggleMenu(`project-${item.id}`, event)} title={`More actions for ${item.name}`} type="button"><DotsThree size={17} weight="bold" /></button>
-                {openMenu?.key === `project-${item.id}` && createPortal(<div className="explorer-context-menu" role="menu" style={{ left: openMenu.left, top: openMenu.top }}>
+                <button aria-expanded={openMenu?.key === `project-${item.id}`} aria-label={`More actions for ${item.name}`} className="explorer-menu-trigger" onClick={(event) => { event.stopPropagation(); toggleMenu(`project-${item.id}`, event); }} title={`More actions for ${item.name}`} type="button"><DotsThree size={17} weight="bold" /></button>
+                {openMenu?.key === `project-${item.id}` && createPortal(<div className="explorer-context-menu" onClick={(event) => event.stopPropagation()} role="menu" style={{ left: openMenu.left, top: openMenu.top }}>
                   <button onClick={() => { setOpenMenu(null); onCreateMission(item); }} role="menuitem" type="button"><ChatCircleDots size={15} />New chat</button>
-                  <button onClick={() => { setOpenMenu(null); onSelectProject(item); onNavigate("Mission"); }} role="menuitem" type="button"><FolderSimple size={15} />Open project</button>
                   <button onClick={() => { setOpenMenu(null); onOpenProjectSettings?.(item, openMenu?.trigger); }} role="menuitem" type="button"><Gear size={15} />Project settings</button>
                   {item.repository && <button onClick={() => { setOpenMenu(null); onSelectProject(item); onNavigate("Code"); }} role="menuitem" type="button"><FolderSimple size={15} />Open repository</button>}
                   <div className="explorer-context-menu-divider" />
