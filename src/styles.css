@@ -189,21 +189,24 @@ input::placeholder, textarea::placeholder { color: var(--muted-2); opacity: 1; }
 .explorer-add:hover { border-color: var(--line-strong); background: var(--surface-hover); color: var(--text); }
 .project-explorer-list { min-height: 0; overflow-y: auto; }
 .explorer-project { margin-bottom: 3px; }
-.explorer-project-row { min-width: 0; display: flex; align-items: center; border-radius: var(--radius-control); }
+.explorer-project-row { position: relative; min-width: 0; display: flex; align-items: center; border-radius: var(--radius-control); }
 .explorer-project-row--selected { background: var(--surface-selected); }
+.explorer-project-row:hover, .explorer-project-row:focus-within { background: var(--surface-hover); }
 .explorer-project-button, .explorer-mission, .explorer-new-mission { width: 100%; min-width: 0; display: flex; align-items: center; gap: 9px; border: 1px solid transparent; border-radius: var(--radius-control); background: transparent; color: var(--text-secondary); text-align: left; cursor: pointer; }
-.explorer-project-button { min-height: 34px; flex: 1; width: auto; padding: 0 2px 0 8px; font-size: var(--font-ui-strong); }
+.explorer-project-button { min-height: 34px; flex: 1; width: auto; padding: 0 5px 0 8px; gap: 6px; font-size: var(--font-ui-strong); }
+.explorer-project-row:hover .explorer-project-button, .explorer-project-row:focus-within .explorer-project-button { padding-right: 34px; }
 .explorer-disclosure { width: 25px; height: 27px; flex: 0 0 25px; display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent; color: var(--muted); cursor: pointer; }
-.explorer-disclosure:hover { background: var(--surface-hover); color: var(--text); }
+.explorer-disclosure:hover { background: transparent; color: var(--text); }
 .explorer-project-button > span, .explorer-mission > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .explorer-project-button > span { flex: 1; font-weight: 600; }
 .explorer-project-button small { min-width: 19px; padding: 2px 5px; border-radius: 99px; background: var(--surface-hover); color: var(--muted); font-size: var(--font-caption); text-align: center; }
 .explorer-create-chat { width: 27px; height: 27px; flex: 0 0 27px; display: inline-grid; place-items: center; border: 0; border-radius: var(--radius-compact); background: transparent; color: var(--muted); cursor: pointer; }
 .explorer-create-chat:hover, .explorer-create-chat:focus-visible { background: var(--surface-hover); color: var(--text); }
-.explorer-project-button:hover, .explorer-mission:hover, .explorer-new-mission:hover { background: var(--surface-raised); color: var(--text); }
+.explorer-project-button:hover { color: var(--text); }
+.explorer-mission:hover, .explorer-new-mission:hover { background: var(--surface-raised); color: var(--text); }
 .explorer-project-button--selected { color: var(--text); }
 .explorer-missions { margin: 2px 0 7px 15px; padding-left: 8px; border-left: 1px solid var(--line-subtle); }
-.explorer-mission { min-height: 30px; padding: 0 7px; font-size: var(--font-ui); }
+.explorer-mission { min-height: 30px; padding: 0 5px; gap: 6px; font-size: var(--font-ui); }
 .explorer-mission--selected { background: var(--surface-selected); color: var(--text); }
 .explorer-archived-toggle { width: 100%; min-height: 27px; display: flex; align-items: center; gap: 6px; padding: 0 7px; border: 0; border-radius: var(--radius-compact); background: transparent; color: var(--muted); text-align: left; font: inherit; font-size: var(--font-caption); cursor: pointer; }
 .explorer-archived-toggle:hover { background: var(--surface-raised); color: var(--text-secondary); }
@@ -1049,11 +1052,13 @@ input::placeholder, textarea::placeholder { color: var(--muted-2); opacity: 1; }
 .send-button { width: 34px; height: 34px; margin-left: 3px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 50%; background: var(--accent-primary); color: white; cursor: pointer; transition: opacity 120ms ease, transform 120ms ease; }
 .send-button:hover:not(:disabled) { background: var(--accent-primary-hover); transform: translateY(-1px); }
 .send-button:disabled { opacity: .4; cursor: not-allowed; }
-.explorer-chat-row { min-width: 0; display: flex; align-items: center; border-radius: var(--radius-control); }
-.explorer-chat-row > .explorer-mission { flex: 1; width: auto; }
-.explorer-menu-wrap { position: relative; flex: 0 0 auto; }
-.explorer-menu-trigger { width: 30px; height: 30px; display: inline-grid; place-items: center; border: 0; border-radius: var(--radius-compact); background: transparent; color: var(--text-secondary); opacity: 1; cursor: pointer; }
+.explorer-chat-row { position: relative; min-width: 0; display: flex; align-items: center; border-radius: var(--radius-control); }
+.explorer-chat-row > .explorer-mission { flex: 1; width: 100%; padding-right: 5px; }
+.explorer-chat-row:hover > .explorer-mission, .explorer-chat-row:focus-within > .explorer-mission { padding-right: 34px; }
+.explorer-menu-wrap { position: absolute; z-index: 2; top: 50%; right: 1px; flex: 0 0 auto; transform: translateY(-50%); }
+.explorer-menu-trigger { width: 28px; height: 28px; display: inline-grid; place-items: center; border: 0; border-radius: var(--radius-compact); background: var(--surface-sidebar); color: var(--text-secondary); opacity: 0; cursor: pointer; transition: opacity 100ms ease, background 100ms ease; }
 .explorer-project-row:hover .explorer-menu-trigger, .explorer-project-row:focus-within .explorer-menu-trigger, .explorer-chat-row:hover .explorer-menu-trigger, .explorer-chat-row:focus-within .explorer-menu-trigger, .explorer-menu-trigger[aria-expanded="true"] { opacity: 1; }
+.explorer-menu-trigger:focus-visible { opacity: 1; outline: 2px solid var(--focus-ring); outline-offset: 1px; }
 .explorer-menu-trigger:hover, .explorer-menu-trigger[aria-expanded="true"] { background: var(--surface-control-hover); color: var(--text); }
 .explorer-context-menu { position: fixed; z-index: 100; width: 220px; padding: 5px; border: 1px solid var(--line-subtle); border-radius: 9px; background: var(--surface-soft); box-shadow: 0 12px 28px #0008; }
 .explorer-context-menu button { width: 100%; min-height: 34px; padding: 0 9px; display: flex; align-items: center; gap: var(--space-2); border: 0; border-radius: var(--radius-compact); background: transparent; color: var(--text-secondary); font: inherit; font-size: var(--font-ui); text-align: left; cursor: pointer; }
