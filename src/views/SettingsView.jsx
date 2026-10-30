@@ -36,6 +36,13 @@ const modelProviderLabels = { openai: "OpenAI", anthropic: "Anthropic", google: 
 const modelProviders = Object.keys(modelProviderLabels);
 const modelProviderLogos = { openai: openaiLogo, anthropic: anthropicLogo, google: googleLogo, groq: groqLogo, mistral: mistralLogo, deepseek: deepseekLogo, openrouter: openrouterLogo, xai: xaiLogo, cerebras: cerebrasLogo, cohere: cohereLogo, fireworks: fireworksLogo, together: togetherLogo, ollama: ollamaLogo };
 const lightModelProviderLogos = new Set(["xai", "cohere"]);
+const imageGenerationOptions = [
+  { id: "openai:gpt-image-2.5-flare", provider: "openai", label: "OpenAI · GPT Image 2.5 Flare · Fast" },
+  { id: "openai:gpt-image-2.5-sunburst", provider: "openai", label: "OpenAI · GPT Image 2.5 Sunburst · Precision" },
+  { id: "openai:gpt-image-2", provider: "openai", label: "OpenAI · GPT Image 2" },
+  { id: "google:gemini-3.1-flash-image", provider: "google", label: "Google · Gemini 3.1 Flash Image" },
+  { id: "xai:grok-imagine-image", provider: "xai", label: "xAI · Grok Imagine" },
+];
 
 function UsageBreakdown({ heading, items, nameKey }) {
   return <section className="usage-breakdown">
@@ -233,6 +240,10 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
   const [modelCatalogLoading, setModelCatalogLoading] = useState(false);
   const [modelCatalogError, setModelCatalogError] = useState("");
   const [modelToggleBusy, setModelToggleBusy] = useState(null);
+  const [imageGenerationModel, setImageGenerationModel] = useState("");
+  const [imageGenerationDraft, setImageGenerationDraft] = useState("");
+  const [imageGenerationSaving, setImageGenerationSaving] = useState(false);
+  const [imageGenerationError, setImageGenerationError] = useState("");
   const providerCheckRequest = useRef(0);
   const [backupPending, setBackupPending] = useState(false);
   const [backupError, setBackupError] = useState("");
@@ -339,6 +350,14 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
     }).finally(() => {
       if (current) setProviderConnectionsLoading(false);
     });
+    runtime.getSettings().then((settings) => {
+      if (current) {
+        setImageGenerationModel(settings.imageGenerationModel ?? "");
+        setImageGenerationDraft(settings.imageGenerationModel ?? "");
+      }
+    }).catch((error) => {
+      if (current) setImageGenerationError(error.message || "Image settings could not be loaded.");
+    });
     return () => { current = false; };
   }, [activeSection, agentRuntime.model]);
   useEffect(() => {
@@ -392,6 +411,25 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
       setModelToggleBusy(null);
     }
   }
+  async function saveImageGenerationModel(event) {
+    event.preventDefault();
+    setImageGenerationSaving(true);
+    setImageGenerationError("");
+    try {
+      const { model } = await runtime.setImageGenerationModel(imageGenerationDraft);
+      setImageGenerationModel(model);
+      setImageGenerationDraft(model);
+    } catch (error) {
+      const messages = {
+        image_generation_model_unsupported: "Choose a supported image model.",
+        image_generation_provider_disabled: "Enable that provider before using its image model.",
+        image_generation_provider_not_configured: "Connect that provider and save an API key first.",
+      };
+      setImageGenerationError(messages[error.message] ?? "Image settings could not be saved.");
+    } finally {
+      setImageGenerationSaving(false);
+    }
+  }
   async function toggleProvider(connection) {
     const enabled = connection.enabled === false;
     setProviderToggleBusy(connection.id);
@@ -401,8 +439,10 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
       setProviderConnections((current) => current.map((item) => item.id === updated.id ? { ...item, ...updated } : item));
       setModelCatalog((current) => current.map((model) => model.provider === updated.id ? { ...model, providerEnabled: enabled } : model));
     } catch (error) {
-      setConnectionError(error.message === "provider_is_in_use"
-        ? "Choose another workspace default and remove this provider from agent profiles before turning it off."
+      setConnectionError(error.message === "image_generation_provider_in_use"
+        ? "Choose another image model before turning this provider off."
+        : error.message === "provider_is_in_use"
+          ? "Choose another workspace default and remove this provider from agent profiles before turning it off."
         : `Provider could not be updated: ${error.message}`);
     } finally {
       setProviderToggleBusy("");
@@ -626,6 +666,7 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
   const providerRows = [...new Set([...modelProviders, ...providerConnections.map((item) => item.id)])]
     .filter((id) => `${modelProviderLabels[id] ?? id} ${id}`.toLowerCase().includes(providerSearch.trim().toLowerCase()))
     .map((id) => providerConnections.find((item) => item.id === id) ?? { id, status: "not_configured", modelCount: 0, enabled: false });
+  const imageProviderState = new Map(providerConnections.map((connection) => [connection.id, connection]));
   const selectedProviderInResults = providerRows.some((provider) => provider.id === selectedProvider);
   const selectedProviderId = connectionProvider.trim().toLowerCase();
   const selectedProviderConnection = providerConnections.find((connection) => connection.id === selectedProviderId);
@@ -697,6 +738,23 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
             </section>
           </>}
           {activeSection === "models" && <div className="model-default-summary"><span className="settings-symbol"><Sparkle size={17} /></span><div><strong>Workspace default</strong><small>{agentRuntime.configured ? agentRuntime.model : "Auto · used when a chat or role has no model override"}</small></div><span aria-live="polite" className={`provider-readiness provider-readiness--${providerReadiness.tone}`} role="status"><i aria-hidden="true" />{providerReadiness.label}</span><div className="provider-actions">{allowedAgentModels.length > 0 && <IconButton label={agentRuntime.configured ? "Change workspace default" : "Choose workspace default"} onClick={() => { const model = modelCatalog.find((entry) => entry.id === agentRuntime.model) ?? allowedAgentModels[0]; setSelectedProvider(model.provider); setSelectedModelId(model.id); setProviderFormOpen(false); }}><PencilSimple size={15} /></IconButton>}<IconButton disabled={!agentRuntime.configured || providerChecking} label={providerChecking ? "Testing connection" : "Test connection"} onClick={checkProvider}><ArrowClockwise size={15} /></IconButton></div></div>}
+          {activeSection === "models" && <section className="settings-card image-generation-settings">
+            <div className="settings-card-heading"><span className="settings-symbol"><ImageIcon size={17} /></span><div><h3>Image generation</h3><p>Use native image support when the chat model has it. Choose a connected image model as a fallback for other models.</p></div></div>
+            <form className="image-generation-form" onSubmit={saveImageGenerationModel}>
+              <label htmlFor="workspace-image-model">Fallback image model</label>
+              <select id="workspace-image-model" onChange={(event) => setImageGenerationDraft(event.target.value)} value={imageGenerationDraft}>
+                <option value="">Native support only</option>
+                {imageGenerationOptions.map((option) => {
+                  const connection = imageProviderState.get(option.provider);
+                  const ready = connection?.enabled !== false && Boolean(connection?.credentialAvailable);
+                  return <option disabled={!ready} key={option.id} value={option.id}>{option.label}{ready ? "" : " · connect provider first"}</option>;
+                })}
+              </select>
+              {imageGenerationError && <p className="recipe-error" role="alert">{imageGenerationError}</p>}
+              <p className="settings-note">The selected provider uses its saved API key. Image generation remains available only to roles granted the Image generation capability.</p>
+              <button className="button button--quiet" disabled={imageGenerationSaving || imageGenerationDraft === imageGenerationModel} type="submit">{imageGenerationSaving ? "Saving…" : "Save image model"}</button>
+            </form>
+          </section>}
           {activeSection === "models" && <section className="settings-card provider-connections-card model-settings-workspace" id="provider-connections-card">
             <div className="provider-connections-heading"><div className="settings-card-heading"><span className="settings-symbol"><Plug size={17} /></span><div><h3>Providers</h3></div></div>{!providerConnectionsLoading && <IconButton label="Add custom provider" onClick={(event) => {
               setConnectionProvider("");
@@ -757,7 +815,7 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
           </section>}
           {activeSection === "connections" && <>
             <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><Plug size={17} /></span><div><h3>Connected services</h3><p>{project.name ? `Services agents can use in ${project.name}. Changes that affect data need your approval.` : "Choose a project to manage its connected services."}</p></div><IconButton disabled={!project.id} label="Manage connections" onClick={onManageMcp}><Plug size={15} /></IconButton></div></section>
-            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><MagnifyingGlass size={17} /></span><div><h3>Web and browser access</h3><p>Allow agents to research public websites or use the project’s browser. Search, page fetches and browser actions still follow approval rules.</p></div></div><form className="usage-budget-form web-access-form" onSubmit={saveWebAccess}><label className="web-access-toggle"><button aria-checked={webEnabled} className="web-access-switch" disabled={!project.id} onClick={() => setWebEnabled((enabled) => !enabled)} role="switch" type="button"><span /></button><span>Allow website access</span></label><label htmlFor="web-allowed-domains">Allowed websites <small>Enter exact hostnames, one per line. Browser access is unavailable until at least one is listed.</small></label><textarea disabled={!project.id} id="web-allowed-domains" onChange={(event) => setWebDomains(event.target.value)} placeholder={"docs.python.org\nreact.dev"} rows={3} value={webDomains} /><p className="settings-note">Browser site limits are a guardrail; redirects can leave the list. Navigation and changes in the browser still need your approval.</p>{webError && <p className="recipe-error" role="alert">{webError}</p>}<div className="web-access-footer"><button className="button button--quiet" disabled={!project.id || webSaving} type="submit">{webSaving ? "Saving…" : "Save website settings"}</button></div></form></section>
+            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><MagnifyingGlass size={17} /></span><div><h3>Web and browser access</h3><p>Allow agents to research public websites or use the project’s browser. Search, page fetches and browser actions still follow approval rules.</p></div></div><form className="usage-budget-form web-access-form" onSubmit={saveWebAccess}><label className="web-access-toggle"><button aria-checked={webEnabled} className="web-access-switch" disabled={!project.id} onClick={() => setWebEnabled((enabled) => !enabled)} role="switch" type="button"><span /></button><span>Allow website access</span></label><label htmlFor="web-allowed-domains">Allowed websites <small>Enter exact hostnames, one per line. Browser access is unavailable until at least one is listed.</small></label><textarea disabled={!project.id} id="web-allowed-domains" onChange={(event) => setWebDomains(event.target.value)} placeholder={"docs.python.org\nreact.dev"} rows={3} value={webDomains} /><p className="settings-note">Agents can access only these exact hostnames. Your own browser navigation is not restricted by this list.</p>{webError && <p className="recipe-error" role="alert">{webError}</p>}<div className="web-access-footer"><button className="button button--quiet" disabled={!project.id || webSaving} type="submit">{webSaving ? "Saving…" : "Save website settings"}</button></div></form></section>
           </>}
           {activeSection === "commands" && <section className="settings-card command-tools-card"><div className="settings-card-heading"><span className="settings-symbol"><TerminalWindow size={17} /></span><div><h3>Project command tools</h3><p>Choose extra executables for background runs in {project.name || "this project"}. Tribe runs each command in the repository folder with your account's file and network access.</p></div></div>{!project.id ? <p className="settings-note">Choose a project to manage its command tools.</p> : <><form className="command-tools-form" onSubmit={addCommandTool}><label htmlFor="project-command-tool">Executable name</label><div><input autoComplete="off" id="project-command-tool" maxLength={128} onChange={(event) => setCommandToolInput(event.target.value)} placeholder="terraform, gh, or a tool on PATH" value={commandToolInput} /><button className="button button--quiet" disabled={commandToolsSaving || !/^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/.test(commandToolInput.trim()) || commandTools.includes(commandToolInput.trim())} type="submit">Add tool</button></div><small>Enter a command name only, without a path or arguments. You start each background run.</small></form>{commandToolsError && <p className="recipe-error" role="alert">{commandToolsError}</p>}{commandToolsLoading ? <p className="settings-note">Loading command tools…</p> : commandTools.length ? <ul className="command-tool-list">{commandTools.map((executable) => <li key={executable}><code>{executable}</code><button className="text-button" disabled={commandToolsSaving} onClick={() => saveCommandTools(commandTools.filter((item) => item !== executable))} type="button">Remove</button></li>)}</ul> : <p className="settings-note">No extra tools approved. Tribe's built-in command set remains available.</p>}</>}</section>}
           {activeSection === "desktop" && <><section className="settings-card desktop-access-card"><div className="settings-card-heading"><span className="settings-symbol"><DesktopTower size={17} /></span><div><h3>Desktop access</h3><p>Check whether this device can support app inspection. This check does not capture the screen or control apps.</p></div></div><button className="button button--quiet" disabled={!window.__TAURI_INTERNALS__ || desktopAccessChecking} onClick={checkDesktopAccess} type="button">{desktopAccessChecking ? "Checking…" : "Check access"}</button>{!window.__TAURI_INTERNALS__ && <p className="settings-note">Available in the desktop app.</p>}{desktopAccessError && <p className="recipe-error" role="alert">{desktopAccessError}</p>}{desktopAccess && <div className="desktop-access-results" role="status"><p><strong>Screen capture</strong><span>{formatPermission(desktopAccess.screenCapture.permission)}</span><small>{desktopAccess.screenCapture.detail}</small>{desktopAccess.platform === "macos" && <button className="button button--quiet desktop-access-settings-link" onClick={() => openDesktopPrivacySettings("screen_capture")} type="button">Open Screen Recording settings</button>}</p><p><strong>Accessibility</strong><span>{formatPermission(desktopAccess.accessibility.permission)}</span><small>{desktopAccess.accessibility.detail}</small>{desktopAccess.platform === "macos" && <button className="button button--quiet desktop-access-settings-link" onClick={() => openDesktopPrivacySettings("accessibility")} type="button">Open Accessibility settings</button>}</p>{desktopAccess.adapterAvailable ? <p className="settings-note">One-shot window screenshots use the macOS system picker. Accessibility data and app controls are not available.</p> : <p className="settings-note">Window selection depends on this app’s WebView on this platform. Packaged support is not yet verified; accessibility data and app controls are not available.</p>}</div>}</section><section className="settings-card computer-access-card"><div className="settings-card-heading"><span className="settings-symbol"><DesktopTower size={17} /></span><div><h3>Computer use for this project</h3><p>Let agents ask to inspect a window you choose. Each request opens the system picker; Tribe never captures in the background.</p></div></div><form className="computer-access-form" onSubmit={saveComputerAccess}><label className="computer-access-toggle"><input checked={computerEnabled} disabled={!project.id} onChange={(event) => setComputerEnabled(event.target.checked)} role="switch" type="checkbox" /><span className="computer-access-switch" aria-hidden="true" /><span>Allow agents to request a window observation</span></label>{computerError && <p className="recipe-error" role="alert">{computerError}</p>}<button className="button button--quiet" disabled={!project.id || computerSaving || computerEnabled === Boolean(computerAccess?.enabled)} type="submit">{computerSaving ? "Saving…" : "Save access"}</button></form></section></>}

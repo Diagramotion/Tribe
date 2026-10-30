@@ -12,7 +12,7 @@ export default defineConfig({
     host: "127.0.0.1",
     allowedHosts: ["terminal.local"],
     proxy: {
-      "/api": "http://127.0.0.1:4317",
+      "/api": `http://127.0.0.1:${process.env.TRIBE_PORT || "4317"}`,
     },
     warmup: {
       clientFiles: ["./src/main.jsx"],

@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import { Check, Copy, WarningCircle } from "@phosphor-icons/react";
 import { languageLoaders } from "./ReadOnlyCodeEditor.jsx";
 import { DiagramPreview } from "./DiagramPreview.jsx";
+import { ChartPreview, parseChartSpec } from "./ChartPreview.jsx";
 
 const codeFenceLanguageAliases = {
   javascript: "js", javascriptreact: "jsx", js: "js", jsx: "jsx",
@@ -19,7 +20,7 @@ const codeFenceLanguageLabels = {
   js: "JavaScript", jsx: "JSX", json: "JSON", jsonc: "JSON", md: "Markdown", markdown: "Markdown",
   py: "Python", python: "Python", rust: "Rust", rs: "Rust", scss: "SCSS", sh: "Shell", shell: "Shell",
   diff: "Diff", sql: "SQL", ts: "TypeScript", typescript: "TypeScript", typescriptreact: "TSX", tsx: "TSX",
-  xml: "XML", yaml: "YAML", yml: "YAML", zsh: "Zsh", mermaid: "Mermaid",
+  xml: "XML", yaml: "YAML", yml: "YML", zsh: "Zsh", mermaid: "Mermaid", chart: "Chart",
 };
 
 function HighlightedCode({ source, language }) {
@@ -78,9 +79,10 @@ function MarkdownCodeBlock({ children, node: _node, ...props }) {
 
   const copyLabel = copyStatus === "copied" ? "Code copied" : copyStatus === "failed" ? "Could not copy code" : "Copy code";
 
-  return <div className={`message-code-block${sourceLanguage === "diff" ? " message-code-block--diff" : ""}`}>
+  const chartSpec = sourceLanguage === "chart" ? parseChartSpec(codeText) : null;
+  return <div className={`message-code-block${sourceLanguage === "diff" ? " message-code-block--diff" : ""}${chartSpec ? " message-code-block--chart" : ""}`}>
     <div className="message-code-toolbar"><span>{languageLabel}</span><button aria-live="polite" aria-label={copyLabel} className={`message-code-copy ${copyStatus === "failed" ? "message-code-copy--failed" : ""}`} title={copyStatus === "copied" ? "Copied" : copyStatus === "failed" ? copyLabel : "Copy code"} onClick={copyCode} type="button">{copyStatus === "copied" ? <Check size={14} /> : copyStatus === "failed" ? <WarningCircle size={14} /> : <Copy size={14} />}</button></div>
-    {sourceLanguage === "mermaid" ? <DiagramPreview source={codeText} /> : sourceLanguage === "diff" ? <pre {...props}><DiffCode source={codeText} /></pre> : <pre {...props}><HighlightedCode language={language} source={codeText} /></pre>}
+    {chartSpec ? <ChartPreview source={codeText} spec={chartSpec} /> : sourceLanguage === "mermaid" ? <DiagramPreview source={codeText} /> : sourceLanguage === "diff" ? <pre {...props}><DiffCode source={codeText} /></pre> : <pre {...props}><HighlightedCode language={language} source={codeText} /></pre>}
   </div>;
 }
 

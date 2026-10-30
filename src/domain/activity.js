@@ -54,6 +54,7 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
       canvasDocument: event.payload.canvasDocument ?? null,
       attachments: event.payload.attachments ?? [],
       interactiveArtifactIds: event.payload.interactiveArtifactIds ?? [],
+      imageArtifactIds: event.payload.imageArtifactIds ?? [],
       time: formatTime(event.createdAt), text: actorType === "agent"
         ? userFacingAgentText(event.payload.text) || "Update available."
         : event.payload.text };
@@ -167,6 +168,10 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
       message_agent: { working: "Messaging a teammate", finished: "Messaged a teammate" },
       reply_to_agent: { working: "Replying to a teammate", finished: "Replied to a teammate" },
       post_update: { working: "Sharing a progress update", finished: "Shared a progress update" },
+      analyze_tabular_artifact: { working: "Profiling attached data", finished: "Profiled attached data" },
+      aggregate_tabular_artifact: { working: "Summarising attached data", finished: "Summarised attached data" },
+      extract_pdf_pages: { working: "Reading PDF pages", finished: "Read PDF pages" },
+      extract_pdf_tables: { working: "Extracting PDF tables", finished: "Extracted PDF tables" },
     };
     const genericTool = String(tool ?? "tool").replaceAll("_", " ");
     const normalizedTool = String(tool ?? "").toLowerCase().replaceAll(".", "_");

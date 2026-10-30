@@ -20,6 +20,7 @@ import {
   FileText,
   Flask,
   FolderSimple,
+  Globe,
   Gear,
   GitDiff,
   GitBranch,
@@ -44,7 +45,7 @@ import {
   tabs,
 } from "./data/workspace.js";
 import { runtime } from "./api/runtime.js";
-import { inlineImagePreview } from "./domain/artifact-preview.js";
+import { inlineImagePreview, playableMediaKind } from "./domain/artifact-preview.js";
 import { chatTitleFromPrompt, compactChatTitle } from "./domain/chat-title.js";
 import { captureSelectedWindow } from "./domain/computerCapture.js";
 import {
@@ -89,33 +90,60 @@ const ProjectKnowledgeView = lazy(() => import("./views/ProjectKnowledgeView.jsx
 const InteractiveAccessView = lazy(() => import("./views/InteractiveAccessView.jsx").then((module) => ({ default: module.InteractiveAccessView })));
 const TestRunsView = lazy(() => import("./views/TestRunsView.jsx").then((module) => ({ default: module.TestRunsView })));
 const WorkflowsView = lazy(() => import("./views/WorkflowsView.jsx").then((module) => ({ default: module.WorkflowsView })));
+const BrowserView = lazy(() => import("./views/BrowserView.jsx").then((module) => ({ default: module.BrowserView })));
 const secondaryPaneTools = [
+  { id: "Browser", label: "Browser", icon: Globe },
   { id: "Activity", label: "Agent activity", icon: UsersThree },
   { id: "Plan", label: "Plan", icon: ListChecks },
   { id: "Tests", label: "Tests", icon: Flask },
   { id: "Runs", label: "Runs", icon: ClockCounterClockwise },
   { id: "Code", label: "Repository", icon: FolderSimple },
+  { id: "Browser", label: "Browser", icon: Globe },
   { id: "Git", label: "Git changes", icon: GitBranch },
   { id: "Artifacts", label: "Artifacts", icon: SquaresFour },
   { id: "Preview", label: "Artifact preview", icon: FileText },
 ];
 function MissionWorkflowProgress({ stages, currentStageId, currentTitle, title, state, completed }) {
   if (!Array.isArray(stages) || stages.length === 0) return null;
-  const completedStages = new Set(state?.values?.completed_stage_ids ?? []);
+  const hasCompletionTracking = Array.isArray(state?.values?.completed_stage_ids);
+  const completedStages = new Set(hasCompletionTracking ? state.values.completed_stage_ids : []);
+  const completedCount = stages.filter((stage) => completedStages.has(stage.id)).length;
+  const progressLabel = hasCompletionTracking
+    ? `${completedCount} of ${stages.length} stages complete`
+    : "Stage completion not recorded";
+  const statusLabel = completed
+    ? currentStageId ? `Chat complete · last stage: ${currentTitle}` : "Chat complete · no stage recorded"
+    : currentTitle;
   return <section aria-label={`${title} workflow · ${completed ? "Chat complete" : currentTitle}`} className="mission-workflow-progress">
-    <div className="mission-workflow-progress-heading"><GitBranch size={14} /><span>{title}</span><strong>{completed ? "Chat complete" : currentTitle}</strong></div>
+    <div className="mission-workflow-progress-heading">
+      <span className="mission-workflow-name"><GitBranch size={14} />{title}</span>
+      <strong aria-atomic="true" aria-live="polite">{statusLabel}</strong>
+      <span className="mission-workflow-count">{progressLabel}</span>
+    </div>
     <ol aria-label="Workflow stages">
       {stages.map((stage, index) => {
         const complete = completedStages.has(stage.id);
-        const current = !completed && stage.id === currentStageId;
-        return <li aria-current={current ? "step" : undefined} className={`${complete ? "mission-workflow-step--complete" : ""} ${current ? "mission-workflow-step--current" : ""}`.trim()} key={stage.id}>
+        const current = stage.id === currentStageId;
+        return <li aria-current={current && !completed ? "step" : undefined} className={`${complete ? "mission-workflow-step--complete" : ""} ${current ? "mission-workflow-step--current" : ""}`.trim()} key={stage.id}>
           <span aria-hidden="true" className="mission-workflow-step-marker">{complete ? <Check size={11} weight="bold" /> : index + 1}</span>
           <span>{stage.title}</span>
-          {stage.transitions?.length > 0 && <small>Next: {stage.transitions.map((edge) => typeof edge === "string" ? edge : edge.to).join(", ")}</small>}
         </li>;
       })}
     </ol>
   </section>;
+}
+
+function runtimeConnectionLabel(status) {
+  if (status === "connected") return "Runtime connected";
+  if (status === "offline") return "Runtime offline";
+  return status === "connecting" ? "Connecting to runtime" : "Reconnecting to runtime";
+}
+
+function runtimeConnectionText(status) {
+  if (status === "offline") return "Offline";
+  if (status === "connecting") return "Connecting";
+  if (status === "reconnecting") return "Reconnecting";
+  return "";
 }
 
 function initialSecondaryPaneWidth() {
@@ -130,7 +158,7 @@ function initialSecondaryPaneWidth() {
   } catch { return 480; }
 }
 function maxSecondaryPaneWidth(availableWidth) {
-  return Math.max(320, Math.min(availableWidth - 360, availableWidth * 0.6, 820));
+  return Math.max(320, availableWidth - 400);
 }
 function modelProvider(model) {
   return model.trim().toLowerCase().split(":", 1)[0];
@@ -159,28 +187,41 @@ function Toast({ text, onDismiss }) {
   return <div className="toast" role="status"><Check size={16} />{text}<IconButton label="Dismiss" onClick={onDismiss}><X size={15} /></IconButton></div>;
 }
 
-function SecondaryPaneTabs({ selected, openTabs, onSelect, onClose, badges = {}, tools = secondaryPaneTools }) {
+function SecondaryPaneTabs({ selected, openTabs, onSelect, onClose, onNewBrowserTab, onReorder, browserTabs = [], badges = {}, tools = secondaryPaneTools }) {
   const selectedTabRef = useRef(null);
+  const dragKeyRef = useRef(null);
   useLayoutEffect(() => {
     selectedTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [selected, openTabs]);
 
-  return <nav aria-label="Workspace tools" className="secondary-pane-tabs" role="tablist">
-    {openTabs.map((id) => {
-      const tool = tools.find((item) => item.id === id);
-      if (!tool) return null;
-      const { label, icon: Icon } = tool;
-      const isSelected = selected === id;
-      return <div className={`secondary-pane-tab-item ${isSelected ? "secondary-pane-tab-item--selected" : ""}`} key={id} ref={isSelected ? selectedTabRef : null}>
-        <button aria-label={label} aria-selected={isSelected} className={`icon-button secondary-pane-tab ${isSelected ? "secondary-pane-tab--selected" : ""}`} onClick={() => onSelect(id)} role="tab" type="button">
-          <Icon size={17} weight={isSelected ? "fill" : "regular"} />
+  function reorderFromKeyboard(event, key) {
+    if (!event.altKey || !["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+    event.preventDefault();
+    onReorder(key, event.key === "ArrowLeft" ? -1 : 1);
+  }
+
+  return <div className="secondary-pane-tabs-layout">
+  <nav aria-label="Workspace pages" className="secondary-pane-tabs" role="tablist">
+    {openTabs.map((tab) => {
+      const isBrowser = tab.kind === "browser";
+      const browserTab = isBrowser ? browserTabs.find((item) => item.id === tab.id) : null;
+      const tool = isBrowser ? null : tools.find((item) => item.id === tab.id);
+      if (isBrowser && !browserTab || !isBrowser && !tool) return null;
+      const label = isBrowser ? (browserTab.title || "New tab") : tool.label;
+      const Icon = isBrowser ? Globe : tool.icon;
+      const isSelected = selected === tab.key;
+      return <div className={`secondary-pane-tab-item${isBrowser ? " secondary-pane-tab-item--browser" : ""}${isSelected ? " secondary-pane-tab-item--selected" : ""}`} key={tab.key} ref={isSelected ? selectedTabRef : null} draggable onDragStart={(event) => { dragKeyRef.current = tab.key; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", tab.key); }} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); const from = dragKeyRef.current || event.dataTransfer.getData("text/plain"); if (from) onReorder(from, tab.key); dragKeyRef.current = null; }} onDragEnd={() => { dragKeyRef.current = null; }}>
+        <button aria-label={label} aria-selected={isSelected} className={`icon-button secondary-pane-tab ${isSelected ? "secondary-pane-tab--selected" : ""}`} onClick={() => onSelect(tab)} onKeyDown={(event) => reorderFromKeyboard(event, tab.key)} role="tab" title={`${label} · Drag to reorder; Alt+Left/Right to move`} type="button">
+          {isBrowser && browserTab.favicon ? <img alt="" className="secondary-pane-tab-favicon" src={browserTab.favicon} /> : <Icon size={17} weight={isSelected && !isBrowser ? "fill" : "regular"} />}
           <span>{label}</span>
-          {badges[id] > 0 && <span aria-label={`${badges[id]} ${label.toLowerCase()}`} className="secondary-tool-badge">{badges[id] > 99 ? "99+" : badges[id]}</span>}
+          {!isBrowser && badges[tab.id] > 0 && <span aria-label={`${badges[tab.id]} ${label.toLowerCase()}`} className="secondary-tool-badge">{badges[tab.id] > 99 ? "99+" : badges[tab.id]}</span>}
         </button>
-        <IconButton className="secondary-pane-tab-close" label={`Close ${label}`} onClick={() => onClose(id)}><X size={13} /></IconButton>
+        <IconButton className="secondary-pane-tab-close" label={`Close ${label}`} onClick={() => onClose(tab)}><X size={13} /></IconButton>
       </div>;
     })}
-  </nav>;
+  </nav>
+    <IconButton className="secondary-pane-new-browser-tab" label="New browser tab" onClick={onNewBrowserTab}><Plus size={16} /></IconButton>
+  </div>;
 }
 
 function ConfirmationDialog({ confirmation, onCancel, onConfirm }) {
@@ -273,8 +314,13 @@ export function App() {
   const [workItemsState, setWorkItems] = useState([]);
   const [isolatedWorkspaces, setIsolatedWorkspaces] = useState([]);
   const [selectedArtifact, setSelectedArtifact] = useState(null);
-  const [projectPaneTab, setProjectPaneTab] = useState("Code");
+  const [projectPaneTab, setProjectPaneTab] = useState("");
   const [openProjectPaneTabs, setOpenProjectPaneTabs] = useState([]);
+  const [browserWorkspaceState, setBrowserWorkspaceState] = useState({ tabs: [], activeTabId: null });
+  const browserWorkspaceStateRef = useRef(browserWorkspaceState);
+  const browserWorkspaceOpenPromiseRef = useRef(null);
+  const selectedWorkspaceTab = openProjectPaneTabs.find((tab) => tab.key === projectPaneTab) ?? null;
+  const selectedWorkspaceView = selectedWorkspaceTab?.kind === "view" ? selectedWorkspaceTab.id : selectedWorkspaceTab?.kind === "browser" ? "Browser" : "";
   const [projectGitEnabled, setProjectGitEnabled] = useState(false);
   const [projectGitChangeCount, setProjectGitChangeCount] = useState(0);
   const [projectPaneOpen, setProjectPaneOpen] = useState(false);
@@ -312,28 +358,131 @@ export function App() {
   }, [secondaryPaneWidth]);
 
   function chooseSecondaryPane(tab) {
+    if (tab === "Browser") {
+      const currentBrowserState = browserWorkspaceStateRef.current;
+      const browserTab = currentBrowserState.tabs.find((item) => item.id === currentBrowserState.activeTabId) ?? currentBrowserState.tabs[0];
+      if (browserTab) selectBrowserWorkspaceTab(browserTab.id);
+      else void openBrowserWorkspace();
+      return;
+    }
     if (tab === "Code") {
       setSelectedArtifact(null);
       setSelectedCanvasDocument(null);
     }
-    setOpenProjectPaneTabs((current) => current.includes(tab) ? current : [...current, tab]);
-    setProjectPaneTab(tab);
+    const key = `view:${tab}`;
+    setOpenProjectPaneTabs((current) => current.some((item) => item.key === key) ? current : [...current, { key, kind: "view", id: tab }]);
+    setProjectPaneTab(key);
+    setProjectPaneOpen(true);
+  }
+
+  const handleBrowserWorkspaceState = useCallback((next) => {
+    browserWorkspaceStateRef.current = next;
+    setBrowserWorkspaceState(next);
+    setOpenProjectPaneTabs((current) => {
+      const presentIds = new Set((next.tabs ?? []).map((item) => item.id));
+      const retained = current.filter((item) => item.kind !== "browser" || presentIds.has(item.id));
+      const known = new Set(retained.filter((item) => item.kind === "browser").map((item) => item.id));
+      for (const browserTab of next.tabs ?? []) {
+        if (!known.has(browserTab.id)) retained.push({ key: `browser:${browserTab.id}`, kind: "browser", id: browserTab.id });
+      }
+      return retained;
+    });
+    setProjectPaneTab((current) => current.startsWith("browser:") && next.activeTabId ? `browser:${next.activeTabId}` : current);
+    if ((next.tabs ?? []).length === 0) {
+      setProjectPaneTab((current) => current.startsWith("browser:") ? "" : current);
+    }
+  }, []);
+
+  async function openBrowserWorkspace() {
+    const bridge = window.tribeDesktopBrowser;
+    if (!bridge) return;
+    if (browserWorkspaceOpenPromiseRef.current) return browserWorkspaceOpenPromiseRef.current;
+    const opening = bridge.open("workspace").then((next) => {
+      handleBrowserWorkspaceState(next);
+      const activeId = next.activeTabId ?? next.tabs?.find((tab) => tab.active)?.id;
+      if (activeId) setProjectPaneTab(`browser:${activeId}`);
+      setProjectPaneOpen(true);
+      return next;
+    }).catch((error) => {
+      notify(`The browser workspace could not be opened: ${error.message}`);
+      return null;
+    }).finally(() => {
+      if (browserWorkspaceOpenPromiseRef.current === opening) browserWorkspaceOpenPromiseRef.current = null;
+    });
+    browserWorkspaceOpenPromiseRef.current = opening;
+    return opening;
+  }
+
+  async function createBrowserWorkspaceTab() {
+    const bridge = window.tribeDesktopBrowser;
+    if (!bridge) return;
+    try {
+      const next = await bridge.newTab("workspace");
+      handleBrowserWorkspaceState(next);
+      const activeId = next.activeTabId ?? next.tabs?.find((tab) => tab.active)?.id;
+      if (activeId) setProjectPaneTab(`browser:${activeId}`);
+      setProjectPaneOpen(true);
+    } catch (error) { notify(`A browser tab could not be opened: ${error.message}`); }
+  }
+
+  async function selectBrowserWorkspaceTab(tabId) {
+    const bridge = window.tribeDesktopBrowser;
+    setProjectPaneTab(`browser:${tabId}`);
+    setProjectPaneOpen(true);
+    if (!bridge) return;
+    try { handleBrowserWorkspaceState(await bridge.selectTab("workspace", tabId)); }
+    catch (error) { notify(`The browser tab could not be selected: ${error.message}`); }
+  }
+
+  function selectSecondaryPaneTab(tab) {
+    if (tab.kind === "browser") return void selectBrowserWorkspaceTab(tab.id);
+    setProjectPaneTab(tab.key);
     setProjectPaneOpen(true);
   }
 
   function closeSecondaryPaneTab(tab) {
-    const index = openProjectPaneTabs.indexOf(tab);
-    const nextTabs = openProjectPaneTabs.filter((item) => item !== tab);
+    const index = openProjectPaneTabs.findIndex((item) => item.key === tab.key);
+    if (tab.kind === "browser") {
+      const wasSelected = projectPaneTab === tab.key;
+      void (async () => {
+        const next = await window.tribeDesktopBrowser?.closeTab("workspace", tab.id);
+        if (!next) return;
+        handleBrowserWorkspaceState(next);
+        if (wasSelected && next.tabs.length === 0) {
+          const remaining = openProjectPaneTabs.filter((item) => item.key !== tab.key);
+          const fallback = remaining[Math.min(index, remaining.length - 1)] ?? null;
+          if (fallback) selectSecondaryPaneTab(fallback);
+          else setProjectPaneOpen(false);
+        }
+      })();
+      return;
+    }
+    const nextTabs = openProjectPaneTabs.filter((item) => item.key !== tab.key);
     setOpenProjectPaneTabs(nextTabs);
-    if (tab === "Preview") {
+    if (tab.id === "Preview") {
       setSelectedArtifact(null);
       setSelectedCanvasDocument(null);
     }
-    if (projectPaneTab === tab) {
-      const nextTab = nextTabs[Math.min(index, nextTabs.length - 1)] ?? "";
-      setProjectPaneTab(nextTab);
-      if (!nextTab) setProjectPaneOpen(false);
+    if (projectPaneTab === tab.key) {
+      const nextTab = nextTabs[Math.min(index, nextTabs.length - 1)] ?? null;
+      if (nextTab) selectSecondaryPaneTab(nextTab);
+      else { setProjectPaneTab(""); setProjectPaneOpen(false); }
     }
+  }
+
+  function reorderWorkspaceTabs(from, toOrDelta) {
+    setOpenProjectPaneTabs((current) => {
+      const fromIndex = current.findIndex((item) => item.key === from);
+      if (fromIndex < 0) return current;
+      const toIndex = typeof toOrDelta === "number"
+        ? Math.max(0, Math.min(current.length - 1, fromIndex + toOrDelta))
+        : current.findIndex((item) => item.key === toOrDelta);
+      if (toIndex < 0 || toIndex === fromIndex) return current;
+      const next = [...current];
+      const [item] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, item);
+      return next;
+    });
   }
 
   function openMissionWorkspaceTool(tab) {
@@ -454,15 +603,15 @@ export function App() {
     return () => { active = false; window.clearInterval(timer); };
   }, [project.id]);
   useEffect(() => {
-    if (projectGitEnabled || !openProjectPaneTabs.includes("Git")) return;
-    const nextTabs = openProjectPaneTabs.filter((tab) => tab !== "Git");
+    if (projectGitEnabled || !openProjectPaneTabs.some((tab) => tab.kind === "view" && tab.id === "Git")) return;
+    const nextTabs = openProjectPaneTabs.filter((tab) => !(tab.kind === "view" && tab.id === "Git"));
     setOpenProjectPaneTabs(nextTabs);
-    if (projectPaneTab === "Git") {
-      const nextTab = nextTabs.at(-1) ?? "";
-      setProjectPaneTab(nextTab);
-      if (!nextTab) setProjectPaneOpen(false);
+    if (selectedWorkspaceView === "Git") {
+      const nextTab = nextTabs.at(-1) ?? null;
+      if (nextTab) selectSecondaryPaneTab(nextTab);
+      else { setProjectPaneTab(""); setProjectPaneOpen(false); }
     }
-  }, [projectGitEnabled, projectPaneTab, openProjectPaneTabs]);
+  }, [projectGitEnabled, projectPaneTab, selectedWorkspaceView, openProjectPaneTabs]);
   const [runtimeStatus, setRuntimeStatus] = useState("connecting");
   const [agentRuntime, setAgentRuntime] = useState({ enabled: false });
   const [toast, setToast] = useState("");
@@ -477,8 +626,10 @@ export function App() {
   const [recipes, setRecipes] = useState([]);
   const [usage, setUsage] = useState(emptyUsage);
   const [query, setQuery] = useState("");
+  const [headerSearchOpen, setHeaderSearchOpen] = useState(false);
   const [missionControlPending, setMissionControlPending] = useState(false);
   const fileInputRef = useRef(null);
+  const headerSearchInputRef = useRef(null);
   const pendingAttachmentCallbackRef = useRef(null);
   const cursorRef = useRef(0);
   const oldestEventSequenceRef = useRef(null);
@@ -489,6 +640,9 @@ export function App() {
   const pendingInteractionAgentsRef = useRef(new Map());
   const confirmationResolverRef = useRef(null);
   const confirmationFocusRef = useRef(null);
+  useLayoutEffect(() => {
+    if (headerSearchOpen) headerSearchInputRef.current?.focus();
+  }, [headerSearchOpen]);
   const preferredInteractionRef = useRef(null);
   const artifactQueryVersionRef = useRef(0);
   const computerRequestDialogRef = useRef(null);
@@ -521,7 +675,9 @@ export function App() {
     });
   }
   const isMissionTab = tabs.includes(activeTab);
-  const isGlobalWorkspaceTab = ["Skills", "Recipes", "Settings"].includes(activeTab);
+  const splitBrowserTitlebarActive = Boolean(projectPaneOpen && mission && isMissionTab && selectedWorkspaceTab?.kind === "browser");
+  const browserTitlebarActive = activeTab === "Browser" || splitBrowserTitlebarActive;
+  const isGlobalWorkspaceTab = ["Browser", "Skills", "Recipes", "Settings"].includes(activeTab);
   const isProjectWorkspace = Boolean(project.id)
     && ["Code", "Git", "Artifacts", "Schedules", "Skills", "Agents", "Knowledge", "Recipes"].includes(activeTab);
   const unavailableAgentStatuses = new Set(["Not configured", "Provider setup failed"]);
@@ -532,6 +688,7 @@ export function App() {
   const noAgentsReady = projectAgents.length > 0 && readyAgentCount === 0;
   const requiresProject = isMissionTab || ["Code", "Git", "Artifacts", "Schedules", "Knowledge"].includes(activeTab);
   const activeWorkspaceLabel = ({
+    Browser: "Browser",
     Code: "Repository",
     Git: "Git changes",
     Artifacts: "Artifacts",
@@ -1021,7 +1178,7 @@ export function App() {
       } catch { /* Command history will refresh when the runtime reconnects. */ }
     };
     refresh();
-    if (activeTab !== "Runs" && !(projectPaneOpen && projectPaneTab === "Runs")) return () => { alive = false; };
+    if (activeTab !== "Runs" && !(projectPaneOpen && selectedWorkspaceView === "Runs")) return () => { alive = false; };
     const timer = window.setInterval(refresh, 1200);
     return () => { alive = false; window.clearInterval(timer); };
   }, [mission?.id, activeTab, projectPaneOpen, projectPaneTab]);
@@ -1033,7 +1190,7 @@ export function App() {
       try { const result = await runtime.listSchedules(project.id); if (alive) setSchedules(result.schedules); } catch { /* Keep the cached schedule list while reconnecting. */ }
     };
     refresh();
-    if (activeTab !== "Schedules" && !(projectPaneOpen && projectPaneTab === "Schedules") && !(projectSettingsOpen && projectSettingsSection === "schedules")) return () => { alive = false; };
+    if (activeTab !== "Schedules" && !(projectPaneOpen && selectedWorkspaceView === "Schedules") && !(projectSettingsOpen && projectSettingsSection === "schedules")) return () => { alive = false; };
     const timer = window.setInterval(refresh, 5000);
     return () => { alive = false; window.clearInterval(timer); };
   }, [project.id, activeTab, projectPaneOpen, projectPaneTab, projectSettingsOpen, projectSettingsSection]);
@@ -1052,7 +1209,7 @@ export function App() {
 
   useEffect(() => {
     const version = ++artifactQueryVersionRef.current;
-    if (!project.id || (activeTab !== "Artifacts" && !(projectPaneOpen && projectPaneTab === "Artifacts") && !(projectSettingsOpen && projectSettingsSection === "artifacts"))) {
+    if (!project.id || (activeTab !== "Artifacts" && !(projectPaneOpen && selectedWorkspaceView === "Artifacts") && !(projectSettingsOpen && projectSettingsSection === "artifacts"))) {
       if (!project.id) setProjectArtifacts([]);
       return undefined;
     }
@@ -1218,7 +1375,7 @@ export function App() {
     try {
       const { mission: created } = await runtime.createMission(
         project.id, title, goal, parsed.recipeId, goal, parsed.selectedSkills,
-        modelPreference, effortPreference,
+        modelPreference, effortPreference, parsed.recipeVersion,
       );
       const pauseActive = (items) => items.map((item) => item.status === "active" && !item.archived_at
         ? { ...item, status: "paused" } : item);
@@ -1741,14 +1898,12 @@ export function App() {
   }
 
   async function chooseProjectReferenceFiles(repositoryPath, setReferenceFiles = setNewProjectReferenceFiles) {
-    if (!window.__TAURI_INTERNALS__ || !repositoryPath.trim()) return;
+    if ((!window.__TAURI_INTERNALS__ && !window.tribeDesktop) || !repositoryPath.trim()) return;
     try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const selected = await open({
-        defaultPath: repositoryPath.trim(),
-        multiple: true,
-        title: "Choose project reference files",
-      });
+      const options = { defaultPath: repositoryPath.trim(), multiple: true, title: "Choose project reference files" };
+      const selected = window.tribeDesktop
+        ? await window.tribeDesktop.openDialog(options)
+        : await (await import("@tauri-apps/plugin-dialog")).open(options);
       if (!selected) return;
       const root = repositoryPath.trim().replace(/[\\/]+$/, "").replaceAll("\\", "/");
       const paths = (Array.isArray(selected) ? selected : [selected]).map((path) => {
@@ -2238,20 +2393,62 @@ export function App() {
     setSelectedArtifact({ ...artifact, preview: undefined, previewDataUrl: undefined });
     if (projectPaneOpen || (mission && isMissionTab)) chooseSecondaryPane("Preview");
     else setActiveTab("Code");
+    const extension = artifact.name.split(".").pop()?.toLowerCase();
+    if (extension === "xlsx" || artifact.type === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") return;
+    const isPdf = extension === "pdf" || artifact.type?.split(";", 1)[0]?.trim().toLowerCase() === "application/pdf";
+    if (isPdf) return;
+    if (playableMediaKind(artifact.type)) return;
     try {
       const { contentBase64 } = await runtime.getArtifact(artifact.id);
       const bytes = Uint8Array.from(atob(contentBase64), (character) => character.charCodeAt(0));
       const extension = artifact.name.split(".").pop()?.toLowerCase();
-      const textExtensions = new Set(["md", "txt", "json", "yaml", "yml", "log", "diff", "patch", "csv", "js", "jsx", "ts", "tsx", "py", "rs", "html", "css", "xml", "toml", "sql", "sh"]);
+      const textExtensions = new Set(["md", "txt", "json", "yaml", "yml", "log", "diff", "patch", "csv", "tsv", "js", "jsx", "ts", "tsx", "py", "rs", "html", "css", "xml", "toml", "sql", "sh"]);
       if (artifact.type.startsWith("text/") || textExtensions.has(extension)) {
         const content = new TextDecoder().decode(bytes);
-        setSelectedArtifact({ ...artifact, preview: content.length > 100_000 ? `${content.slice(0, 100_000)}\n\n[Preview truncated]` : content });
+        const isDelimited = extension === "csv" || extension === "tsv"
+          || artifact.type === "text/csv" || artifact.type === "application/csv" || artifact.type === "text/tab-separated-values";
+        setSelectedArtifact({
+          ...artifact,
+          preview: content.length > 100_000 ? `${content.slice(0, 100_000)}\n\n[Preview truncated]` : content,
+          previewTruncated: content.length > 100_000,
+          tableText: isDelimited ? content : undefined,
+          tableDelimiter: extension === "tsv" || artifact.type === "text/tab-separated-values" ? "\t" : ",",
+        });
       } else {
-        setSelectedArtifact({ ...artifact, preview: undefined, previewDataUrl: inlineImagePreview(artifact.type, contentBase64) ?? undefined });
+        setSelectedArtifact({
+          ...artifact,
+          preview: undefined,
+          previewDataUrl: inlineImagePreview(artifact.type, contentBase64) ?? undefined,
+        });
       }
     } catch (error) {
       notify(`Artifact could not be opened: ${error.message}`);
     }
+  }
+
+  async function prepareSpreadsheetSelection({ artifact, sheet, range, text }) {
+    if (!artifact?.missionId) {
+      notify("This workbook is not linked to a chat, so its selection cannot be sent.");
+      return;
+    }
+    if (artifact.missionId !== mission?.id) {
+      const opened = await selectMission(artifact.missionId, project);
+      if (!opened) return;
+    }
+    setComposerDraft({
+      token: `${Date.now()}-${Math.random()}`,
+      text: `Analyse these selected spreadsheet cells.\n\nSource workbook: ${artifact.name}\nWorksheet: ${sheet}\nRange: ${range}\n\n${text}`,
+      attachments: [{ id: artifact.id, name: artifact.name, mediaType: artifact.type, size: artifact.size }],
+    });
+    setActiveTab("Mission");
+  }
+
+  async function onArtifactSaved(result) {
+    const mapped = mapArtifact(result.artifact);
+    setArtifacts((current) => [mapped, ...current.filter((item) => item.id !== mapped.id)]);
+    if (result.event) applyEvent(result.event);
+    await selectArtifact(mapped);
+    notify(`Saved ${mapped.name} as a new artifact.`);
   }
 
   async function createCanvasDocument() {
@@ -2492,7 +2689,8 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
     />;
   }
 
-  function renderProjectTool(tab) {
+  function renderProjectTool(tab, paneVisible = true) {
+    if (tab === "Browser") return <BrowserView onStateChange={handleBrowserWorkspaceState} projects={projects} visible={paneVisible && !createProjectOpen && !projectSettingsOpen && !settingsOpen && !workspaceSettingsOpen && !confirmation} />;
     if (tab === "Activity") return <AgentActivityView
       agents={projectAgents}
       messages={executionMessages}
@@ -2504,7 +2702,8 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
     if (tab === "Plan") return <PlanView agents={projectAgents} project={project} mission={mission} agentConfigured={agentRuntime.enabled} workItems={workItemsState} onSelectWork={selectWork} onEditProjectGoal={openProjectGoalEditor} onConnectModel={() => openAgentSettings("model")} />;
     if (tab === "Tests") return <TestRunsView runs={runs} />;
     if (tab === "Runs") return <RunsView agentRequests={agentRequests} mission={mission} onStop={stopBackgroundCommand} runs={commandRuns} />;
-    if (tab === "Code") return <RepositoryView artifact={selectedArtifact} agents={agents} project={project} reviewRevision={artifactReviewRevision} onBrowseRepository={() => { setSelectedArtifact(null); setSelectedCanvasDocument(null); }} />;
+    if (tab === "Code") return <RepositoryView artifact={selectedArtifact} missionId={selectedArtifact?.missionId ?? mission?.id} agents={agents} project={project} reviewRevision={artifactReviewRevision} onArtifactSaved={onArtifactSaved} onUseSpreadsheetSelection={prepareSpreadsheetSelection} onBrowseRepository={() => { setSelectedArtifact(null); setSelectedCanvasDocument(null); }} />;
+    if (tab === "Browser") return <Suspense fallback={<div className="tab-panel column-empty">Opening browser…</div>}><BrowserView agents={projectAgents} mission={mission} onOpenWebsiteSettings={() => openWorkspaceSettings("connections")} /></Suspense>;
     if (tab === "Git") return <GitChangesView project={project} />;
     if (tab === "Preview" && selectedCanvasDocument) return <ViewErrorBoundary backLabel="Back to artifacts" key={`preview:${selectedCanvasDocument.id}`} onBack={() => { setSelectedCanvasDocument(null); chooseSecondaryPane("Artifacts"); }} title="Document preview couldn't be opened"><Suspense fallback={<div className="tab-panel column-empty">Opening shared document…</div>}><CanvasView
       document={selectedCanvasDocument}
@@ -2513,7 +2712,7 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
       onBack={() => setSelectedCanvasDocument(null)}
       onDiscuss={(reference) => void discussCanvasDocument({ ...reference, missionId: selectedCanvasDocument.access_mission_id ?? selectedCanvasDocument.mission_id })}
     /></Suspense></ViewErrorBoundary>;
-    if (tab === "Preview" && selectedArtifact) return <RepositoryView artifact={selectedArtifact} agents={agents} project={project} reviewRevision={artifactReviewRevision} onBrowseRepository={() => { setSelectedArtifact(null); setProjectPaneTab("Code"); }} />;
+    if (tab === "Preview" && selectedArtifact) return <RepositoryView artifact={selectedArtifact} missionId={selectedArtifact?.missionId ?? mission?.id} agents={agents} project={project} reviewRevision={artifactReviewRevision} onArtifactSaved={onArtifactSaved} onUseSpreadsheetSelection={prepareSpreadsheetSelection} onBrowseRepository={() => { setSelectedArtifact(null); setProjectPaneTab("Code"); }} />;
     if (tab === "Preview") return <div className="project-preview-empty"><FileText size={22} /><strong>No preview selected</strong><span>Select a file in Project artifacts to view it beside the chat.</span></div>;
     if (tab === "Schedules") return <SchedulesView agentsConfigured={agentRuntime.enabled} project={project} schedules={schedules} onCreate={createSchedule} onAction={updateSchedule} onLoadMoreRuns={loadScheduleRuns} />;
     if (tab === "Knowledge") return <ProjectKnowledgeView entries={knowledge} proposals={knowledgeProposals} onSave={saveKnowledge} onReview={reviewKnowledgeProposal} onArchive={archiveKnowledge} onRestore={restoreKnowledge} />;
@@ -2590,6 +2789,7 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
   }
 
   function renderTab() {
+    if (activeTab === "Browser") return <BrowserView onStateChange={handleBrowserWorkspaceState} projects={projects} visible={!createProjectOpen && !projectSettingsOpen && !settingsOpen && !workspaceSettingsOpen && !confirmation} />;
     if (isMissionTab && !mission) return renderMissionView();
     if (isMissionTab && mission) return renderMissionView();
     if (["Code", "Git", "Artifacts", "Schedules", "Knowledge"].includes(activeTab)) return renderProjectTool(activeTab);
@@ -2607,18 +2807,19 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
     if (activeTab === "Skills") return <SkillsView skills={skills} />;
     if (activeTab === "Agents") return <AgentRolesView agents={agents} capabilityCatalog={capabilityCatalog} agentConfigured={agentRuntime.enabled} onCreate={createAgentDefinition} onUpdate={updateAgentDefinition} onArchive={archiveAgentDefinition} onConnectModel={() => openAgentSettings("model")} onManageModels={() => openWorkspaceSettings("models")} />;
     if (activeTab === "Knowledge") return <ProjectKnowledgeView entries={knowledge} proposals={knowledgeProposals} onSave={saveKnowledge} onReview={reviewKnowledgeProposal} onArchive={archiveKnowledge} onRestore={restoreKnowledge} />;
-    if (activeTab === "Recipes") return <WorkflowsView recipes={recipes} onSave={saveWorkflowRecipe} />;
+    if (activeTab === "Recipes") return <WorkflowsView recipes={recipes} onSave={saveWorkflowRecipe} onListVersions={runtime.listRecipeVersions} onGetVersion={runtime.getRecipeVersion} />;
     return renderMissionView();
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${window.tribeDesktop ? "app-shell--electron" : ""} ${collapsed ? "app-shell--sidebar-collapsed" : ""}`}>
       <Sidebar
-        activeTab={workspaceSettingsOpen ? "Settings" : projectPaneOpen ? (projectPaneTab === "Preview" ? "Artifacts" : projectPaneTab) : activeTab}
+        activeTab={workspaceSettingsOpen ? "Settings" : projectPaneOpen ? (selectedWorkspaceView === "Preview" ? "Artifacts" : selectedWorkspaceView) : activeTab}
         collapsed={collapsed}
         mission={mission}
         onNavigate={(tab) => {
           if (tab === "Settings") { setProjectPaneOpen(false); openWorkspaceSettings(); return; }
+          if (tab === "Browser" && mission) { setActiveTab("Mission"); chooseSecondaryPane("Browser"); return; }
           if (tab === "Code") {
             if (mission) { setActiveTab("Mission"); chooseSecondaryPane("Code"); }
             else { setProjectPaneOpen(false); setSelectedArtifact(null); setSelectedCanvasDocument(null); setActiveTab("Code"); }
@@ -2644,11 +2845,24 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
         project={{ ...project, missions }}
         projects={projects.map((item) => item.id === project.id ? { ...item, missions } : item)}
       />
-      <main className={`main-area ${isMissionTab && mission ? "main-area--mission-workspace" : ""} ${isProjectWorkspace ? "main-area--project-workspace" : ""} ${activeTab === "Code" ? "main-area--repository" : ""} ${isMissionTab && mission && activeTab === "Mission" ? "main-area--conversation" : ""} ${projectPaneOpen && mission && isMissionTab ? "main-area--project-pane-open" : ""} ${isMissionTab && mission && activeTab === "Mission" && canvasDiscussionSplit && selectedCanvasDocument ? "main-area--canvas-discussion" : ""} ${isMissionTab && !mission && activeTab === "Mission" ? "main-area--project-home" : ""}`}>
-        <header className="topbar">
+      <main className={`main-area ${isMissionTab && mission ? "main-area--mission-workspace" : ""} ${isProjectWorkspace ? "main-area--project-workspace" : ""} ${activeTab === "Browser" ? "main-area--browser-workspace" : ""} ${activeTab === "Code" ? "main-area--repository" : ""} ${isMissionTab && mission && activeTab === "Mission" ? "main-area--conversation" : ""} ${projectPaneOpen && mission && isMissionTab ? "main-area--project-pane-open" : ""} ${isMissionTab && mission && activeTab === "Mission" && canvasDiscussionSplit && selectedCanvasDocument ? "main-area--canvas-discussion" : ""} ${isMissionTab && !mission && activeTab === "Mission" ? "main-area--project-home" : ""}`} style={{ "--secondary-pane-width": `${visibleWorkspacePaneWidth}px` }}>
+        <header aria-label={browserTitlebarActive ? "Browser workspace" : undefined} className={`topbar${window.tribeDesktop?.platform === "darwin" ? " topbar--electron-mac" : ""}${browserTitlebarActive ? " topbar--browser" : ""}${projectPaneOpen && mission && isMissionTab ? " topbar--split-workspace" : ""}`}>
+          <div className="topbar-main">
           <div className="topbar-leading">
             <IconButton aria-pressed={collapsed} className="topbar-sidebar-toggle" label={collapsed ? "Expand sidebar" : "Collapse sidebar"} onClick={() => setCollapsed((value) => !value)}><SidebarSimple size={18} /></IconButton>
-          <div className="breadcrumb"><strong>{isGlobalWorkspaceTab ? "Workspace" : project.name || "Tribe"}</strong>{project.id && !isGlobalWorkspaceTab && <IconButton className="breadcrumb-project-settings" label={`Project settings for ${project.name}`} onClick={() => openProjectSettings(project)}><Gear size={14} /></IconButton>}{(project.id || mission || isMissionTab || isGlobalWorkspaceTab) && <CaretRight size={14} />}<span title={isMissionTab ? mission?.title ?? "New chat" : activeWorkspaceLabel}>{isMissionTab ? compactChatTitle(mission?.title ?? "New chat") : activeWorkspaceLabel}</span></div>
+          {activeTab !== "Browser" && <div className="breadcrumb">
+            <span className="breadcrumb-project" title={isGlobalWorkspaceTab ? "Workspace" : project.name || "Tribe"}>
+              <FolderSimple aria-hidden="true" className="breadcrumb-project-icon" size={17} />
+              {(!project.id || isGlobalWorkspaceTab) && <strong>{isGlobalWorkspaceTab ? "Workspace" : project.name || "Tribe"}</strong>}
+            </span>
+            <span className="breadcrumb-chat" title={isMissionTab ? mission?.title ?? "New chat" : activeWorkspaceLabel}>
+              {isMissionTab && <ChatCircleDots aria-hidden="true" className="breadcrumb-chat-icon" size={16} />}
+              <span className="breadcrumb-chat-label">{isMissionTab ? compactChatTitle(mission?.title ?? "New chat") : activeWorkspaceLabel}</span>
+            </span>
+            {isMissionTab && mission && <span aria-label={runtimeConnectionLabel(runtimeStatus)} className={`runtime-connection-indicator runtime-connection-indicator--${runtimeStatus}`} role="status" title={runtimeConnectionLabel(runtimeStatus)}>
+              <i />{runtimeConnectionText(runtimeStatus) && <span>{runtimeConnectionText(runtimeStatus)}</span>}
+            </span>}
+          </div>}
           </div>
           <div className="topbar-actions">
             <div className="request-menu-wrap">
@@ -2670,7 +2884,10 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
                 {globalInteractions.length + computerRequests.length === 0 && <p className="request-menu-empty">No requests are waiting.</p>}
               </div>}
             </div>
-            {isMissionTab && mission && <label className="search-box"><MagnifyingGlass size={16} /><input aria-label="Search channel" onChange={(event) => setQuery(event.target.value)} placeholder="Search channel" value={query} /><kbd>⌘ K</kbd></label>}
+            {isMissionTab && mission && <>
+              <label className={`search-box${headerSearchOpen ? " search-box--expanded" : ""}`}><MagnifyingGlass size={16} /><input aria-label="Search channel" onBlur={() => { if (!query) setHeaderSearchOpen(false); }} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape") { setHeaderSearchOpen(false); event.currentTarget.blur(); } }} placeholder="Search channel" ref={headerSearchInputRef} value={query} /><kbd>⌘ K</kbd></label>
+              {!headerSearchOpen && <IconButton aria-label="Search channel" className="search-box-trigger" label="Search channel" onClick={() => setHeaderSearchOpen(true)}><MagnifyingGlass size={16} /></IconButton>}
+            </>}
             {isMissionTab && mission && <div className="mission-header-controls">
               {mission.status === "completed" && !mission.archived_at && <span className="mission-status mission-status--completed" role="status"><i className="status-pulse" />Completed</span>}
               {noAgentsReady && <IconButton className="mission-control-button mission-control-button--setup" label={`Connect a model · ${readyAgentCount} of ${agents.length} agents ready`} onClick={() => openAgentSettings("model")}><WarningCircle size={16} /></IconButton>}
@@ -2684,14 +2901,19 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
               <IconButton aria-expanded={chatViewsOpen} aria-haspopup="menu" className="chat-views-menu-button" label="Open chat views" onClick={() => setChatViewsOpen((value) => !value)}><DotsThreeVertical size={18} weight="bold" /></IconButton>
               {chatViewsOpen && <div className="chat-views-menu" role="menu">
                 <div className="chat-views-menu-heading">Open in pane</div>
-                {chatViewMenuTools.map(({ id, label, icon: Icon }) => <button aria-current={openProjectPaneTabs.includes(id) ? "true" : undefined} className="chat-views-menu-item" key={id} onClick={() => openMissionWorkspaceTool(id)} role="menuitem" type="button">
+                {chatViewMenuTools.map(({ id, label, icon: Icon }) => <button aria-current={openProjectPaneTabs.some((tab) => tab.kind === "view" && tab.id === id) ? "true" : undefined} className="chat-views-menu-item" key={id} onClick={() => openMissionWorkspaceTool(id)} role="menuitem" type="button">
                   <Icon size={16} />
                   <span>{label}</span>
-                  {openProjectPaneTabs.includes(id) && <Check aria-label="Open" size={15} />}
+                  {openProjectPaneTabs.some((tab) => tab.kind === "view" && tab.id === id) && <Check aria-label="Open" size={15} />}
                 </button>)}
               </div>}
             </div>}
           </div>
+          </div>
+          {projectPaneOpen && mission && isMissionTab && <div className="topbar-secondary-tabs">
+            <SecondaryPaneTabs badges={{ Git: projectGitChangeCount, Artifacts: artifactTotal, Preview: selectedArtifact ? 1 : 0 }} onClose={closeSecondaryPaneTab} openTabs={openProjectPaneTabs} selected={projectPaneTab} tools={projectPaneTools} browserTabs={browserWorkspaceState.tabs} onNewBrowserTab={createBrowserWorkspaceTab} onReorder={reorderWorkspaceTabs} onSelect={selectSecondaryPaneTab} />
+          </div>}
+          {activeTab === "Browser" && <div className="topbar-secondary-tabs"><SecondaryPaneTabs badges={{}} browserTabs={browserWorkspaceState.tabs} onNewBrowserTab={createBrowserWorkspaceTab} onReorder={reorderWorkspaceTabs} onSelect={selectSecondaryPaneTab} onClose={closeSecondaryPaneTab} openTabs={openProjectPaneTabs.filter((tab) => tab.kind === "browser")} selected={browserWorkspaceState.activeTabId ? `browser:${browserWorkspaceState.activeTabId}` : projectPaneTab} tools={projectPaneTools} /></div>}
         </header>
 
         <div className={`workspace-body ${projectPaneOpen && mission && isMissionTab ? "workspace-body--split" : ""} ${paneResizing ? "workspace-body--resizing" : ""}`} ref={workspacePaneRef} style={{ "--secondary-pane-width": `${visibleWorkspacePaneWidth}px` }}>
@@ -2724,9 +2946,11 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
         </div>
         {projectPaneOpen && mission && isMissionTab && <>
           <div aria-label="Resize chat and workspace pane" aria-orientation="vertical" aria-valuemax={maxWorkspacePaneWidth} aria-valuemin={320} aria-valuenow={Math.round(visibleWorkspacePaneWidth)} aria-valuetext={`Workspace pane ${Math.round(visibleWorkspacePaneWidth)} pixels wide`} className="secondary-pane-resizer" onKeyDown={nudgeSecondaryPaneWidth} onLostPointerCapture={stopSecondaryPaneResize} onPointerCancel={stopSecondaryPaneResize} onPointerDown={startSecondaryPaneResize} onPointerMove={moveSecondaryPaneResize} onPointerUp={stopSecondaryPaneResize} role="separator" tabIndex={0}><DotsSixVertical aria-hidden="true" size={16} weight="bold" /></div>
-          <aside aria-label={`${projectPaneTools.find((tool) => tool.id === projectPaneTab)?.label ?? "Workspace tools"} pane`} className="project-tool-pane" id="secondary-workspace-pane">
-            <div className="project-tool-pane-heading"><SecondaryPaneTabs badges={{ Git: projectGitChangeCount, Artifacts: artifactTotal, Preview: selectedArtifact ? 1 : 0 }} onClose={closeSecondaryPaneTab} onSelect={chooseSecondaryPane} openTabs={openProjectPaneTabs} selected={projectPaneTab} tools={projectPaneTools} /></div>
-            <div className="project-tool-pane-body">{renderProjectTool(projectPaneTab)}</div>
+          <aside aria-label={`${projectPaneTools.find((tool) => tool.id === selectedWorkspaceView)?.label ?? "Workspace tools"} pane`} className="project-tool-pane" id="secondary-workspace-pane">
+            <div className="project-tool-pane-body">
+              {openProjectPaneTabs.some((tab) => tab.kind === "browser") && <div className="browser-pane-retained" hidden={selectedWorkspaceTab?.kind !== "browser"}>{renderProjectTool("Browser", selectedWorkspaceTab?.kind === "browser")}</div>}
+              {selectedWorkspaceTab?.kind === "view" && renderProjectTool(selectedWorkspaceTab.id)}
+            </div>
           </aside>
         </>}
         </div>

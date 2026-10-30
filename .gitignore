@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 .venv/
 build/
+/release/
 runtime/*.egg-info/
 src-tauri/target/
 src-tauri/binaries/tribe-runtime-*

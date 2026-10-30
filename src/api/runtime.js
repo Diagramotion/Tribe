@@ -1,4 +1,6 @@
-const API_BASE = window.__TAURI_INTERNALS__ ? "http://127.0.0.1:4317" : "";
+const API_BASE = window.__TAURI_INTERNALS__
+  ? "http://127.0.0.1:4317"
+  : window.tribeDesktop?.runtimeBaseUrl || "";
 
 async function request(path, options) {
   const attempts = options?.method ? 1 : 20;
@@ -12,6 +14,26 @@ async function request(path, options) {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error ?? `Could not complete the request (${response.status})`);
       return data;
+    } catch (error) {
+      lastError = error;
+      if (!(error instanceof TypeError)) throw error;
+      if (attempt + 1 < attempts) await new Promise((resolve) => window.setTimeout(resolve, 350));
+    }
+  }
+  throw lastError;
+}
+
+async function requestBlob(path) {
+  const attempts = 20;
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const response = await fetch(`${API_BASE}${path}`);
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.error ?? `Could not complete the request (${response.status})`);
+      }
+      return { blob: await response.blob(), headers: response.headers };
     } catch (error) {
       lastError = error;
       if (!(error instanceof TypeError)) throw error;
@@ -103,10 +125,12 @@ export const runtime = {
       source.close();
     };
   },
-  createMission: (projectId, title, goal, recipeId = null, initialMessage = null, selectedSkills = [], modelPreference = null, effortPreference = null) => request("/api/missions", {
-    method: "POST", body: JSON.stringify({ projectId, title, goal, recipeId, initialMessage, selectedSkills, modelPreference, effortPreference }),
+  createMission: (projectId, title, goal, recipeId = null, initialMessage = null, selectedSkills = [], modelPreference = null, effortPreference = null, recipeVersion = null) => request("/api/missions", {
+    method: "POST", body: JSON.stringify({ projectId, title, goal, recipeId, initialMessage, selectedSkills, modelPreference, effortPreference, recipeVersion }),
   }),
   listRecipes: () => request("/api/recipes"),
+  listRecipeVersions: (id) => request(`/api/recipes/${encodeURIComponent(id)}/versions`),
+  getRecipeVersion: (id, version) => request(`/api/recipes/${encodeURIComponent(id)}?version=${encodeURIComponent(version)}`),
   saveRecipe: (recipe) => request("/api/recipes", {
     method: "POST", body: JSON.stringify(recipe),
   }),
@@ -150,6 +174,9 @@ export const runtime = {
     method: "POST", body: JSON.stringify({}),
   }),
   getSettings: () => request("/api/settings"),
+  setImageGenerationModel: (model) => request("/api/settings/image-generation", {
+    method: "PUT", body: JSON.stringify({ model }),
+  }),
   setContextPruning: (enabled) => request("/api/settings/context-pruning", {
     method: "PUT", body: JSON.stringify({ enabled }),
   }),
@@ -229,6 +256,25 @@ export const runtime = {
   },
   getMcpConfig: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/mcp`),
   getComputerAccess: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/computer-access`),
+  getBrowserRuntime: () => request("/api/browser/runtime"),
+  getBrowserSessions: (missionId) => request(`/api/missions/${encodeURIComponent(missionId)}/browser`),
+  openBrowserSession: (missionId, url) => request(`/api/missions/${encodeURIComponent(missionId)}/browser`, {
+    method: "POST", body: JSON.stringify({ url }),
+  }),
+  navigateBrowserSession: (missionId, sessionId, url) => request(`/api/missions/${encodeURIComponent(missionId)}/browser/${encodeURIComponent(sessionId)}/navigate`, {
+    method: "POST", body: JSON.stringify({ url }),
+  }),
+  browserSessionAction: (missionId, sessionId, action) => request(`/api/missions/${encodeURIComponent(missionId)}/browser/${encodeURIComponent(sessionId)}/${action}`, {
+    method: "POST", body: JSON.stringify({}),
+  }),
+  interactWithBrowserSession: (missionId, sessionId, input) => request(`/api/missions/${encodeURIComponent(missionId)}/browser/${encodeURIComponent(sessionId)}/interact`, {
+    method: "POST", body: JSON.stringify(input),
+  }),
+  browserScreenshotUrl: (missionId, sessionId, revision = 0) => `${API_BASE}/api/missions/${encodeURIComponent(missionId)}/browser/${encodeURIComponent(sessionId)}/screenshot?v=${revision}`,
+  stopBrowserSession: (missionId, sessionId) => request(`/api/missions/${encodeURIComponent(missionId)}/browser/${encodeURIComponent(sessionId)}/stop`, {
+    method: "POST", body: JSON.stringify({}),
+  }),
+  installBrowser: () => request("/api/browser/install", { method: "POST", body: JSON.stringify({}) }),
   setComputerAccess: (projectId, enabled) => request(`/api/projects/${encodeURIComponent(projectId)}/computer-access`, {
     method: "PUT", body: JSON.stringify({ enabled }),
   }),
@@ -302,6 +348,17 @@ export const runtime = {
     { method: "POST", body: JSON.stringify({ recipient, action, data }) },
   ),
   getArtifact: (id) => request(`/api/artifacts/${encodeURIComponent(id)}`),
+  previewPdfArtifactPage: async (id, page = 1) => {
+    const { blob, headers } = await requestBlob(`/api/artifacts/${encodeURIComponent(id)}/pdf-page?page=${page}`);
+    return { blob, pageCount: Number(headers.get("X-PDF-Page-Count")) || 1 };
+  },
+  previewXlsxArtifact: (id, sheet = "", offset = 0, limit = 50, search = "", headerRows = 1) => {
+    const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+    if (sheet) params.set("sheet", sheet);
+    if (search) params.set("search", search);
+    if (headerRows !== 1) params.set("headerRows", String(headerRows));
+    return request(`/api/artifacts/${encodeURIComponent(id)}/xlsx-preview?${params}`);
+  },
   listCanvasDocuments: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/canvas`),
   listMissionCanvasDocuments: (missionId) => request(`/api/missions/${encodeURIComponent(missionId)}/canvas`),
   linkCanvasDocument: (missionId, artifactId) => request(`/api/missions/${encodeURIComponent(missionId)}/canvas/${encodeURIComponent(artifactId)}/link`, {

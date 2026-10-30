@@ -61,3 +61,54 @@ jobs:
         with:
           name: tribe-${{ matrix.target }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/**
+
+  electron-browser:
+    name: Electron browser (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            package-platform: mac
+            package-target: zip
+            package-app: release/electron/mac-arm64/Tribe.app/Contents/MacOS/Tribe
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            package-platform: win
+            package-target: nsis
+            package-app: release/electron/win-unpacked/Tribe.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: python -m pip install uv
+      - run: uv sync --project runtime --extra ai --extra desktop
+      - name: Browser unit tests
+        run: npm run test:browser
+      - name: Live Electron browser and agent test
+        run: npm run test:browser:e2e
+        env:
+          TRIBE_BROWSER_E2E_AUTO_UPLOAD: "1"
+          TRIBE_BROWSER_E2E_SKIP_APPROVAL: "1"
+      - name: Build unpacked Electron app
+        run: npm run build && npm run runtime:package && npx electron-builder --${{ matrix.package-platform }} --dir
+      - name: Live packaged browser and agent test
+        run: npm run test:browser:e2e
+        env:
+          TRIBE_BROWSER_E2E_PACKAGED_APP: ${{ matrix.package-app }}
+          TRIBE_BROWSER_E2E_AUTO_UPLOAD: "1"
+          TRIBE_BROWSER_E2E_SKIP_APPROVAL: "1"
+      - name: Build Electron installer
+        run: npx electron-builder --${{ matrix.package-platform }} ${{ matrix.package-target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tribe-electron-${{ matrix.target }}
+          path: release/electron/**

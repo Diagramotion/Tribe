@@ -8,10 +8,12 @@ import {
 } from "@phosphor-icons/react";
 import { initialAgents } from "../data/workspace.js";
 import { IconButton } from "../components/WorkspaceSidebar.jsx";
+import { MediaArtifactPreview } from "../components/MediaArtifactPreview.jsx";
 import { shareableArtifacts } from "../domain/artifacts.js";
 import { MessageMarkdown } from "../components/MarkdownContent.jsx";
 import { deduplicateAgentActivityMessages, filterTimelineMessages, groupActivityMessages, mergeTimelineMessages } from "../domain/activity.js";
 import { secureInteractiveDocument } from "../domain/interactive-artifact.js";
+import { inlineImagePreview, playableMediaKind } from "../domain/artifact-preview.js";
 import { agentStatusLabel } from "../domain/labels.js";
 import { channelFollowOutput, channelIsAtBottom, nextChannelPinnedState } from "../domain/channel-scroll.js";
 import { modelDisplayName, sortModelCatalog } from "../domain/model-catalog.js";
@@ -372,6 +374,55 @@ function InteractiveArtifact({ artifactId, missionId, recipient, recipientLabel,
   </section>;
 }
 
+function GeneratedImage({ artifactId, actor, onOpenArtifact }) {
+  const [preview, setPreview] = useState(null);
+  const [name, setName] = useState("Generated image");
+  useEffect(() => {
+    let active = true;
+    runtime.getArtifact(artifactId).then(({ artifact, contentBase64 }) => {
+      if (!active) return;
+      setName(artifact.name);
+      setPreview(inlineImagePreview(artifact.media_type, contentBase64) ?? false);
+    }).catch(() => { if (active) setPreview(false); });
+    return () => { active = false; };
+  }, [artifactId]);
+
+  return <button aria-label={`Open image created by ${actor}: ${name}`} className="message-generated-image" onClick={() => onOpenArtifact(artifactId)} type="button">
+    {typeof preview === "string" ? <img alt={`Image created by ${actor}`} src={preview} /> : <span>{preview === false ? "Image preview unavailable" : "Loading image…"}</span>}
+    <small>{name}</small>
+  </button>;
+}
+
+function AttachedImage({ attachment, actor, onOpenArtifact }) {
+  const [preview, setPreview] = useState(null);
+  const mediaKind = playableMediaKind(attachment.mediaType);
+  useEffect(() => {
+    let active = true;
+    const mediaType = String(attachment.mediaType ?? "").toLowerCase().split(";", 1)[0];
+    if (!mediaType.startsWith("image/")) return () => { active = false; };
+    runtime.getArtifact(attachment.id).then(({ artifact, contentBase64 }) => {
+      if (!active || !artifact.media_type?.toLowerCase().startsWith("image/")) return;
+      setPreview(inlineImagePreview(artifact.media_type, contentBase64) ?? false);
+    }).catch(() => { if (active) setPreview(false); });
+    return () => { active = false; };
+  }, [attachment.id, attachment.mediaType]);
+
+  if (mediaKind) {
+    return <div className="message-attachment-media">
+      <MediaArtifactPreview artifact={{ id: attachment.id, name: attachment.name, media_type: attachment.mediaType }} compact />
+      <button className="message-attachment-media-name" onClick={() => onOpenArtifact(attachment.id)} type="button">{attachment.name}</button>
+    </div>;
+  }
+
+  if (!String(attachment.mediaType ?? "").toLowerCase().startsWith("image/")) {
+    return <button className="message-attachment" onClick={() => onOpenArtifact(attachment.id)} title={attachment.name} type="button"><FileText size={14} /><span>{attachment.name}</span><ArrowSquareOut size={12} /></button>;
+  }
+  return <button aria-label={`Open image attached by ${actor}: ${attachment.name}`} className="message-attachment-image" onClick={() => onOpenArtifact(attachment.id)} title={attachment.name} type="button">
+    {typeof preview === "string" ? <img alt={`Image attached by ${actor}`} src={preview} /> : <span>{preview === false ? "Image preview unavailable" : "Loading image…"}</span>}
+    <small>{attachment.name}</small>
+  </button>;
+}
+
 function formatRunDuration(milliseconds) {
   if (!Number.isFinite(milliseconds)) return null;
   const seconds = Math.max(0, Math.round(milliseconds / 1000));
@@ -476,6 +527,7 @@ function ChannelMessage({ message, agents, artifacts, onOpenArtifact, onOpenCanv
         <div className="message-markdown">
         <MessageMarkdown>{message.text}</MessageMarkdown>
         </div>
+        {message.imageArtifactIds?.length > 0 && <div aria-label="Images created by this agent" className="message-generated-images">{message.imageArtifactIds.map((artifactId) => <GeneratedImage actor={message.actor} artifactId={artifactId} key={artifactId} onOpenArtifact={onOpenArtifact} />)}</div>}
         {message.interactiveArtifactIds?.map((artifactId) => <InteractiveArtifact
           artifactId={artifactId}
           enabled={interactiveResponsesEnabled}
@@ -487,7 +539,7 @@ function ChannelMessage({ message, agents, artifacts, onOpenArtifact, onOpenCanv
         />)}
         {message.workItemTitle && <span className="timeline-task-tag">{message.workItemTitle}</span>}
         {message.canvasDocument && <button className="message-canvas-context" onClick={() => onOpenCanvas(message.canvasDocument)} type="button"><FileText size={15} /><span>{message.canvasDocument.title}</span><small>Revision {message.canvasDocument.revision}</small></button>}
-        {message.attachments?.length > 0 && <div aria-label="Attached files" className="message-attachments">{message.attachments.map((attachment) => <button className="message-attachment" key={attachment.id} onClick={() => onOpenArtifact(attachment.id)} title={attachment.name} type="button"><FileText size={14} /><span>{attachment.name}</span><ArrowSquareOut size={12} /></button>)}</div>}
+        {message.attachments?.length > 0 && <div aria-label="Attached files" className="message-attachments">{message.attachments.map((attachment) => <AttachedImage actor={message.actor} attachment={attachment} key={attachment.id} onOpenArtifact={onOpenArtifact} />)}</div>}
         {message.artifactId && (
           <button className="message-artifact" onClick={() => onOpenArtifact(message.artifactId)} type="button">
             <GitDiff size={17} />
@@ -722,6 +774,7 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
     if (!initialDraft) return;
     setValue(initialDraft.text);
     setCanvasContext(initialDraft.canvasDocument ?? null);
+    setAttachments(initialDraft.attachments ?? []);
     inputRef.current?.focus();
     onDraftConsumed(initialDraft.token);
   }, [initialDraft?.token]);
@@ -1081,10 +1134,8 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
     const intentAtRequest = userScrollIntentRef.current;
     requestAnimationFrame(() => {
       if (!force && userScrollIntentRef.current !== intentAtRequest) return;
-      const list = channelListRef.current;
-      if (list?.scrollToIndex) {
-        list.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
-      }
+      const scroller = channelFrameRef.current?.querySelector(".channel-scroll");
+      if (scroller) scroller.scrollTo({ top: scroller.scrollHeight, behavior: "auto" });
     });
   }, []);
 
@@ -1243,14 +1294,14 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
       </section>}
       <div className={`workspace-columns ${shareableArtifacts(artifacts).length === 0 && queuedInteractions.length === 0 && !activeInteraction ? "workspace-columns--channel-only" : ""}`}>
         <section className="channel-panel">
-          <div className="channel-presence">
+          {(workingAgents.length > 0 || awaitingAgentResponse || agents.some((agent) => activityAgentStatuses.has(agent.status))) && <div className="channel-presence">
             {workingAgents.length > 0
               ? <span aria-live="polite" className="channel-live channel-live--working" role="status"><CircleNotch className="spin" size={12} />{workingAgents.length === 1 ? `${workingAgents[0].name} is working…` : `${workingAgents.length} agents are working…`}</span>
               : awaitingAgentResponse
                 ? <span aria-label={`Waiting for ${requestedAgent.name} to reply`} aria-live="polite" className="channel-live channel-live--waiting" role="status"><CircleNotch className="spin" size={12} />Waiting for {requestedAgent.name}…</span>
-              : <span className={`channel-live ${runtimeStatus === "offline" ? "channel-live--offline" : ""}`}><i /> {runtimeStatus === "connected" ? "Live" : runtimeStatus === "offline" ? "Offline" : "Reconnecting…"}</span>}
+                : null}
             <AgentActivityDock agents={agents} onOpen={onOpenAgentActivity} />
-          </div>
+          </div>}
           <div className="channel-scroll-frame" ref={channelFrameRef}>
             {activityRows.length === 0 ? <div className={`channel-empty ${query ? "channel-empty--filtered" : ""}`}>
               {query

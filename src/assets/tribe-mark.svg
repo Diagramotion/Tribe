@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <title>Tribe</title>
+  <path d="M10 14H32" stroke="#4EACFF" stroke-linecap="round" stroke-width="9" />
+  <path d="M54 14H32" stroke="#83C5FF" stroke-linecap="round" stroke-width="9" />
+  <path d="M32 54V14" stroke="#59D5BF" stroke-linecap="round" stroke-width="9" />
+  <circle cx="32" cy="14" r="4.5" fill="#E8EFF9" />
+</svg>

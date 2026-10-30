@@ -8,7 +8,7 @@ The values in `src/styles.css` are the implementation source of truth. Keep this
 
 | Role | Tokens | Use |
 | --- | --- | --- |
-| Canvas and surfaces | `--canvas`, `--surface`, `--surface-soft`, `--surface-well`, `--surface-raised`, `--surface-sidebar` | Separate the app, pane, composer, inset controls and floating surfaces by small luminance steps. |
+| Canvas and surfaces | `--canvas`, `--surface`, `--surface-soft`, `--surface-well`, `--surface-raised`, `--surface-chrome` | Keep the sidebar, titlebar and workspace tab rail visibly deeper than the shared page canvas; chat and tabbed pages share that content canvas. Separate contained work areas with smaller luminance steps. |
 | Interaction surfaces | `--surface-hover`, `--surface-selected`, `--surface-control-hover`, `--surface-choice` | Hover and selected states. Reserve the strongest fill for the current selection. |
 | Separators | `--line-subtle`, `--line-control`, `--line-strong` | Use the lowest contrast that still explains a real boundary. Do not outline every row. |
 | Text | `--text`, `--text-secondary`, `--muted`, `--muted-2` | Primary content, supporting content, metadata and tertiary hints, in that order. |
@@ -18,7 +18,8 @@ The values in `src/styles.css` are the implementation source of truth. Keep this
 
 ## Component rules
 
-- **Workspace frame:** the sidebar, breadcrumb and tab rail are compact navigation chrome. Main task content gets the remaining width and height. On desktop, keep chat at least 360px wide; cap the resizable secondary pane at 60% of workspace width and 820px. Narrower screens use the overlay layout. Split panes share a single seam and resize handle; avoid adding a gutter beside the handle.
+- **Workspace frame:** the sidebar, title bar and tab rail use the deeper `--surface-sidebar` chrome shade. Chat and every tabbed workspace page share the `--canvas` content shade; distinct tools can use the raised surface tokens for contained work areas. On desktop, keep chat at least 400px wide and let the resizable secondary pane use the remaining width. Narrower screens use the overlay layout. Split panes share a single seam and resize handle; avoid adding a gutter beside the handle.
+- **Native titlebar:** use the native titlebar region for the workspace identity, first-level tabs and shell actions in one aligned row. Match its height to the platform titlebar; do not leave an empty native strip above a second app header. Put page-specific controls in one toolbar directly below, and do not repeat tabs at a lower level.
 - **Navigation and actions:** selected items use a quiet filled surface without an outline. Expanded sidebars use group labels and spacing; keep separators for the icon-only rail where they clarify tool groups. Hover uses a smaller contrast change. Default routine and utility actions to compact icon-only buttons with an accessible name and tooltip, including toolbar and page-header actions such as add, edit, refresh, open, cancel and close. Use visible text buttons only when the label is needed to complete a form (for example, Save or Connect), confirm a consequential choice, or disambiguate an action that has no recognisable icon. Keep secondary actions quiet; do not turn routine actions into large filled buttons or enlarge controls for emphasis. Use the shared compact control height and reserve stronger fill for the primary action.
 - **Tabs:** align tab rails that operate at the same level. Use a short active underline, not a filled card or a second separator around each tab.
 - **Content groups:** use open layouts by default. A card is appropriate for a distinct approval, error, empty state or self-contained task. Never nest cards or frame ordinary messages and list rows.

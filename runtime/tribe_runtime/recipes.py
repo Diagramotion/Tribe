@@ -13,8 +13,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 RECIPE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
+_EXPECTED_VERSION_UNSET = object()
 _RECIPE_LOCKS_GUARD = threading.Lock()
 _RECIPE_LOCKS: dict[Path, threading.RLock] = {}
+
+
+class WorkflowVersionConflict(ValueError):
+    def __init__(self, current_version: int | None):
+        super().__init__("workflow_version_conflict")
+        self.current_version = current_version
 
 
 def _load_frontmatter(source: str, path: Path) -> dict[str, object]:
@@ -153,6 +160,19 @@ def _normalise_stages(value: object, path: Path | None = None,
         if len(objective) > 2000 or len(guide) > 8000:
             raise ValueError("workflow_stage_guidance_too_long")
         rules = _normalise_rules(item.get("rules", []), "stage rules")
+        position_value = item.get("position")
+        position = None
+        if position_value is not None:
+            if (not isinstance(position_value, dict)
+                    or isinstance(position_value.get("x"), bool)
+                    or not isinstance(position_value.get("x"), (int, float))
+                    or isinstance(position_value.get("y"), bool)
+                    or not isinstance(position_value.get("y"), (int, float))):
+                raise ValueError("workflow_stage_position_invalid")
+            x, y = float(position_value["x"]), float(position_value["y"])
+            if not (-100_000 <= x <= 100_000 and -100_000 <= y <= 100_000):
+                raise ValueError("workflow_stage_position_invalid")
+            position = {"x": x, "y": y}
         transitions = item.get("transitions", [])
         if not isinstance(transitions, list) or len(transitions) > 20:
             raise ValueError("workflow_stage_transitions_invalid")
@@ -172,9 +192,12 @@ def _normalise_stages(value: object, path: Path | None = None,
             if not RECIPE_ID.fullmatch(target) or len(when) > 500:
                 raise ValueError("workflow_stage_transitions_invalid")
             normalised_transitions.append({"to": target, "when": when})
-        stages.append({"id": stage_id, "title": title, "objective": objective,
-                       "guide": guide, "rules": list(rules),
-                       "transitions": normalised_transitions})
+        normalised_stage = {"id": stage_id, "title": title, "objective": objective,
+                            "guide": guide, "rules": list(rules),
+                            "transitions": normalised_transitions}
+        if position is not None:
+            normalised_stage["position"] = position
+        stages.append(normalised_stage)
     if graph_transitions is not None:
         if not stages and graph_transitions:
             raise ValueError("workflow_transitions_require_stages")
@@ -274,8 +297,8 @@ def _parse(path: Path, source: str) -> WorkflowRecipe:
         raise ValueError(f"{path}: terminal_stages must name workflow stages")
     else:
         terminal_stages = tuple(dict.fromkeys(terminal_value))
-    if not instructions and not any(stage.get("guide") for stage in stages):
-        raise ValueError(f"{path}: workflow needs overall or stage guidance")
+    if not instructions and not any(stage.get("guide") for stage in stages) and not stages:
+        raise ValueError(f"{path}: workflow needs at least one stage or some overall guidance")
     return WorkflowRecipe(recipe_id, title, description, int(version_text), instructions,
                           source, stages, objective, rules, tuple(tag.strip() for tag in tags_value),
                           initial_stage, terminal_stages)
@@ -310,18 +333,35 @@ def get_recipe(builtin_dir: Path, user_dir: Path, recipe_id: str,
     return None
 
 
+def list_recipe_versions(builtin_dir: Path, user_dir: Path, recipe_id: str) -> list[int]:
+    """Return every immutable version available for one workflow."""
+    versions: set[int] = set()
+    history = user_dir / ".versions" / recipe_id
+    if history.is_dir():
+        versions.update(
+            int(match.group(1)) for path in history.glob("v*.md")
+            if (match := re.fullmatch(r"v(\d+)\.md", path.name))
+        )
+    for path in (user_dir / f"{recipe_id}.md", builtin_dir / f"{recipe_id}.md"):
+        if path.is_file():
+            versions.add(_parse(path, "user" if path.parent == user_dir else "builtin").version)
+    return sorted(versions, reverse=True)
+
+
 def save_recipe(user_dir: Path, recipe_id: str, title: str, description: str,
                 instructions: str, builtin_dir: Path,
                 stages: object = None, objective: str | None = None,
                 rules: object = None, tags: object = None,
                 initial_stage: str | None = None,
-                terminal_stages: object = None, transitions: object = None) -> WorkflowRecipe:
+                terminal_stages: object = None, transitions: object = None,
+                expected_version: object = _EXPECTED_VERSION_UNSET) -> WorkflowRecipe:
     if not isinstance(recipe_id, str) or not RECIPE_ID.fullmatch(recipe_id):
         raise ValueError("recipe_id_must_be_2_to_64_lowercase_letters_digits_underscore_or_hyphen")
     with _recipe_lock(user_dir, recipe_id):
         return _save_recipe_unlocked(
             user_dir, recipe_id, title, description, instructions, builtin_dir,
             stages, objective, rules, tags, initial_stage, terminal_stages, transitions,
+            expected_version,
         )
 
 
@@ -330,7 +370,8 @@ def _save_recipe_unlocked(user_dir: Path, recipe_id: str, title: str, descriptio
                           stages: object = None, objective: str | None = None,
                           rules: object = None, tags: object = None,
                           initial_stage: str | None = None,
-                          terminal_stages: object = None, transitions: object = None) -> WorkflowRecipe:
+                          terminal_stages: object = None, transitions: object = None,
+                          expected_version: object = _EXPECTED_VERSION_UNSET) -> WorkflowRecipe:
     if not RECIPE_ID.fullmatch(recipe_id):
         raise ValueError("recipe_id_must_be_2_to_64_lowercase_letters_digits_underscore_or_hyphen")
     if not all(isinstance(value, str) for value in (title, description, instructions)):
@@ -341,6 +382,12 @@ def _save_recipe_unlocked(user_dir: Path, recipe_id: str, title: str, descriptio
     if len(instructions) > 20_000:
         raise ValueError("workflow_guide_must_be_no_longer_than_20000_characters")
     current = get_recipe(builtin_dir, user_dir, recipe_id)
+    if expected_version is not _EXPECTED_VERSION_UNSET:
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 0:
+            raise ValueError("workflow_expected_version_must_be_a_non_negative_integer")
+        current_version = current.version if current else 0
+        if expected_version != current_version:
+            raise WorkflowVersionConflict(current.version if current else None)
     history = user_dir / ".versions" / recipe_id
     historical_versions = [
         int(match.group(1))
@@ -383,8 +430,8 @@ def _save_recipe_unlocked(user_dir: Path, recipe_id: str, title: str, descriptio
     if (not isinstance(saved_terminal, list) or len(saved_terminal) > 20
             or any(not isinstance(stage_id, str) or stage_id not in stage_ids for stage_id in saved_terminal)):
         raise ValueError("workflow_terminal_stage_not_found")
-    if not instructions and not any(stage.get("guide") for stage in saved_stages):
-        raise ValueError("workflow_requires_overall_or_stage_guidance")
+    if not instructions and not any(stage.get("guide") for stage in saved_stages) and not saved_stages:
+        raise ValueError("workflow_requires_stage_or_overall_guidance")
     version = max([current.version if current else 0, *historical_versions]) + 1
     content = (
         "---\n"

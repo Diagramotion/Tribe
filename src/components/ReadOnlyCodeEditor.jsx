@@ -39,12 +39,21 @@ const editorTheme = {
   ".cm-foldGutter": { width: "12px" },
 };
 
-export function ReadOnlyCodeEditor({ path, content, wrapLines }) {
+export function ReadOnlyCodeEditor({ path, content, wrapLines, editable = false, onChange, onSelectionChange, ariaLabel, maxLength = Infinity }) {
   const hostRef = useRef(null);
+  const viewRef = useRef(null);
   const updateWrapRef = useRef(null);
   const wrapLinesRef = useRef(wrapLines);
+  const contentRef = useRef(content);
+  const latestContentRef = useRef(content);
+  const onChangeRef = useRef(onChange);
+  const onSelectionChangeRef = useRef(onSelectionChange);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+
+  onChangeRef.current = onChange;
+  onSelectionChangeRef.current = onSelectionChange;
+  latestContentRef.current = content;
 
   useEffect(() => {
     let active = true;
@@ -74,22 +83,37 @@ export function ReadOnlyCodeEditor({ path, content, wrapLines }) {
           { tag: [tags.monospace], color: "#95d4c5" },
         ]);
         if (!active || !hostRef.current) return;
+        const initialContent = latestContentRef.current;
+        contentRef.current = initialContent;
+        const editableExtension = editable ? EditorView.updateListener.of((update) => {
+          if (update.docChanged) {
+            contentRef.current = update.state.doc.toString();
+            onChangeRef.current?.(contentRef.current);
+          }
+          if (update.selectionSet) {
+            const selection = update.state.selection.main;
+            onSelectionChangeRef.current?.({ from: selection.from, to: selection.to, text: update.state.sliceDoc(selection.from, selection.to) });
+          }
+        }) : [];
         view = new EditorView({
           parent: hostRef.current,
           state: EditorState.create({
-            doc: content,
+            doc: initialContent,
             extensions: [
               basicSetup,
               language,
               syntaxHighlighting(highlightStyle),
-              EditorState.readOnly.of(true),
-              EditorView.editable.of(false),
+              EditorState.readOnly.of(!editable),
+              EditorView.editable.of(editable),
+              editableExtension,
+              Number.isFinite(maxLength) ? EditorState.transactionFilter.of((transaction) => transaction.newDoc.length > maxLength ? [] : transaction) : [],
               wrapping.of(wrapLinesRef.current ? EditorView.lineWrapping : []),
-              EditorView.contentAttributes.of({ tabindex: "0", "aria-label": `${path} source code` }),
+              EditorView.contentAttributes.of({ tabindex: "0", "aria-label": ariaLabel ?? `${path} source code` }),
               EditorView.theme(editorTheme),
             ],
           }),
         });
+        viewRef.current = view;
         updateWrapRef.current = (enabled) => view?.dispatch({ effects: wrapping.reconfigure(enabled ? EditorView.lineWrapping : []) });
         setLoading(false);
       } catch {
@@ -97,8 +121,17 @@ export function ReadOnlyCodeEditor({ path, content, wrapLines }) {
       }
     }
     void mountEditor();
-    return () => { active = false; updateWrapRef.current = null; view?.destroy(); };
-  }, [path, content]);
+    return () => { active = false; updateWrapRef.current = null; viewRef.current = null; view?.destroy(); };
+  }, [path, editable, ariaLabel, maxLength]);
+
+  useEffect(() => {
+    if (editable || !hostRef.current) return;
+    if (contentRef.current === content) return;
+    const view = viewRef.current;
+    if (!view) return;
+    contentRef.current = content;
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: content } });
+  }, [content, editable]);
 
   useEffect(() => {
     wrapLinesRef.current = wrapLines;

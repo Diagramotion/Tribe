@@ -1,22 +1,26 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, ChatCircleDots, DownloadSimple } from "@phosphor-icons/react";
+import { ArrowLeft, CaretLeft, CaretRight, ChatCircleDots, DownloadSimple, X } from "@phosphor-icons/react";
 import { canvasFilename, downloadCanvasDocument, downloadCanvasSvg, renderCanvasDiagramSvg } from "../domain/canvas-export.js";
 import { applySelectedHunks, reviewDiff } from "../domain/canvas-diff.js";
 import { selectedCanvasText } from "../domain/canvas-selection.js";
+import { findTextQuoteRange, rangeAtTextOffsets, textSelectionOffsets } from "../domain/artifact-anchor.js";
 import { runtime } from "../api/runtime.js";
 import { DiagramPreview } from "../components/DiagramPreview.jsx";
 import { IconButton } from "../components/WorkspaceSidebar.jsx";
 import { MarkdownContent } from "../components/MarkdownContent.jsx";
+import { ReadOnlyCodeEditor } from "../components/ReadOnlyCodeEditor.jsx";
 
-function CanvasPreview({ document, onTextSelection }) {
+function CanvasPreview({ document, pageId, onTextSelection }) {
   function captureSelection(event) {
-    const quote = selectedCanvasText(event.currentTarget, window.getSelection());
-    if (quote) onTextSelection?.(quote);
+    const selected = window.getSelection();
+    const quote = selectedCanvasText(event.currentTarget, selected);
+    const range = selected?.rangeCount ? selected.getRangeAt(0) : null;
+    if (quote && range) onTextSelection?.(quote, { ...textSelectionOffsets(event.currentTarget, range), rect: range.getBoundingClientRect(), range: range.cloneRange() });
   }
 
-  if (document.kind === "markdown") return <article className={`canvas-markdown${document.body.trim() ? "" : " canvas-markdown--empty"}`} onKeyUp={captureSelection} onMouseUp={captureSelection}>{document.body.trim() ? <MarkdownContent>{document.body}</MarkdownContent> : <p className="canvas-empty">Nothing to preview yet.</p>}</article>;
-  if (document.kind === "diagram") return <div className="canvas-diagram" onKeyUp={captureSelection} onMouseUp={captureSelection}><DiagramPreview source={document.body} /></div>;
-  return <pre className={`canvas-preview canvas-preview--${document.kind}`} onKeyUp={captureSelection} onMouseUp={captureSelection}>{document.body}</pre>;
+  if (document.kind === "markdown") return <article id={pageId} className={`canvas-markdown${document.body.trim() ? "" : " canvas-markdown--empty"}`} onKeyUp={captureSelection} onMouseUp={captureSelection}>{document.body.trim() ? <MarkdownContent>{document.body}</MarkdownContent> : <p className="canvas-empty">Nothing to preview yet.</p>}</article>;
+  if (document.kind === "diagram") return <div id={pageId} className="canvas-diagram" onKeyUp={captureSelection} onMouseUp={captureSelection}><DiagramPreview source={document.body} /></div>;
+  return <pre id={pageId} className={`canvas-preview canvas-preview--${document.kind}`} onKeyUp={captureSelection} onMouseUp={captureSelection}>{document.body}</pre>;
 }
 
 function CommentThread({ missionId, documentId, thread, onRefresh }) {
@@ -78,12 +82,22 @@ export function CanvasView({ document: summary, refreshKey = 0, onBack, backLabe
   const [selection, setSelection] = useState({ quote: "", startOffset: null, endOffset: null });
   const [commentBody, setCommentBody] = useState("");
   const [assignee, setAssignee] = useState("");
+  const [commentNavigatorOpen, setCommentNavigatorOpen] = useState(false);
+  const [activeThreadIndex, setActiveThreadIndex] = useState(0);
+  const [commentDrafts, setCommentDrafts] = useState([]);
+  const [commentPopover, setCommentPopover] = useState(null);
+  const [commentNavigatorPosition, setCommentNavigatorPosition] = useState(null);
+  const [postingCommentDrafts, setPostingCommentDrafts] = useState(false);
+  const [pendingNavigationThreadId, setPendingNavigationThreadId] = useState(null);
   const [reviewingProposalId, setReviewingProposalId] = useState(null);
   const [selectedHunks, setSelectedHunks] = useState([]);
   const [saving, setSaving] = useState(false);
   const [svgExporting, setSvgExporting] = useState(false);
   const [error, setError] = useState("");
   const dirtyRef = useRef(false);
+  const selectionRangeRef = useRef(null);
+  const commentNavigatorRef = useRef(null);
+  const commentToggleRef = useRef(null);
   const draftStorageKey = summary?.id && accessMissionId
     ? `tribe.canvas.draft:${summary.project_id ?? summary.mission_id}:${summary.id}` : "";
 
@@ -109,6 +123,11 @@ export function CanvasView({ document: summary, refreshKey = 0, onBack, backLabe
     setHistoryContent(null);
     setRecoveredDraft(null);
     setError("");
+    setCommentNavigatorOpen(false);
+    setActiveThreadIndex(0);
+    setCommentDrafts([]);
+    setCommentPopover(null);
+    selectionRangeRef.current = null;
     dirtyRef.current = false;
     if (summary?.id && accessMissionId) {
       runtime.getCanvasDocument(accessMissionId, summary.id).then(({ document }) => {
@@ -164,6 +183,159 @@ export function CanvasView({ document: summary, refreshKey = 0, onBack, backLabe
   useEffect(() => {
     if (refreshKey && detail) void loadDetail({ preserveDraft: true }).catch((loadError) => setError(loadError.message));
   }, [refreshKey]);
+
+  function placeCommentPopover(rect, details) {
+    const width = Math.min(340, window.innerWidth - 24);
+    const height = 278;
+    const left = Math.max(12, Math.min(window.innerWidth - width - 12, rect.left + rect.width / 2 - width / 2));
+    const below = rect.bottom + 10;
+    const top = below + height < window.innerHeight - 12 ? below : Math.max(12, rect.top - height - 10);
+    setCommentPopover({ ...details, left, top });
+  }
+
+  function selectPreviewText(quote, details = {}) {
+    if (viewRevision !== null) return;
+    if (dirtyRef.current) {
+      setError("Save your edits before commenting on this document revision.");
+      return;
+    }
+    setSelection({ quote, startOffset: details.startOffset ?? null, endOffset: details.endOffset ?? null });
+    if (details.range) {
+      selectionRangeRef.current = details.range;
+      setCommentNavigatorOpen(false);
+      setCommentBody("");
+      setAssignee("");
+      placeCommentPopover(details.rect, {
+        quote,
+        startOffset: details.startOffset ?? null,
+        endOffset: details.endOffset ?? null,
+        baseRevision: detail?.revision,
+      });
+    }
+  }
+
+  function closeCommentPopover() {
+    setCommentPopover(null);
+    selectionRangeRef.current = null;
+  }
+
+  function openCommentNavigator() {
+    const trigger = commentToggleRef.current;
+    const scope = trigger?.closest(".project-tool-pane") ?? trigger?.closest(".canvas-view");
+    const bounds = scope?.getBoundingClientRect();
+    if (bounds) {
+      const width = Math.max(260, Math.min(380, bounds.width - 24));
+      setCommentNavigatorPosition({ left: Math.max(12, bounds.right - width - 12), top: Math.max(68, bounds.top + 8), width });
+    }
+    setCommentNavigatorOpen(true);
+  }
+
+  function openGeneralComment() {
+    const trigger = commentToggleRef.current;
+    const rect = trigger?.getBoundingClientRect();
+    if (!rect) return;
+    setSelection({ quote: "", startOffset: null, endOffset: null });
+    setAssignee("");
+    setCommentBody("");
+    setCommentNavigatorOpen(false);
+    placeCommentPopover(rect, { quote: "", startOffset: null, endOffset: null, baseRevision: viewRevision ?? detail?.revision });
+  }
+
+  useEffect(() => {
+    if (!commentPopover || !selectionRangeRef.current) return undefined;
+    const reposition = () => {
+      const range = selectionRangeRef.current;
+      if (range) placeCommentPopover(range.getBoundingClientRect(), commentPopover);
+    };
+    window.addEventListener("scroll", reposition, true);
+    window.addEventListener("resize", reposition);
+    return () => {
+      window.removeEventListener("scroll", reposition, true);
+      window.removeEventListener("resize", reposition);
+    };
+  }, [commentPopover?.quote]);
+
+  useEffect(() => {
+    if (!commentNavigatorOpen) return undefined;
+    const closeOnOutsideClick = (event) => {
+      if (!commentNavigatorRef.current?.contains(event.target) && !commentToggleRef.current?.contains(event.target)) setCommentNavigatorOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    return () => document.removeEventListener("pointerdown", closeOnOutsideClick);
+  }, [commentNavigatorOpen]);
+
+  useEffect(() => {
+    if (!pendingNavigationThreadId || !detail) return;
+    const thread = detail.threads.find((item) => item.id === pendingNavigationThreadId);
+    if (!thread) { setPendingNavigationThreadId(null); return; }
+    if (thread.base_revision !== (viewRevision ?? detail.revision)) {
+      if (viewRevision !== thread.base_revision) {
+        setSaving(true);
+        runtime.getCanvasVersion(accessMissionId, detail.id, thread.base_revision).then(({ version }) => {
+          setViewRevision(thread.base_revision);
+          setHistoryContent(version);
+          setMode("preview");
+        }).catch((loadError) => setError(loadError.message)).finally(() => setSaving(false));
+      }
+      return;
+    }
+    if (mode !== "preview") { setMode("preview"); return; }
+    const page = document.getElementById(`canvas-preview-${detail.id}`);
+    const range = thread.start_offset !== null && thread.end_offset !== null
+      ? rangeAtTextOffsets(page, thread.start_offset, thread.end_offset)
+      : findTextQuoteRange(page, { type: "text_quote", quote: thread.quote });
+    if (range) {
+      const selected = window.getSelection();
+      selected?.removeAllRanges();
+      selected?.addRange(range);
+      range.startContainer.parentElement?.scrollIntoView({ behavior: "smooth", block: "center" });
+    } else page?.scrollIntoView({ behavior: "smooth", block: "center" });
+    setPendingNavigationThreadId(null);
+  }, [pendingNavigationThreadId, detail, viewRevision, mode, historyContent, draft]);
+
+  function navigateComment(index) {
+    if (index < 0 || index >= (detail?.threads.length ?? 0)) return;
+    setActiveThreadIndex(index);
+    setPendingNavigationThreadId(detail.threads[index].id);
+  }
+
+  function queueCommentDraft(event) {
+    event.preventDefault();
+    if (!detail || !commentBody.trim() || dirtyRef.current || saving || !commentPopover) return;
+    setCommentDrafts((current) => [...current, {
+      id: crypto.randomUUID(), body: commentBody.trim(), quote: commentPopover.quote,
+      startOffset: commentPopover.startOffset, endOffset: commentPopover.endOffset,
+      baseRevision: commentPopover.baseRevision ?? detail.revision, assignee: assignee.trim() || null,
+    }]);
+    setCommentBody("");
+    setAssignee("");
+    closeCommentPopover();
+    openCommentNavigator();
+  }
+
+  function updateCommentDraft(id, body) {
+    setCommentDrafts((current) => current.map((item) => item.id === id ? { ...item, body } : item));
+  }
+
+  async function postCommentDrafts() {
+    if (postingCommentDrafts || !commentDrafts.length || !detail) return;
+    setPostingCommentDrafts(true);
+    setError("");
+    const failed = [];
+    for (const draftComment of commentDrafts) {
+      try {
+        await runtime.addCanvasComment(accessMissionId, detail.id, {
+          body: draftComment.body, baseRevision: draftComment.baseRevision,
+          quote: draftComment.quote, startOffset: draftComment.startOffset,
+          endOffset: draftComment.endOffset, assignee: draftComment.assignee,
+        });
+      } catch (postError) { failed.push({ ...draftComment, error: postError.message }); }
+    }
+    setCommentDrafts(failed);
+    await loadDetail({ preserveDraft: true });
+    if (failed.length) setError(`${failed.length} comment${failed.length === 1 ? "" : "s"} could not be posted. Your drafts are still here.`);
+    setPostingCommentDrafts(false);
+  }
 
   async function save(content = draft) {
     if (!detail || !content || saving) return;
@@ -259,10 +431,6 @@ export function CanvasView({ document: summary, refreshKey = 0, onBack, backLabe
     });
   }
 
-  function selectPreviewText(quote) {
-    setSelection({ quote, startOffset: null, endOffset: null });
-  }
-
   async function loadVersion(revision) {
     if (!revision || revision === detail.revision) {
       setViewRevision(null);
@@ -277,40 +445,6 @@ export function CanvasView({ document: summary, refreshKey = 0, onBack, backLabe
       setHistoryContent(version);
     } catch (versionError) {
       setError(versionError.message);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function addComment(event) {
-    event.preventDefault();
-    if (!detail || !commentBody.trim() || saving) return;
-    if (dirtyRef.current) {
-      setError("Save your document edits before anchoring a comment to this revision.");
-      return;
-    }
-    if (new TextEncoder().encode(selection.quote).length > 4096) {
-      setError("Select a shorter passage before commenting. The attached passage can be up to 4 KB.");
-      return;
-    }
-    const revision = viewRevision ?? detail.revision;
-    setSaving(true);
-    setError("");
-    try {
-      await runtime.addCanvasComment(accessMissionId, detail.id, {
-        body: commentBody,
-        baseRevision: revision,
-        quote: selection.quote,
-        startOffset: selection.startOffset,
-        endOffset: selection.endOffset,
-        assignee: assignee.trim() || null,
-      });
-      setCommentBody("");
-      setAssignee("");
-      setSelection({ quote: "", startOffset: null, endOffset: null });
-      await loadDetail({ preserveDraft: true });
-    } catch (commentError) {
-      setError(commentError.message);
     } finally {
       setSaving(false);
     }
@@ -379,7 +513,7 @@ export function CanvasView({ document: summary, refreshKey = 0, onBack, backLabe
       {historical ? <button className="button button--primary" disabled={saving} onClick={() => { setDraft(historyContent); dirtyRef.current = true; setViewRevision(null); setHistoryContent(null); }} type="button">Restore as new revision</button>
         : <button className="button button--primary" disabled={saving || !dirtyRef.current} onClick={() => void save()} type="button">{saving ? "Saving…" : "Save changes"}</button>}
     </div>
-    <div className="canvas-title-row"><div><span className="eyebrow">Shared document · {summary.mission_title}</span><input aria-label="Document title" disabled={historical} maxLength={240} onChange={(event) => { setDraft({ ...draft, title: event.target.value }); dirtyRef.current = true; }} value={historical ? shown.title : draft.title} /></div><div className="canvas-mode-switch"><button aria-pressed={mode === "edit"} className={mode === "edit" ? "active" : ""} onClick={() => setMode("edit")} type="button">Edit</button><button aria-pressed={mode === "preview"} className={mode === "preview" ? "active" : ""} onClick={() => setMode("preview")} type="button">Preview</button></div></div>
+    <div className="canvas-title-row"><div><span className="eyebrow">Shared document · {summary.mission_title}</span><input aria-label="Document title" disabled={historical} maxLength={240} onChange={(event) => { setDraft({ ...draft, title: event.target.value }); dirtyRef.current = true; }} value={historical ? shown.title : draft.title} /></div><div className="canvas-title-actions"><button aria-expanded={commentNavigatorOpen} className="canvas-comments-toggle" disabled={mode === "edit" && !historical} onClick={() => commentNavigatorOpen ? setCommentNavigatorOpen(false) : openCommentNavigator()} ref={commentToggleRef} type="button"><ChatCircleDots size={15} /> Comments <span>{detail.threads.length + commentDrafts.length}</span></button><div className="canvas-mode-switch"><button aria-pressed={mode === "edit"} className={mode === "edit" ? "active" : ""} onClick={() => setMode("edit")} type="button">Edit</button><button aria-pressed={mode === "preview"} className={mode === "preview" ? "active" : ""} onClick={() => setMode("preview")} type="button">Preview</button></div></div></div>
     {recoveredDraft && <div className={`canvas-draft-recovery ${recoveredDraft.baseRevision !== recoveredDraft.currentRevision ? "canvas-draft-recovery--stale" : ""}`} role="status">
       <div><strong>Unsaved changes recovered</strong><span>{recoveredDraft.baseRevision === recoveredDraft.currentRevision
         ? `Restored from revision ${recoveredDraft.baseRevision}.`
@@ -391,8 +525,18 @@ export function CanvasView({ document: summary, refreshKey = 0, onBack, backLabe
     </div>}
     {error && <div className="canvas-error" role="alert">{error} {error.includes("draft is preserved") && <button className="button button--quiet" onClick={() => void reloadLatest()} type="button">Reload latest</button>}</div>}
     {mode === "edit" && !historical
-      ? <textarea aria-label="Document content" className="canvas-editor" maxLength={256 * 1024} onChange={(event) => { setDraft({ ...draft, body: event.target.value }); dirtyRef.current = true; }} onSelect={(event) => { const { selectionStart, selectionEnd, value } = event.target; const quote = value.slice(selectionStart, selectionEnd); setSelection(quote ? { quote, startOffset: selectionStart, endOffset: selectionEnd } : { quote: "", startOffset: null, endOffset: null }); }} placeholder="Write your document in Markdown…" value={draft.body} />
-      : <CanvasPreview document={shown} onTextSelection={selectPreviewText} />}
+      ? <div className="canvas-editor-surface"><ReadOnlyCodeEditor
+        ariaLabel="Document source editor"
+        content={draft.body}
+        editable
+        key={`${detail.id}:${draft.kind}:${draft.language ?? ""}`}
+        maxLength={256 * 1024}
+        onChange={(body) => { setDraft((current) => ({ ...current, body })); dirtyRef.current = true; }}
+        onSelectionChange={({ from, to, text }) => setSelection(text ? { quote: text, startOffset: from, endOffset: to } : { quote: "", startOffset: null, endOffset: null })}
+        path={`document.${draft.language || (draft.kind === "markdown" ? "md" : "txt")}`}
+        wrapLines
+      /></div>
+      : <CanvasPreview document={shown} pageId={`canvas-preview-${detail.id}`} onTextSelection={selectPreviewText} />}
     {pending.length > 0 && <section className="canvas-proposals"><div className="canvas-section-heading"><div><h3>Proposed changes</h3><p>Agent edits need your review before becoming the current version.</p></div><span>{pending.length} pending</span></div>
       {pending.map((proposal) => {
         const diff = reviewingProposalId === proposal.id ? reviewDiff(detail.current.body, proposal.body) : null;
@@ -418,9 +562,19 @@ export function CanvasView({ document: summary, refreshKey = 0, onBack, backLabe
         </article>;
       })}
     </section>}
-    <section className="canvas-comments"><div className="canvas-section-heading"><div><h3>Comments</h3><p>Comments stay anchored to the revision and text they refer to.</p></div><span>{detail.threads.filter((thread) => !thread.resolved_at).length} open</span></div>
-      {detail.threads.map((thread) => <CommentThread documentId={detail.id} key={thread.id} missionId={accessMissionId} onRefresh={() => loadDetail({ preserveDraft: true })} thread={thread} />)}
-      <form className="canvas-comment-composer" onSubmit={(event) => void addComment(event)}>{selection.quote && <blockquote>“{selection.quote}”</blockquote>}{dirtyRef.current && <p className="canvas-comment-note">Save your edits before adding a comment to this revision.</p>}<textarea aria-label="Add a document comment" maxLength={8192} onChange={(event) => setCommentBody(event.target.value)} placeholder="Add a comment…" value={commentBody} /><div><input aria-label="Assign comment to an agent" maxLength={80} onChange={(event) => setAssignee(event.target.value)} placeholder="Assign to an agent, e.g. @reviewer" value={assignee} /><button className="button button--primary" disabled={saving || dirtyRef.current || !commentBody.trim()} type="submit">Comment</button></div></form>
-    </section>
+    {commentPopover && <form className="artifact-selection-composer artifact-selection-composer--canvas" onSubmit={(event) => queueCommentDraft(event)} style={{ left: commentPopover.left, top: commentPopover.top }}>
+      <header><strong>{commentPopover.quote ? "Comment on selection" : "New comment"}</strong><IconButton label="Close comment composer" onClick={closeCommentPopover}><X size={14} /></IconButton></header>
+      {commentPopover.quote && <blockquote className="artifact-selection-quote">“{commentPopover.quote}”</blockquote>}
+      {dirtyRef.current && <p className="canvas-comment-note">Save your edits before commenting on this revision.</p>}
+      <textarea autoFocus aria-label="Add a document comment" maxLength={8192} onChange={(event) => setCommentBody(event.target.value)} placeholder="Write a comment…" value={commentBody} />
+      <input aria-label="Assign comment to an agent" maxLength={80} onChange={(event) => setAssignee(event.target.value)} placeholder="Assign to an agent (optional)" value={assignee} />
+      <div><button className="button button--quiet" onClick={closeCommentPopover} type="button">Cancel</button><button className="button button--primary" disabled={saving || dirtyRef.current || !commentBody.trim()} type="submit">Add to review</button></div>
+    </form>}
+    {commentNavigatorOpen && <aside aria-label="Document comments" className="artifact-review-navigator canvas-comment-navigator" ref={commentNavigatorRef} role="dialog" style={commentNavigatorPosition}>
+      <header><strong>Comments <span>{detail.threads.length + commentDrafts.length}</span></strong><button className="button button--quiet" disabled={mode === "edit" && !historical} onClick={openGeneralComment} type="button">New</button><IconButton disabled={!detail.threads.length} label="Previous comment" onClick={() => navigateComment((activeThreadIndex - 1 + detail.threads.length) % detail.threads.length)}><CaretLeft size={14} /></IconButton><IconButton disabled={!detail.threads.length} label="Next comment" onClick={() => navigateComment((activeThreadIndex + 1) % detail.threads.length)}><CaretRight size={14} /></IconButton><IconButton label="Close comments" onClick={() => setCommentNavigatorOpen(false)}><X size={14} /></IconButton></header>
+      {detail.threads.length > 0 ? <div className="artifact-review-navigator-list" aria-label="Comment threads">{detail.threads.map((thread, index) => <button aria-current={activeThreadIndex === index ? "true" : undefined} key={thread.id} onClick={() => navigateComment(index)} type="button"><span>{thread.quote || thread.comments[0]?.body || "Comment"}</span><small>{thread.resolved_at ? "Resolved" : "Open"} · Rev {thread.base_revision}</small></button>)}</div> : <p className="artifact-review-navigator-empty">No comments yet. Select text or add a general comment.</p>}
+      {detail.threads[activeThreadIndex] && <CommentThread documentId={detail.id} key={detail.threads[activeThreadIndex].id} missionId={accessMissionId} onRefresh={() => loadDetail({ preserveDraft: true })} thread={detail.threads[activeThreadIndex]} />}
+      {commentDrafts.length > 0 && <section className="artifact-review-drafts"><strong>Ready to post · {commentDrafts.length}</strong>{commentDrafts.map((item) => <div className="artifact-review-draft" key={item.id}>{item.quote && <blockquote>“{item.quote}”</blockquote>}<textarea aria-label="Edit pending comment" maxLength={8192} onChange={(event) => updateCommentDraft(item.id, event.target.value)} value={item.body} /><button className="button button--quiet" onClick={() => setCommentDrafts((current) => current.filter((draftItem) => draftItem.id !== item.id))} type="button">Remove</button>{item.error && <small role="alert">{item.error}</small>}</div>)}<button className="button button--primary artifact-review-post-all" disabled={postingCommentDrafts || !commentDrafts.some((item) => item.body.trim())} onClick={() => void postCommentDrafts()} type="button">{postingCommentDrafts ? "Posting…" : `Post ${commentDrafts.length} comment${commentDrafts.length === 1 ? "" : "s"}`}</button></section>}
+    </aside>}
   </section>;
 }

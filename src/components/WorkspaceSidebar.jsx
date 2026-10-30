@@ -2,8 +2,9 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   CaretDown, CaretRight, ChatCircleDots, ClockCounterClockwise, DotsThree,
-  FileText, FolderOpen, FolderSimple, Gear, GitBranch, Plus, Sparkle, Trash, UsersThree,
+  FileText, FolderOpen, FolderSimple, Gear, GitBranch, Globe, Plus, Sparkle, Trash,
 } from "@phosphor-icons/react";
+import tribeMark from "../assets/tribe-mark.svg";
 import { compactChatTitle } from "../domain/chat-title.js";
 import { missionStatusLabel } from "../domain/labels.js";
 
@@ -57,6 +58,7 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
     };
   }, []);
   const workspaceItems = [
+    { label: "Browser", icon: Globe, tab: "Browser" },
     { label: "Skills", icon: Sparkle, tab: "Skills" },
     { label: "Workflows", icon: GitBranch, tab: "Recipes" },
   ];
@@ -65,7 +67,7 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
   return (
     <aside className={`sidebar ${collapsed ? "sidebar--collapsed" : ""}`}>
       <div className="brand-row">
-        <span className="brand-mark" aria-hidden="true"><UsersThree size={23} weight="fill" /></span>
+        <span className="brand-mark" aria-hidden="true"><img alt="" src={tribeMark} /></span>
         {!collapsed && <span className="brand-name">Tribe</span>}
       </div>
 

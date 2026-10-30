@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { insertSlashCommand, parseMissionPrompt, slashCommandOptions } from "../src/domain/slash-commands.js";
 
 const recipes = [
-  { id: "goal-driven-sdlc", title: "Goal-driven SDLC", description: "Plan and verify." },
-  { id: "bug-fix", title: "Bug fix", description: "Fix a defect." },
+  { id: "goal-driven-sdlc", title: "Goal-driven SDLC", description: "Plan and verify.", version: 1 },
+  { id: "bug-fix", title: "Bug fix", description: "Fix a defect.", version: 3 },
 ];
 const skills = [
   { id: "skill-123", name: "Analytics Dashboard", description: "Build dashboards." },
@@ -12,16 +12,19 @@ const skills = [
 
 test("plain chat has no mode or skill directives", () => {
   assert.deepEqual(parseMissionPrompt("Explain this project", recipes, skills), {
-    text: "Explain this project", recipeId: null, selectedSkills: [],
+    text: "Explain this project", recipeId: null, recipeVersion: null, selectedSkills: [],
   });
 });
 
 test("goal, workflow and skill slash commands are removed from the user message", () => {
   assert.deepEqual(parseMissionPrompt("/goal /skill analytics-dashboard Improve onboarding", recipes, skills), {
-    text: "Improve onboarding", recipeId: "goal-driven-sdlc", selectedSkills: ["skill-123"],
+    text: "Improve onboarding", recipeId: "goal-driven-sdlc", recipeVersion: null, selectedSkills: ["skill-123"],
   });
   assert.deepEqual(parseMissionPrompt("/workflow bug-fix Fix the login regression", recipes, skills), {
-    text: "Fix the login regression", recipeId: "bug-fix", selectedSkills: [],
+    text: "Fix the login regression", recipeId: "bug-fix", recipeVersion: null, selectedSkills: [],
+  });
+  assert.deepEqual(parseMissionPrompt("/workflow bug-fix@v2 Fix this", recipes, skills), {
+    text: "Fix this", recipeId: "bug-fix", recipeVersion: 2, selectedSkills: [],
   });
 });
 
@@ -36,5 +39,6 @@ test("slash menu lists commands and inserts at the active token", () => {
 test("ambiguous or unknown directives fail before mission creation", () => {
   assert.match(parseMissionPrompt("/goal /workflow bug-fix Fix this", recipes, skills).error, /either goal mode/);
   assert.match(parseMissionPrompt("/workflow missing Fix this", recipes, skills).error, /not available/);
+  assert.match(parseMissionPrompt("/workflow bug-fix@v0 Fix this", recipes, skills).error, /valid saved workflow version/);
   assert.match(parseMissionPrompt("/skill unknown Fix this", recipes, skills).error, /not available/);
 });

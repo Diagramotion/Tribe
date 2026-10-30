@@ -9,9 +9,12 @@ import re
 import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
+from .browser_sessions import BROWSER_ACTION_TOOLS
 from .mcp_registry import MCPRegistry
 from .skills import SkillCatalog
+from .transient_media import sanitized_browser_messages
 from .workspace import WorkspaceTools
 
 if TYPE_CHECKING:
@@ -56,6 +59,7 @@ def build_capabilities(
     model_context_window: int | None = None,
     model_max_output_tokens: int | None = None,
     tool_permissions: tuple[str, ...] | None = None,
+    image_generator=None,
     after_model_response=None,
     context_pruning_enabled: bool = False,
 ) -> list[object]:
@@ -72,6 +76,7 @@ def build_capabilities(
         from pydantic_ai.capabilities import (
             HandleDeferredToolCalls,
             Hooks,
+            ImageGeneration,
             LocalWorkspace,
             WebFetch,
             WebSearch,
@@ -80,6 +85,7 @@ def build_capabilities(
         from pydantic_ai_harness import FileSystem, Shell, Skills
         from pydantic_ai_harness.compaction import SummarizingCompaction
         from pydantic_ai_harness.step_persistence import SqliteStepStore, StepPersistence
+
         from .context_pruning import ContextPruning
     except ImportError as error:
         raise RuntimeError(
@@ -91,6 +97,8 @@ def build_capabilities(
     approved_calls = approved_tool_call_ids if approved_tool_call_ids is not None else set()
 
     def mcp_action(tool_name: str) -> tuple[str, str] | None:
+        if tool_name in BROWSER_ACTION_TOOLS:
+            return ("browser", tool_name.removeprefix("browser_"))
         if not mcp_registry or not project_id:
             return None
         return mcp_registry.approval_for(project_id, tool_name)
@@ -194,12 +202,27 @@ def build_capabilities(
             command = command_text(args)
             if mcp_tool:
                 server_name, tool_name = mcp_tool
-                title = f"Run MCP action {server_name}.{tool_name}"
-                target = f"MCP server {server_name} · {tool_name}"
+                title = (f"Use browser · {tool_name.replace('_', ' ')}" if server_name == "browser"
+                         else f"Run MCP action {server_name}.{tool_name}")
+                target = ("Browser session" if server_name == "browser"
+                          else f"MCP server {server_name} · {tool_name}")
                 redacted_args = redact_mcp_arguments(args)
+                if server_name == "browser":
+                    target_url = args.get("url") if isinstance(args, dict) else None
+                    try:
+                        safe_host = urlsplit(target_url).hostname if isinstance(target_url, str) else None
+                    except ValueError:
+                        safe_host = None
+                    redacted_args = {
+                        key: (safe_host or "[website host omitted]" if key == "url" and isinstance(value, str)
+                              else f"[text omitted · {len(value)} characters]"
+                              if key in {"value", "text", "selector", "name"} and isinstance(value, str)
+                              else value)
+                        for key, value in redacted_args.items()
+                    }
                 exact_action = json.dumps(redacted_args, indent=2, ensure_ascii=False)[:8000]
                 details = (
-                    f"Exact MCP tool: {server_name}.{tool_name}\nArguments:\n{exact_action}\n\n"
+                    f"Exact {('browser action' if server_name == 'browser' else 'MCP tool')}: {server_name}.{tool_name}\nArguments:\n{exact_action}\n\n"
                     "Approval applies once to this exact tool call."
                 )
             elif call.tool_name in web_action_names:
@@ -224,8 +247,13 @@ def build_capabilities(
                 target=target, trigger_sequence=trigger_sequence,
                 run_id=ctx.run_id, conversation_id=ctx.conversation_id or "",
                 tool_call_id=call.tool_call_id, tool_name=call.tool_name,
-                tool_arguments=args if isinstance(args, dict) else {},
-                message_history=ModelMessagesTypeAdapter.dump_json(ctx.messages).decode("utf-8"),
+                tool_arguments=({key: ("[redacted]" if key in {"url", "value", "text", "selector", "name"}
+                                       else value) for key, value in args.items()}
+                                if mcp_tool and server_name == "browser" and isinstance(args, dict)
+                                else args if isinstance(args, dict) else {}),
+                message_history=ModelMessagesTypeAdapter.dump_json(
+                    sanitized_browser_messages(ctx.messages)
+                ).decode("utf-8"),
                 tool_summary=(getattr(ctx.deps, "tool_call_summaries", None) or {})
                     .get(call.tool_call_id, {}).get("summary", ""),
                 activity_labels=(getattr(ctx.deps, "tool_call_summaries", None) or {})
@@ -380,5 +408,12 @@ def build_capabilities(
                 allowed_domains=[domain for domain in allowed_domains if isinstance(domain, str)],
                 id="tribe_web_fetch", defer_loading=True,
             ))
+
+    if "image_generation" in granted_tools:
+        capabilities.append(ImageGeneration(
+            local=image_generator,
+            defer_loading=True,
+            description="Generate an image for a user request when a visual deliverable is useful. Uses the chat model's native image support or the configured image provider.",
+        ))
 
     return capabilities

@@ -10,6 +10,7 @@ Expose workflows as one coherent capability, not a set of unrelated per-operatio
 
 - `list_workflows(query)` discovers and searches definitions.
 - `get_workflow(id, version)` retrieves a definition and immutable version.
+- `save_workflow(...)` creates a workflow or saves a new version after checking the current version.
 - `activate_workflow(id, version)` attaches the chosen version to a chat as guidance.
 - `get_workflow_state()` and `update_workflow_state(state, expected_revision)` read or update optional progress.
 
@@ -58,6 +59,8 @@ stages:
 ```
 
 Definitions support an objective, overall instructions and rules, tags, a starting and terminal stage, and stage objectives, guides, rules and outgoing transitions. Transitions can branch or loop; `when` gives optional context for an edge. Legacy `guidance` fields and top-level `from`/`to` transitions are accepted and normalised. The graph guides navigation, but is never a completion gate. Reaching a terminal stage does not imply that the task is complete.
+
+The editor offers a sequential stage list, a Mermaid-style text view and a node designer over the same structured definition. The text view is an authoring convenience, not a second stored format; parsing it preserves each stage's Markdown guide. A named stage list alone is enough to define a workflow; its order derives next-stage links. The text editor reserves `__start__` and `__end__` as endpoint IDs; those markers cannot collide with valid stage IDs. The advanced designer may store optional `position: {x, y}` values on stages so the graph reopens in place; positions are display metadata and do not affect agent execution. The shared canvas uses the same immutable definition sent to agents when a workflow is activated.
 
 ## Activation and state
 

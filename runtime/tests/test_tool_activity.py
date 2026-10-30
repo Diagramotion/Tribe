@@ -27,6 +27,22 @@ class ToolActivityTests(unittest.TestCase):
             "working": "opening a page",
             "finished": "opened a page",
         })
+        self.assertEqual(browser_activity_labels("browser_resize"), {
+            "working": "resizing the browser",
+            "finished": "resized the browser",
+        })
+        self.assertEqual(browser_activity_labels("browser_select"), {
+            "working": "choosing a page option",
+            "finished": "chose a page option",
+        })
+        self.assertEqual(browser_activity_labels("browser_upload"), {
+            "working": "asking to select files for a page",
+            "finished": "selected files for a page",
+        })
+        self.assertEqual(browser_activity_labels("browser_site_storage"), {
+            "working": "checking site storage",
+            "finished": "checked site storage",
+        })
         self.assertIsNone(browser_activity_labels("github_create_issue"))
 
     def test_non_browser_tool_summaries_keep_existing_file_path_and_command_behaviour(self):

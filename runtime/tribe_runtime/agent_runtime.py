@@ -1,6 +1,7 @@
 """Independent event consumers for the mission channel."""
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -9,6 +10,9 @@ import re
 import threading
 import time
 import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field
@@ -19,7 +23,13 @@ from typing import Any, Literal
 
 from typing_extensions import NotRequired, TypedDict
 
-from .agents import AgentDefinition, AgentProvider, AgentRunResult, TOOL_PERMISSION_NAMES
+from .agents import TOOL_PERMISSION_NAMES, AgentDefinition, AgentProvider, AgentRunResult
+from .browser_sessions import (
+    BROWSER_ACTION_TOOLS,
+    BROWSER_READ_TOOLS,
+    BrowserPolicyError,
+    BrowserSessionManager,
+)
 from .computer_use import ComputerObservationBroker
 from .credentials import (
     get_api_key,
@@ -32,16 +42,35 @@ from .credentials import (
 from .file_recovery import expected_file_hash
 from .harness_capabilities import build_capabilities
 from .mcp_registry import MCPRegistry
+from .pdf_analysis import extract_pdf_pages as extract_pdf_pages_content
+from .pdf_analysis import extract_pdf_tables as extract_pdf_tables_content
+from .pdf_analysis import ocr_pdf_pages as ocr_pdf_pages_content
 from .project_memory import (
-    list_project_memory, read_project_memory as _read_project_memory,
+    list_project_memory,
+)
+from .project_memory import (
+    read_project_memory as _read_project_memory,
+)
+from .project_memory import (
     search_project_memory as _search_project_memory,
 )
-from .recipes import get_recipe, list_recipes
+from .recipes import WorkflowVersionConflict, get_recipe, list_recipes, save_recipe
 from .skills import SkillCatalog
 from .store import MissionStore
+from .tabular_analysis import aggregate_tabular_artifact as aggregate_tabular_artifact_content
+from .tabular_analysis import profile_tabular_artifact, transform_tabular_artifact
 from .tool_activity import browser_activity_labels, summarize_tool_arguments
 from .transient_media import TransientMediaStepStore
 from .workspace import WorkspaceTools
+
+_BROWSER_API_PORT = os.environ.get("TRIBE_BROWSER_API_PORT", "")
+_BROWSER_API_TOKEN = ""
+
+
+def configure_browser_api_token(token: str) -> None:
+    """Set the bridge credential received through the runtime's private stdin pipe."""
+    global _BROWSER_API_TOKEN
+    _BROWSER_API_TOKEN = token
 
 MAX_AGENT_REPLY_HOPS = 3
 _INTERNAL_ID_PATTERN = re.compile(
@@ -135,6 +164,76 @@ def _durable_tool_output(tool_name: str, content: object) -> str | None:
     return content[-200_000:]
 
 
+def _browser_api(ctx: Any, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Call the authenticated desktop browser bridge for its visible tab."""
+    port = _BROWSER_API_PORT
+    token = _BROWSER_API_TOKEN
+    if not port or not token:
+        raise RuntimeError("The embedded desktop browser is unavailable in this runtime.")
+    mission = ctx.deps.store.mission(ctx.deps.mission_id)
+    if not mission:
+        raise RuntimeError("The current chat could not be found.")
+    policy = ctx.deps.store.project_web_access(mission["project_id"])
+    if not policy["enabled"] or not policy["allowedDomains"]:
+        raise PermissionError("Enable website access and allow specific domains in project settings before using browser automation.")
+    domains = [str(domain).encode("idna").decode("ascii").casefold().rstrip(".")
+               for domain in policy["allowedDomains"]]
+    if action == "navigate":
+        target = str((payload or {}).get("url", ""))
+        host = urllib.parse.urlsplit(target).hostname
+        if not host or host.encode("idna").decode("ascii").casefold().rstrip(".") not in domains:
+            raise PermissionError("This website is not allowed by the project's website access settings.")
+        return _browser_api_request(port, token, ctx.deps.mission_id, action,
+                                    {**(payload or {}), "allowedDomains": domains})
+    state = _browser_api_request(port, token, ctx.deps.mission_id, "state", {})
+    current_url = str(state.get("url", ""))
+    host = urllib.parse.urlsplit(current_url).hostname
+    try:
+        current_host = host.encode("idna").decode("ascii").casefold().rstrip(".") if host else ""
+    except UnicodeError:
+        current_host = ""
+    if not current_host or current_host not in domains:
+        raise PermissionError("The current website is not allowed by the project's website access settings.")
+    tab_id = state.get("activeTabId")
+    if not isinstance(tab_id, str) or not tab_id:
+        raise RuntimeError("Open a browser tab before asking the agent to use it.")
+    return _browser_api_request(port, token, ctx.deps.mission_id, action,
+                                {**(payload or {}), "tabId": tab_id, "allowedDomains": domains})
+
+
+def _browser_api_request(port: str, token: str, mission_id: str, action: str,
+                         payload: dict[str, Any]) -> dict[str, Any]:
+    """Send one bounded request to the local Electron service."""
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{int(port)}/v1/browser/{mission_id}/{action}",
+        data=body, method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        timeout = _browser_api_request_timeout(action)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            result = json.loads(response.read(8_000_000).decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        try:
+            details = json.loads(error.read(4_000).decode("utf-8"))
+        except Exception:
+            details = {}
+        raise RuntimeError(str(details.get("error", "The browser action failed."))) from error
+    except (urllib.error.URLError, TimeoutError, ValueError) as error:
+        raise RuntimeError("The desktop browser could not be reached. Open the Browser workspace and try again.") from error
+    return result.get("result", result) if isinstance(result, dict) else {"result": result}
+
+
+def _browser_api_request_timeout(action: str) -> int:
+    """Leave time for a user to answer native prompts on consequential browser actions."""
+    if action in {"click", "fill", "type", "press", "upload"}:
+        return 300
+    if action == "navigate":
+        return 25
+    return 10
+
+
 def _merge_usage_totals(*values: dict[str, Any] | None) -> dict[str, int | str | None] | None:
     merged: dict[str, int | str | None] = {}
     for value in values:
@@ -149,6 +248,133 @@ def _merge_usage_totals(*values: dict[str, Any] | None) -> dict[str, int | str |
             elif isinstance(item, int) and not isinstance(item, bool):
                 merged[key] = int(merged.get(key) or 0) + max(0, item)
     return merged or None
+
+
+def _persist_generated_images(store: MissionStore, mission_id: str, agent_id: str, result: object) -> tuple[str, ...]:
+    """Save provider-generated image tool results as user-visible mission artifacts."""
+    try:
+        from pydantic_ai.messages import BinaryImage, ModelResponse, NativeToolReturnPart, ToolReturnPart
+    except ImportError:
+        return ()
+    message_reader = getattr(result, "new_messages", None)
+    messages = message_reader() if callable(message_reader) else ()
+    images = []
+    for message in messages:
+        # Native image generation is attached to the response itself. Direct
+        # generation instead returns files from its ToolReturnPart below.
+        if isinstance(message, ModelResponse):
+            images.extend(image for image in message.images if isinstance(image, BinaryImage))
+        for part in getattr(message, "parts", ()):
+            if not isinstance(part, (NativeToolReturnPart, ToolReturnPart)) or part.outcome != "success":
+                continue
+            is_image_generation = (
+                part.tool_kind == "image_generation"
+                if isinstance(part, NativeToolReturnPart)
+                else part.tool_name == "generate_image"
+            )
+            if is_image_generation:
+                images.extend(file for file in part.files if isinstance(file, BinaryImage))
+    artifact_ids = []
+    extensions = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
+    for image in images:
+        media_type = str(image.media_type).lower().split(";", 1)[0]
+        if media_type not in extensions:
+            continue
+        if len(image.data) > 15 * 1024 * 1024:
+            raise ValueError("The generated image is too large to save as a chat result (15 MB maximum).")
+        name = f"Generated image {len(artifact_ids) + 1}.{extensions[media_type]}"
+        artifact, _event = store.add_artifact(mission_id, name, media_type, agent_id, image.data)
+        artifact_ids.append(artifact["id"])
+    return tuple(artifact_ids)
+
+
+def _save_tabular_analysis(
+    store: MissionStore,
+    mission_id: str,
+    agent_id: str,
+    source_artifact_id: str,
+    source_artifact: dict[str, Any],
+    source_content: bytes,
+    operation: dict[str, Any],
+    *,
+    replayed_from: str | None = None,
+    expected_output_hash: str | None = None,
+) -> dict[str, Any]:
+    """Persist a transformed CSV and a checksum-bound record of how to reproduce it."""
+    csv_content, summary = transform_tabular_artifact(
+        source_artifact["name"], source_artifact["media_type"], source_content,
+        filters=operation.get("filters"), columns=operation.get("columns"),
+        sort_by=operation.get("sortBy", ""), descending=operation.get("descending", False),
+        group_by=operation.get("groupBy", ""), pivot_by=operation.get("pivotBy", ""),
+        aggregation=operation.get("aggregation", "none"),
+        value_column=operation.get("valueColumn", ""), limit=operation.get("limit", 1000),
+        sheet_name=operation.get("sheetName", ""),
+        date_bucket=operation.get("dateBucket", ""),
+        header_rows=operation.get("headerRows", 1),
+    )
+    output_hash = hashlib.sha256(csv_content).hexdigest()
+    if expected_output_hash and output_hash != expected_output_hash:
+        raise ValueError("analysis_replay_output_does_not_match_the_saved_checksum")
+    base_name = Path(source_artifact["name"]).stem[:100] or "table"
+    output_name = f"{base_name} - analysis.csv"
+    output_artifact, _ = store.add_artifact(
+        mission_id, output_name, "text/csv", agent_id, csv_content,
+    )
+    record: dict[str, Any] = {
+        "schema": "tribe.tabular-analysis/v1",
+        "createdAt": datetime.now(UTC).isoformat(),
+        "source": {
+            "artifactId": source_artifact_id,
+            "name": source_artifact["name"],
+            "mediaType": source_artifact["media_type"],
+            "sha256": hashlib.sha256(source_content).hexdigest(),
+            "sheetName": summary["operation"]["sheetName"] or None,
+        },
+        "operation": summary["operation"],
+        "result": {
+            "artifactId": output_artifact["id"],
+            "name": output_artifact["name"],
+            "mediaType": output_artifact["media_type"],
+            "sha256": output_hash,
+            "inputRows": summary["inputRows"],
+            "matchedRows": summary["matchedRows"],
+            "outputRows": summary["outputRows"],
+            "outputColumns": summary["outputColumns"],
+            "numericValuesSkipped": summary["numericValuesSkipped"],
+            "dateValuesSkipped": summary["dateValuesSkipped"],
+            "truncated": summary["truncated"],
+        },
+    }
+    if replayed_from:
+        record["replayedFrom"] = replayed_from
+    record_bytes = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+    record_artifact, _ = store.add_artifact(
+        mission_id, f"{base_name} - analysis record.json", "application/json", agent_id, record_bytes,
+    )
+    return {
+        "output": {"artifactId": output_artifact["id"], "name": output_artifact["name"]},
+        "analysisRecord": {"artifactId": record_artifact["id"], "name": record_artifact["name"]},
+        "source": {"name": source_artifact["name"], "sha256": record["source"]["sha256"]},
+        "summary": {key: value for key, value in summary.items() if key != "operation"},
+        "replayedFrom": replayed_from,
+    }
+
+
+def _valid_analysis_filter(item: object) -> bool:
+    if not isinstance(item, dict) or not isinstance(item.get("column"), str):
+        return False
+    keys = set(item)
+    if keys == {"column", "equals"}:
+        return isinstance(item.get("equals"), str)
+    operator = item.get("operator")
+    if not isinstance(operator, str):
+        return False
+    if operator in {"blank", "not_blank"}:
+        return keys == {"column", "operator"}
+    return (
+        keys == {"column", "operator", "value"}
+        and isinstance(item.get("value"), str)
+    )
 
 
 def _count_compaction_receipts(messages: object) -> int:
@@ -266,11 +492,19 @@ def _reject_text_encoded_tool_call(output: str) -> None:
         value = json.loads(output)
     except (TypeError, json.JSONDecodeError):
         return
-    if (isinstance(value, dict) and value.get("name") in AGENT_TOOL_NAMES
-            and isinstance(value.get("arguments"), dict)):
+    if not isinstance(value, dict):
+        return
+    tool_name = value.get("name")
+    if tool_name is None and isinstance(value.get("function"), str):
+        tool_name = value["function"]
+    looks_like_tool_call = (
+        isinstance(value.get("arguments"), dict)
+        and (tool_name in AGENT_TOOL_NAMES or tool_name == "search_tools")
+    )
+    if looks_like_tool_call:
         raise RuntimeError(
-            "The model described a tool call as plain text instead of invoking it. "
-            "Choose a model with native tool-calling support."
+            "The selected model described a tool call as plain text instead of invoking it, so no browser "
+            "action was performed. Choose a model with working native tool-calling support."
         )
 
 
@@ -291,6 +525,7 @@ class AgentDependencies:
     tool_call_summaries: dict[str, dict[str, Any]] | None = None
     computer_observations: ComputerObservationBroker | None = None
     computer_access_enabled: bool = False
+    browser_sessions: BrowserSessionManager | None = None
     cancellation_token: Any = None
     trigger_sequence: int | None = None
     interactive_artifact_ids: list[str] | None = None
@@ -421,6 +656,8 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
         "keeps responses to internal and direct-message triggers in the run record. "
         "When interactive responses are enabled for this project, you may create a self-contained HTML interactive artifact for a request that benefits from one. "
         "Only create one when it materially helps; ordinary answers and image lists should remain standard Markdown. "
+        "For a data-analysis, chart or quantitative-visualisation request, use the granted analysis tools when helpful and, if the `skills` capability is available, discover and load Tribe's built-in `data-visualisation` skill for chart syntax, transformation and PDF guidance. Keep the interpretation concise, grounded in source values, and disclose meaningful limits or truncation. "
+        "If your profile grants Image generation, use that provider-backed capability when the user asks for an illustration or image deliverable; generated images are saved and shown inline in the chat. Do not substitute a code mock-up for an image request. Image generation is optional and must not be used for ordinary answers. "
         "Before creating one, search for and load Tribe's built-in `interactive-app-authoring` skill, then follow its guidance; the artifact tool enforces this. "
         "Treat every interactive artifact as a finished, task-specific mini-product, never a wireframe or generic form. Choose a coherent visual direction that suits the task; build clear hierarchy, deliberate spacing and typography, a restrained palette, and polished, fully styled controls. Do not leave browser-default buttons or fields, placeholder-only labels, oversized empty areas, or content that requires unnecessary scrolling. Make the result and primary action easy to find, with useful defaults, validation and feedback states. Make the layout work from 320px to the available desktop width, use semantic HTML, accessible contrast, keyboard operation and visible focus. Use inline CSS and JavaScript only, with CSS custom properties and responsive layout; do not load external fonts, libraries, images or other network resources. A small set of namespaced `.tribe-ui-*` layout, field, button, panel and result classes is available as a styled foundation; use it where it fits, then extend or override it to make the app feel specific to its task. Let content determine the app's height. Keep the design focused rather than adding decorative or unrelated features. Offer a result through window.tribe.postAction only after a meaningful user action, so the user can choose whether to share it. "
         "The embedded app runs as untrusted code in an opaque-origin sandbox. Tribe blocks its network requests and remote subresources, browser storage, credentials, and direct tool access. Do not put sensitive data in an app: a script may still navigate its own frame to a remote site. Any useful result must be explicitly shared by the user through Tribe's app bridge. "
@@ -442,7 +679,10 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
         "Use computer_observe only when the user has enabled computer use for this project and a visual check is necessary. "
         "State a specific purpose, inspect only the window the user selects, and do not ask again after cancellation. "
         "If the project has the Playwright MCP server, use its browser tools for requested end-to-end verification; "
-        "page navigation and interaction tools require the user's exact-action approval. "
+        "Use the workspace Browser's currently visible tab for browser work. Project website grants restrict where it may navigate and send requests. "
+        "Tribe asks for one-time approval before detected form changes, sending or publishing information, or destructive actions; do not bypass or retry a cancelled approval. "
+        "Do not complete a payment or financial transaction: stop before the final action and hand control to the user. "
+        "File uploads always require separate approval. Never type or fill passwords or secrets; ask the user to enter those directly. "
         "For substantial documents, publish a complete canvas:v1 JSON document in post_update. "
         "For an existing document, include its exact artifact_id and base_revision so the update becomes a review proposal. "
         "Use canvas-comment:v1 blocks for quoted annotations and replies; never invent document, revision or thread IDs. "
@@ -731,6 +971,151 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
             BinaryContent(data=observation["image"], media_type="image/png"),
         ])
 
+    @agent.tool(defer_loading=True)
+    async def browser_state(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
+        """Inspect the current page in Tribe's shared desktop browser."""
+        return await asyncio.to_thread(_browser_api, ctx, "state")
+
+    @agent.tool(defer_loading=True)
+    async def browser_navigate(ctx: RunContext[AgentDependencies], url: str) -> dict[str, Any]:
+        """Open an HTTP or HTTPS URL in the same browser page visible to the user."""
+        if len(url) > 4096:
+            raise ValueError("Website address is too long.")
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("Use an HTTP or HTTPS address without embedded credentials.")
+        return await asyncio.to_thread(_browser_api, ctx, "navigate", {"url": url})
+
+    @agent.tool(defer_loading=True)
+    async def browser_snapshot(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
+        """Read visible page text, interactive element labels and viewport for the current page."""
+        return await asyncio.to_thread(_browser_api, ctx, "snapshot")
+
+    @agent.tool(defer_loading=True)
+    async def browser_screenshot(ctx: RunContext[AgentDependencies]):
+        """Capture the current browser tab for visual inspection when DOM details are insufficient."""
+        from base64 import b64decode
+        from pydantic_ai.messages import BinaryContent, ToolReturn
+
+        image = await asyncio.to_thread(_browser_api, ctx, "screenshot")
+        return ToolReturn(return_value=[
+            f"Current browser view ({image.get('viewport', {}).get('width')} by {image.get('viewport', {}).get('height')}).",
+            BinaryContent(data=b64decode(image["image"]), media_type=image.get("mimeType", "image/jpeg")),
+        ])
+
+    @agent.tool(defer_loading=True)
+    async def browser_diagnostics(ctx: RunContext[AgentDependencies], limit: int = 50) -> dict[str, Any]:
+        """Inspect page load/navigation events, console messages and network requests for the current visible page.
+
+        Diagnostic URLs omit query strings and redact likely secret or user identifiers.
+        """
+        if limit < 1 or limit > 100:
+            raise ValueError("Choose between 1 and 100 recent diagnostic entries.")
+        return await asyncio.to_thread(_browser_api, ctx, "diagnostics", {"limit": limit})
+
+    @agent.tool(defer_loading=True)
+    async def browser_site_storage(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
+        """Inspect aggregate storage use by category for the current website.
+
+        Returns the website origin, approximate total and quota, and category byte
+        counts. It never reads stored values, cookies, or credentials.
+        """
+        return await asyncio.to_thread(_browser_api, ctx, "storage")
+
+    @agent.tool(defer_loading=True)
+    async def browser_click(ctx: RunContext[AgentDependencies], ref: str) -> dict[str, Any]:
+        """Click a current page element; Tribe asks before detected sensitive actions."""
+        return await asyncio.to_thread(_browser_api, ctx, "click", {"ref": ref})
+
+    @agent.tool(defer_loading=True)
+    async def browser_click_at(ctx: RunContext[AgentDependencies], x: int, y: int) -> dict[str, Any]:
+        """Click page coordinates when an element has no semantic label; sensitive actions need approval."""
+        if x < 0 or y < 0 or x > 100_000 or y > 100_000:
+            raise ValueError("Use non-negative coordinates from the current browser snapshot.")
+        return await asyncio.to_thread(_browser_api, ctx, "click-at", {"x": x, "y": y})
+
+    @agent.tool(defer_loading=True)
+    async def browser_fill(ctx: RunContext[AgentDependencies], ref: str, value: str | list[str]) -> dict[str, Any]:
+        """Fill a visible text field or choose enabled native select options by current value or label.
+
+        Use a string for text fields and single-select controls, or a list of option
+        values/labels for a multi-select. Read choices and selected state from the latest snapshot.
+        """
+        if isinstance(value, str):
+            if len(value) > 10_000:
+                raise ValueError("Field values must be under 10,000 characters.")
+        elif not isinstance(value, list) or len(value) > 100 or any(
+            not isinstance(item, str) or len(item) > 256 for item in value
+        ):
+            raise ValueError("Use a text value or a list of up to 100 select options, each under 256 characters.")
+        return await asyncio.to_thread(_browser_api, ctx, "fill", {"ref": ref, "value": value})
+
+    @agent.tool(defer_loading=True)
+    async def browser_upload(ctx: RunContext[AgentDependencies], ref: str) -> dict[str, Any]:
+        """Request explicit approval and choose files for a visible page file input.
+
+        Tribe asks the user before opening the page's native file chooser and waits
+        for the user to select or cancel. After selection, inspect a fresh browser
+        snapshot and verify the page result before claiming the upload succeeded.
+        """
+        return await asyncio.to_thread(_browser_api, ctx, "upload", {"ref": ref})
+
+    @agent.tool(defer_loading=True)
+    async def browser_type(ctx: RunContext[AgentDependencies], text: str) -> dict[str, Any]:
+        """Type into the focused page control except password, hidden, and file inputs; sensitive entries need approval."""
+        if not text or len(text) > 5000:
+            raise ValueError("Enter between 1 and 5,000 characters.")
+        return await asyncio.to_thread(_browser_api, ctx, "type", {"text": text})
+
+    @agent.tool(defer_loading=True)
+    async def browser_press(ctx: RunContext[AgentDependencies], key: str) -> dict[str, Any]:
+        """Press a supported page key; Tribe asks before detected form submissions."""
+        return await asyncio.to_thread(_browser_api, ctx, "press", {"key": key})
+
+    @agent.tool(defer_loading=True)
+    async def browser_scroll(ctx: RunContext[AgentDependencies], x: int = 0, y: int = 500) -> dict[str, Any]:
+        """Scroll the current web page horizontally or vertically."""
+        if abs(x) > 5000 or abs(y) > 5000:
+            raise ValueError("Scroll distances must be between -5,000 and 5,000 pixels.")
+        return await asyncio.to_thread(_browser_api, ctx, "scroll", {"x": x, "y": y})
+
+    @agent.tool(defer_loading=True)
+    async def browser_set_viewport(
+        ctx: RunContext[AgentDependencies], viewport: str,
+        width: int | None = None, height: int | None = None,
+        locale: str | None = None, network: str | None = None,
+        reduced_motion: str | None = None,
+    ) -> dict[str, Any]:
+        """Set this tab's device viewport, locale, reduced-motion preference and simulated network condition."""
+        selected: str | dict[str, Any] = viewport
+        if viewport == "custom":
+            if width is None or height is None:
+                raise ValueError("Custom viewport needs width and height values.")
+            selected = {"width": width, "height": height}
+        settings: dict[str, Any] = {"viewport": selected}
+        if locale is not None:
+            settings["locale"] = locale
+        if network is not None:
+            settings["network"] = network
+        if reduced_motion is not None:
+            settings["reducedMotion"] = reduced_motion
+        return await asyncio.to_thread(_browser_api, ctx, "viewport", settings)
+
+    @agent.tool(defer_loading=True)
+    async def browser_reload(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
+        """Reload the current browser page."""
+        return await asyncio.to_thread(_browser_api, ctx, "reload")
+
+    @agent.tool(defer_loading=True)
+    async def browser_back(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
+        """Go back one page in this browser tab's history."""
+        return await asyncio.to_thread(_browser_api, ctx, "back")
+
+    @agent.tool(defer_loading=True)
+    async def browser_forward(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
+        """Go forward one page in this browser tab's history."""
+        return await asyncio.to_thread(_browser_api, ctx, "forward")
+
     @agent.tool(sequential=True, defer_loading=True)
     def create_plan_items(ctx: RunContext[AgentDependencies], items: list[PlanItemSpec]) -> list[dict[str, Any]] | dict[str, Any]:
         """Create 1 to 50 related or parallel tasks in one atomic plan change.
@@ -856,6 +1241,36 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
         return {**recipe.snapshot(), "source": recipe.source}
 
     @agent.tool(sequential=True, defer_loading=True)
+    def save_workflow(ctx: RunContext[AgentDependencies], workflow_id: str, title: str,
+                      description: str, objective: str, instructions: str,
+                      stages: list[dict[str, Any]], expected_version: int,
+                      rules: list[str] | None = None, tags: list[str] | None = None,
+                      initial_stage: str | None = None,
+                      terminal_stages: list[str] | None = None) -> dict[str, Any]:
+        """Create a workflow or save a new version after reading its current version."""
+        builtin_directory = Path(os.environ.get(
+            "TRIBE_RECIPE_DIR", Path(__file__).resolve().parents[2] / "recipes",
+        ))
+        user_directory = Path(os.environ.get(
+            "TRIBE_USER_RECIPE_DIR", ctx.deps.store.data_dir / "recipes",
+        ))
+        try:
+            saved = save_recipe(
+                user_directory, workflow_id.strip(), title, description, instructions,
+                builtin_directory, stages=stages, objective=objective, rules=rules or [],
+                tags=tags or [], initial_stage=initial_stage,
+                terminal_stages=terminal_stages,
+                expected_version=expected_version,
+            )
+            return {"ok": True, **saved.snapshot(), "source": "user"}
+        except WorkflowVersionConflict as error:
+            return {"ok": False, "error": str(error), "current_version": error.current_version,
+                    "action": "get_workflow"}
+        except (OSError, ValueError) as error:
+            return {"ok": False, "error": "workflow_definition_invalid",
+                    "detail": str(error)[:1000], "action": "review_workflow_definition"}
+
+    @agent.tool(sequential=True, defer_loading=True)
     def activate_workflow(ctx: RunContext[AgentDependencies], workflow_id: str,
                           version: int | None = None) -> dict[str, Any]:
         """Attach one immutable workflow version to this chat as optional guidance."""
@@ -890,7 +1305,13 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
     @agent.tool(sequential=True, defer_loading=True)
     def update_workflow_state(ctx: RunContext[AgentDependencies], state: dict[str, Any],
                               expected_revision: int) -> dict[str, Any]:
-        """Update optional workflow progress with optimistic revision checking."""
+        """Update optional workflow progress using the exact state shape and current revision.
+
+        `state` must be an object with only `stage_id` (a stage ID from this chat's workflow,
+        or null) and `values` (a JSON object). Read the latest revision with
+        `get_workflow_state` and pass it as `expected_revision`. Keep workflow-specific values
+        inside `values`; do not add stage names or completion claims at the top level.
+        """
         try:
             return ctx.deps.store.update_mission_workflow_state(
                 ctx.deps.mission_id, definition.id, state, expected_revision,
@@ -1263,6 +1684,194 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
                 "mediaType": artifact["media_type"], "content": text[:100_000],
                 "truncated": len(text) > 100_000}
 
+    @agent.tool(defer_loading=True)
+    def analyze_tabular_artifact(ctx: RunContext[AgentDependencies], artifact_id: str,
+                                 sheet_name: str = "", header_rows: int = 1) -> dict[str, Any]:
+        """Profile an attached table; header_rows combines one to five leading XLSX rows into column names."""
+        found = ctx.deps.store.artifact_content(artifact_id, mission_id=ctx.deps.mission_id)
+        if not found:
+            raise ValueError("artifact_not_found_in_this_chat")
+        artifact, content = found
+        return profile_tabular_artifact(
+            artifact["name"], artifact["media_type"], content, sheet_name, header_rows,
+        )
+
+    @agent.tool(defer_loading=True)
+    def aggregate_tabular_artifact(
+        ctx: RunContext[AgentDependencies],
+        artifact_id: str,
+        group_by: str,
+        aggregation: Literal["count", "sum", "mean", "min", "max", "quartiles"],
+        value_column: str = "",
+        filter_column: str = "",
+        filter_value: str = "",
+        limit: int = 25,
+        sheet_name: str = "",
+        date_bucket: Literal["day", "week", "month", "quarter", "year"] | None = None,
+        header_rows: int = 1,
+    ) -> dict[str, Any]:
+        """Group an attached table; header_rows combines one to five leading XLSX rows into column names."""
+        found = ctx.deps.store.artifact_content(artifact_id, mission_id=ctx.deps.mission_id)
+        if not found:
+            raise ValueError("artifact_not_found_in_this_chat")
+        artifact, content = found
+        return aggregate_tabular_artifact_content(
+            artifact["name"], artifact["media_type"], content,
+            group_by=group_by, aggregation=aggregation, value_column=value_column,
+            filter_column=filter_column, filter_value=filter_value, limit=limit,
+            sheet_name=sheet_name, date_bucket=date_bucket or "", header_rows=header_rows,
+        )
+
+    @agent.tool(defer_loading=True)
+    def create_tabular_analysis_artifact(
+        ctx: RunContext[AgentDependencies],
+        artifact_id: str,
+        filters: list[dict[str, str]] | None = None,
+        columns: list[str] | None = None,
+        sort_by: str = "",
+        descending: bool = False,
+        group_by: str = "",
+        pivot_by: str = "",
+        aggregation: Literal["none", "count", "sum", "mean", "min", "max"] = "none",
+        value_column: str = "",
+        limit: int = 1000,
+        sheet_name: str = "",
+        date_bucket: Literal["day", "week", "month", "quarter", "year"] | None = None,
+        header_rows: int = 1,
+    ) -> dict[str, Any]:
+        """Create a transformed CSV; header_rows combines one to five leading XLSX rows into column names."""
+        found = ctx.deps.store.artifact_content(artifact_id, mission_id=ctx.deps.mission_id)
+        if not found:
+            raise ValueError("artifact_not_found_in_this_chat")
+        artifact, content = found
+        operation = {
+            "filters": filters or [], "columns": columns or [], "sortBy": sort_by,
+            "descending": descending, "groupBy": group_by, "pivotBy": pivot_by,
+            "aggregation": aggregation,
+            "valueColumn": value_column, "limit": limit, "sheetName": sheet_name,
+            "dateBucket": date_bucket or "", "headerRows": header_rows,
+        }
+        return _save_tabular_analysis(
+            ctx.deps.store, ctx.deps.mission_id, definition.id, artifact_id,
+            artifact, content, operation,
+        )
+
+    @agent.tool(defer_loading=True)
+    def replay_tabular_analysis_artifact(
+        ctx: RunContext[AgentDependencies], analysis_record_artifact_id: str,
+    ) -> dict[str, Any]:
+        """Re-run a saved tabular analysis record after verifying its source file checksum."""
+        record_found = ctx.deps.store.artifact_content(
+            analysis_record_artifact_id, mission_id=ctx.deps.mission_id,
+        )
+        if not record_found:
+            raise ValueError("analysis_record_not_found_in_this_chat")
+        _record_artifact, record_content = record_found
+        try:
+            record = json.loads(record_content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("analysis_record_is_not_valid_json") from None
+        if not isinstance(record, dict) or record.get("schema") != "tribe.tabular-analysis/v1":
+            raise ValueError("unsupported_tabular_analysis_record")
+        source = record.get("source")
+        operation = record.get("operation")
+        result = record.get("result")
+        if not isinstance(source, dict) or not isinstance(operation, dict) or not isinstance(result, dict):
+            raise TypeError("analysis_record_source_operation_or_result_has_invalid_type")
+        source_id = source.get("artifactId")
+        expected_hash = source.get("sha256")
+        expected_output_hash = result.get("sha256")
+        if not isinstance(source_id, str) or not isinstance(expected_hash, str) or not isinstance(expected_output_hash, str):
+            raise TypeError("analysis_record_source_reference_or_checksum_has_invalid_type")
+        source_found = ctx.deps.store.artifact_content(source_id, mission_id=ctx.deps.mission_id)
+        if not source_found:
+            raise ValueError("analysis_source_is_no_longer_available_in_this_chat")
+        artifact, content = source_found
+        if hashlib.sha256(content).hexdigest() != expected_hash:
+            raise ValueError("analysis_source_checksum_changed; the saved operation was not replayed")
+        filters = operation.get("filters", [])
+        columns = operation.get("columns", [])
+        if (not isinstance(filters, list)
+                or len(filters) > 20
+                or any(not _valid_analysis_filter(item) for item in filters)
+                or not isinstance(columns, list)
+                or any(not isinstance(column, str) for column in columns)
+                or not isinstance(operation.get("sortBy", ""), str)
+                or not isinstance(operation.get("descending", False), bool)
+                or not isinstance(operation.get("groupBy", ""), str)
+                or not isinstance(operation.get("pivotBy", ""), str)
+                or operation.get("aggregation") not in {"none", "count", "sum", "mean", "min", "max"}
+                or not isinstance(operation.get("valueColumn", ""), str)
+                or not isinstance(operation.get("limit", 1000), int)
+                or isinstance(operation.get("limit", 1000), bool)
+                or not isinstance(operation.get("sheetName", ""), str)
+                or not isinstance(operation.get("headerRows", 1), int)
+                or isinstance(operation.get("headerRows", 1), bool)
+                or not 1 <= operation.get("headerRows", 1) <= 5
+                or not isinstance(operation.get("dateBucket", ""), str)
+                or operation.get("dateBucket", "") not in {"", "day", "week", "month", "quarter", "year"}):
+            raise ValueError("analysis_record_operation_is_invalid")
+        return _save_tabular_analysis(
+            ctx.deps.store, ctx.deps.mission_id, definition.id, source_id,
+            artifact, content, operation, replayed_from=analysis_record_artifact_id,
+            expected_output_hash=expected_output_hash,
+        )
+
+    @agent.tool(defer_loading=True)
+    def extract_pdf_pages(
+        ctx: RunContext[AgentDependencies],
+        artifact_id: str,
+        page_start: int = 1,
+        page_end: int = 10,
+    ) -> dict[str, Any]:
+        """Extract bounded, layout-oriented text from up to 10 pages of a PDF attached to this chat."""
+        found = ctx.deps.store.artifact_content(artifact_id, mission_id=ctx.deps.mission_id)
+        if not found:
+            raise ValueError("artifact_not_found_in_this_chat")
+        artifact, content = found
+        return extract_pdf_pages_content(
+            artifact["name"], artifact["media_type"], content,
+            page_start=page_start, page_end=page_end,
+        )
+
+    @agent.tool(defer_loading=True)
+    def extract_pdf_tables(
+        ctx: RunContext[AgentDependencies],
+        artifact_id: str,
+        page_start: int = 1,
+        page_end: int = 10,
+    ) -> dict[str, Any]:
+        """Extract bounded table rows from up to 10 pages of a PDF attached to this chat."""
+        found = ctx.deps.store.artifact_content(artifact_id, mission_id=ctx.deps.mission_id)
+        if not found:
+            raise ValueError("artifact_not_found_in_this_chat")
+        artifact, content = found
+        return extract_pdf_tables_content(
+            artifact["name"], artifact["media_type"], content,
+            page_start=page_start, page_end=page_end,
+        )
+
+    @agent.tool(defer_loading=True)
+    def ocr_pdf_pages(
+        ctx: RunContext[AgentDependencies],
+        artifact_id: str,
+        page_start: int = 1,
+        page_end: int = 5,
+        language: Literal[
+            "en", "ch", "chinese_cht", "japan", "fr", "de",
+            "es", "it", "pt", "nl", "vi", "tr",
+        ] = "en",
+    ) -> dict[str, Any]:
+        """Render up to five pages of an attached PDF and extract scanned text locally with confidence metadata in the selected language."""
+        found = ctx.deps.store.artifact_content(artifact_id, mission_id=ctx.deps.mission_id)
+        if not found:
+            raise ValueError("artifact_not_found_in_this_chat")
+        artifact, content = found
+        return ocr_pdf_pages_content(
+            artifact["name"], artifact["media_type"], content,
+            page_start=page_start, page_end=page_end, language=language,
+        )
+
     def read_artifact_reviews(ctx: RunContext[AgentDependencies], artifact_id: str) -> list[dict[str, Any]]:
         """Read comments on one artifact in this mission, including its version hash and open state."""
         return ctx.deps.store.artifact_reviews(artifact_id, mission_id=ctx.deps.mission_id)
@@ -1362,6 +1971,153 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
         return ctx.deps.store.propose_knowledge(mission["project_id"], ctx.deps.mission_id,
                                                 definition.id, title.strip(), content.strip())
 
+    def browser_project(ctx: RunContext[AgentDependencies]) -> tuple[dict[str, Any], dict[str, Any]]:
+        manager = ctx.deps.browser_sessions
+        mission = ctx.deps.store.mission(ctx.deps.mission_id)
+        if manager is None or mission is None:
+            raise RuntimeError("The managed browser is unavailable.")
+        policy = ctx.deps.store.project_web_access(mission["project_id"])
+        manager.update_policy(ctx.deps.mission_id, definition.id, policy["allowedDomains"])
+        return mission, policy
+
+    @agent.tool(defer_loading=True)
+    def browser_open(ctx: RunContext[AgentDependencies], url: str) -> dict[str, Any]:
+        """Open an allowed website in this chat's isolated browser session. External navigation needs approval."""
+        from urllib.parse import urlparse
+        try:
+            mission, policy = browser_project(ctx)
+            host = (urlparse(url).hostname or "").casefold().rstrip(".")
+            local = host in {"localhost", "127.0.0.1", "::1"}
+            if not local and not policy["enabled"]:
+                return {"ok": False, "error": "Website access is disabled for this project."}
+            if not local and host not in policy["allowedDomains"]:
+                return {"ok": False, "error": "This website is not in the project's allowed website list."}
+            result = ctx.deps.browser_sessions.open(
+                mission["project_id"], ctx.deps.mission_id, definition.id, url,
+                policy["allowedDomains"], allow_local=True,
+            )
+            return {"ok": True, "browser": result}
+        except (BrowserPolicyError, ValueError, RuntimeError) as error:
+            return {"ok": False, "error": str(error)[:500]}
+
+    @agent.tool(defer_loading=True)
+    def browser_select(ctx: RunContext[AgentDependencies], selector: str, value: str,
+                       by: Literal["role", "label", "placeholder", "text", "css"] = "label",
+                       name: str = "") -> dict[str, Any]:
+        """Choose one option from a page select control. Tribe asks for exact approval first."""
+        if not ctx.deps.browser_sessions:
+            return {"ok": False, "error": "The managed browser is unavailable."}
+        try:
+            browser_project(ctx)
+            return {"ok": True, **ctx.deps.browser_sessions.select(
+                ctx.deps.mission_id, definition.id, selector, value, by, name,
+            )}
+        except (BrowserPolicyError, ValueError, RuntimeError) as error:
+            return {"ok": False, "error": str(error)[:500]}
+
+    @agent.tool(defer_loading=True)
+    def browser_hover(ctx: RunContext[AgentDependencies], name: str,
+                      role: Literal["button", "link", "textbox", "checkbox", "radio",
+                                    "combobox", "option", "tab", "menuitem"] = "button") -> dict[str, Any]:
+        """Move the visible agent pointer to a control by its accessible name and role."""
+        if not ctx.deps.browser_sessions:
+            return {"ok": False, "error": "The managed browser is unavailable."}
+        try:
+            browser_project(ctx)
+            return {"ok": True, **ctx.deps.browser_sessions.hover(
+                ctx.deps.mission_id, definition.id, role, "role", name,
+            )}
+        except (BrowserPolicyError, ValueError, RuntimeError) as error:
+            return {"ok": False, "error": str(error)[:500]}
+
+    @agent.tool(defer_loading=True)
+    def browser_go_back(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
+        """Go back one page in the active browser session. Tribe asks for approval first."""
+        if not ctx.deps.browser_sessions:
+            return {"ok": False, "error": "The managed browser is unavailable."}
+        try:
+            browser_project(ctx)
+            return {"ok": True, **ctx.deps.browser_sessions.go_back(ctx.deps.mission_id, definition.id)}
+        except (BrowserPolicyError, ValueError, RuntimeError) as error:
+            return {"ok": False, "error": str(error)[:500]}
+
+    @agent.tool(defer_loading=True)
+    def browser_go_forward(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
+        """Go forward one page in the active browser session. Tribe asks for approval first."""
+        if not ctx.deps.browser_sessions:
+            return {"ok": False, "error": "The managed browser is unavailable."}
+        try:
+            browser_project(ctx)
+            return {"ok": True, **ctx.deps.browser_sessions.go_forward(ctx.deps.mission_id, definition.id)}
+        except (BrowserPolicyError, ValueError, RuntimeError) as error:
+            return {"ok": False, "error": str(error)[:500]}
+
+    @agent.tool(defer_loading=True)
+    def browser_resize(ctx: RunContext[AgentDependencies], width: int, height: int) -> dict[str, Any]:
+        """Resize the page viewport for responsive review. Tribe asks for exact approval first."""
+        if not ctx.deps.browser_sessions:
+            return {"ok": False, "error": "The managed browser is unavailable."}
+        try:
+            browser_project(ctx)
+            return {"ok": True, **ctx.deps.browser_sessions.resize(
+                ctx.deps.mission_id, definition.id, width, height,
+            )}
+        except (BrowserPolicyError, ValueError, RuntimeError) as error:
+            return {"ok": False, "error": str(error)[:500]}
+
+    @agent.tool(defer_loading=True)
+    def browser_new_tab(ctx: RunContext[AgentDependencies], url: str) -> dict[str, Any]:
+        """Open another allowed page in this browser session. External navigation needs approval."""
+        from urllib.parse import urlparse
+        try:
+            mission, policy = browser_project(ctx)
+            host = (urlparse(url).hostname or "").casefold().rstrip(".")
+            local = host in {"localhost", "127.0.0.1", "::1"}
+            if not local and not policy["enabled"]:
+                return {"ok": False, "error": "Website access is disabled for this project."}
+            if not local and host not in policy["allowedDomains"]:
+                return {"ok": False, "error": "This website is not in the project's allowed website list."}
+            result = ctx.deps.browser_sessions.new_tab(
+                mission["project_id"], ctx.deps.mission_id, definition.id, url,
+                policy["allowedDomains"],
+            )
+            return {"ok": True, "browser": result}
+        except (BrowserPolicyError, ValueError, RuntimeError) as error:
+            return {"ok": False, "error": str(error)[:500]}
+
+    @agent.tool(defer_loading=True)
+    def browser_close_tab(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
+        """Close the active tab, or end the session when it is the only tab."""
+        if not ctx.deps.browser_sessions:
+            return {"ok": False, "error": "The managed browser is unavailable."}
+        try:
+            browser_project(ctx)
+            return {"ok": True, **ctx.deps.browser_sessions.close_tab(ctx.deps.mission_id, definition.id)}
+        except (BrowserPolicyError, ValueError, RuntimeError) as error:
+            return {"ok": False, "error": str(error)[:500]}
+
+    @agent.tool(defer_loading=True)
+    def browser_tabs(ctx: RunContext[AgentDependencies]) -> list[dict[str, str]]:
+        """List the active browser tabs by title and hostname."""
+        if not ctx.deps.browser_sessions:
+            return []
+        try:
+            browser_project(ctx)
+            return ctx.deps.browser_sessions.tabs(ctx.deps.mission_id, definition.id)
+        except (BrowserPolicyError, ValueError, RuntimeError):
+            return []
+
+    @agent.tool(defer_loading=True)
+    def browser_console_messages(ctx: RunContext[AgentDependencies]) -> list[dict[str, str]]:
+        """Read bounded page warnings and errors without recording page content."""
+        if not ctx.deps.browser_sessions:
+            return []
+        try:
+            browser_project(ctx)
+            return ctx.deps.browser_sessions.console_messages(ctx.deps.mission_id, definition.id)
+        except (BrowserPolicyError, ValueError, RuntimeError):
+            return []
+
     selected_tools = set(agent._function_toolset.tools)
     if definition.tool_permissions is not None:
         selected_tools.intersection_update(definition.tool_permissions)
@@ -1411,6 +2167,42 @@ def _disable_provider_sdk_retries(provider_instance: Any) -> None:
             http_options.retry_options = HttpRetryOptions(attempts=1)
         else:
             retry_options.attempts = 1
+
+
+def _image_generator_for_workspace(store: MissionStore):
+    """Build the configured direct image backend with credentials from Tribe's provider store."""
+    identifier = store.get_setting("image_generation_model") or ""
+    provider, separator, model_name = identifier.partition(":")
+    if not separator or provider not in {"openai", "google", "xai"} or not model_name:
+        return None
+    if store.provider_connection(provider).get("enabled") is False:
+        return None
+    api_key = get_api_key(f"{provider}:image-generation")
+    if not api_key:
+        return None
+    base_url = store.provider_connection(provider).get("baseUrl") or None
+
+    from pydantic_ai import ImageGenerator
+    if provider == "openai":
+        from pydantic_ai.images.openai import OpenAIImageGenerationModel
+        from pydantic_ai.providers.openai import OpenAIProvider
+
+        image_model = OpenAIImageGenerationModel(
+            model_name, provider=OpenAIProvider(api_key=api_key, base_url=base_url),
+        )
+    elif provider == "google":
+        from pydantic_ai.images.google import GoogleImageGenerationModel
+        from pydantic_ai.providers.google import GoogleProvider
+
+        image_model = GoogleImageGenerationModel(
+            model_name, provider=GoogleProvider(api_key=api_key, base_url=base_url),
+        )
+    else:
+        from pydantic_ai.images.xai import XaiImageGenerationModel
+        from pydantic_ai.providers.xai import XaiProvider
+
+        image_model = XaiImageGenerationModel(model_name, provider=XaiProvider(api_key=api_key))
+    return ImageGenerator(image_model)
 
 
 def _model_for_identifier(identifier: str, api_key: str | None = None, base_url: str = ""):
@@ -1477,11 +2269,13 @@ def _safe_provider_error(error: Exception, model: str | None = None,
 
 class PydanticAIProvider:
     def __init__(self, definition: AgentDefinition, model: str, base_url: str = "",
-                 computer_observations: ComputerObservationBroker | None = None):
+                 computer_observations: ComputerObservationBroker | None = None,
+                 browser_sessions: BrowserSessionManager | None = None):
         self.definition = definition
         self.model = model
         self.base_url = base_url
         self.computer_observations = computer_observations
+        self.browser_sessions = browser_sessions
         provider = provider_for_model(model)
         api_key = get_api_key(model)
         base_url = _resolved_provider_base_url(model, base_url)
@@ -1547,7 +2341,10 @@ class PydanticAIProvider:
             }],
             "workflow": workflow_snapshot,
             "workflow_stage_update": (
-                "Use update_workflow_state to reflect meaningful workflow progress, following the stored state revision."
+                "For meaningful workflow progress, read get_workflow_state and then update it with exactly "
+                "state={stage_id: <ID from this workflow or null>, values: <JSON object>}; do not add "
+                "other top-level state keys. Pass the returned revision as expected_revision. Keep "
+                "workflow-specific values inside values and never invent completion claims."
                 if workflow_snapshot and workflow_snapshot.get("stages")
                 and "workflows" in self.definition.capabilities else None
             ),
@@ -1603,6 +2400,7 @@ class PydanticAIProvider:
             file_locks={}, pending_file_changes={},
             computer_observations=self.computer_observations,
             computer_access_enabled=computer_access["enabled"],
+            browser_sessions=self.browser_sessions,
             cancellation_token=cancellation_token,
             trigger_sequence=event["sequence"],
             interactive_artifact_ids=[],
@@ -1626,7 +2424,7 @@ class PydanticAIProvider:
         conversation_id = _agent_conversation_id(mission_id, self.definition.id, event)
         step_store = TransientMediaStepStore(
             SqliteStepStore(database=store.data_dir / "agent_steps.sqlite3"),
-            transient_tool_names={"computer_observe"},
+            transient_tool_names={"computer_observe", *BROWSER_READ_TOOLS, *BROWSER_ACTION_TOOLS},
         )
         if deferred_rows:
             # A pending approval suspends the original event. On restart, the
@@ -1739,6 +2537,7 @@ class PydanticAIProvider:
                     model_context_window=model_context_window,
                     model_max_output_tokens=model_output_limit,
                     tool_permissions=self.definition.tool_permissions,
+                    image_generator=_image_generator_for_workspace(store),
                     after_model_response=observe_model_response,
                     context_pruning_enabled=context_pruning_enabled,
                 ),
@@ -1814,10 +2613,16 @@ class PydanticAIProvider:
                 )
             output = _user_facing_agent_text(str(result.output).strip())
             _reject_text_encoded_tool_call(output)
+            image_artifact_ids = (
+                _persist_generated_images(store, mission_id, self.definition.id, result)
+                if "image_generation" in self.definition.tool_permissions else ()
+            )
+            if image_artifact_ids and not output:
+                output = "Here is the generated image."
             # Each provider response was durably accounted by the hook above. Do not
             # pass the run aggregate to complete_agent_event or it would be counted twice.
             return AgentRunResult(output, deps.active_work_item_id, None, active_model,
-                                  tuple(deps.interactive_artifact_ids or ()))
+                                  tuple(deps.interactive_artifact_ids or ()), image_artifact_ids)
         finally:
             if deps.file_locks is not None:
                 for lock in deps.file_locks.values():
@@ -2071,6 +2876,7 @@ class AgentWorker:
                     output = ""
                     work_item_id = None
                     interactive_artifact_ids = ()
+                    image_artifact_ids = ()
                     usage_model = None
                     usage = None
                     failure = None
@@ -2155,6 +2961,9 @@ class AgentWorker:
                                 usage_model = usage_model or failed_attempt_model
                                 interactive_artifact_ids = (
                                     result.interactive_artifact_ids if isinstance(result, AgentRunResult) else ()
+                                )
+                                image_artifact_ids = (
+                                    result.image_artifact_ids if isinstance(result, AgentRunResult) else ()
                                 )
                                 work_item_id = (
                                     result.work_item_id if isinstance(result, AgentRunResult)
@@ -2262,7 +3071,8 @@ class AgentWorker:
                         self.store.complete_agent_event(
                             self.definition.id, self.mission_id, event["sequence"],
                             output or "", work_item_id, usage_model, usage,
-                            reservation_attempt, interactive_artifact_ids,
+                                reservation_attempt, interactive_artifact_ids,
+                                image_artifact_ids=image_artifact_ids,
                             publish_output=True,
                         )
                 if retry_scheduled:
@@ -2275,10 +3085,12 @@ class AgentSupervisor:
     """Starts one independent event consumer per role for each active mission."""
 
     def __init__(self, store: MissionStore, definitions: list[AgentDefinition], provider_factory=None,
-                 computer_observations: ComputerObservationBroker | None = None):
+                 computer_observations: ComputerObservationBroker | None = None,
+                 browser_sessions: BrowserSessionManager | None = None):
         self.store = store
         self.definitions = definitions
         self.computer_observations = computer_observations
+        self.browser_sessions = browser_sessions
         self.model = (store.get_setting("model") or os.environ.get("TRIBE_MODEL", "")).strip()
         model_provider_id = None
         if self.model:
@@ -2333,7 +3145,9 @@ class AgentSupervisor:
         provider = provider_for_model(model)
         base_url = (self.store.provider_connection(provider).get("baseUrl")
                     or (self.base_url if provider == self.provider_id else ""))
-        return PydanticAIProvider(definition, model, base_url, self.computer_observations)
+        return PydanticAIProvider(
+            definition, model, base_url, self.computer_observations, self.browser_sessions,
+        )
 
     @property
     def enabled(self) -> bool:
