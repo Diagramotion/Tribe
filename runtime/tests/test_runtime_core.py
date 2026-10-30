@@ -1665,6 +1665,35 @@ TAP version 13
         self.assertIsNone(restored.activate_pending())
         self.assertEqual(MissionStore(self.store.path).project(self.project["id"])["name"], self.project["name"])
 
+    def test_image_generation_settings_accept_current_models_and_preserve_legacy_choice(self) -> None:
+        from tribe_runtime import server as runtime_server
+
+        with (patch.object(runtime_server, "STORE", self.store),
+              patch.object(runtime_server, "get_api_key", return_value="test-key")):
+            http = runtime_server.LocalHTTPServer(("127.0.0.1", 0), runtime_server.Handler)
+            thread = threading.Thread(target=http.serve_forever, daemon=True)
+            thread.start()
+            try:
+                for model in (
+                    "google:gemini-3.1-flash-lite-image",
+                    "google:gemini-3-pro-image",
+                    "xai:grok-imagine-image-2.0",
+                    "xai:grok-imagine-image",
+                ):
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{http.server_port}/api/settings/image-generation",
+                        data=json.dumps({"model": model}).encode(),
+                        headers={"Content-Type": "application/json", "Origin": "http://127.0.0.1:5173"},
+                        method="PUT",
+                    )
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        self.assertEqual(json.loads(response.read()), {"model": model})
+                    self.assertEqual(self.store.get_setting("image_generation_model"), model)
+            finally:
+                http.shutdown()
+                thread.join(timeout=3)
+                http.server_close()
+
     def test_project_audit_export_contains_mission_events_and_artifact_metadata(self) -> None:
         self.store.append("message.created", "user", self.mission["id"], {"text": "Audit this"})
         artifact, _ = self.store.add_artifact(
