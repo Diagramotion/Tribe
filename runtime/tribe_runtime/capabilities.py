@@ -31,8 +31,8 @@ CAPABILITIES = (
                 "write_file", "edit_file", "create_directory")),
     Capability("commands", "Run project commands", "Run tests and manage project commands.",
                ("run_repository_tests", "run_command", "start_command", "check_command", "stop_command")),
-    Capability("workflows", "Workflows", "Find and follow optional process guidance.",
-               ("list_workflows", "get_workflow", "activate_workflow",
+    Capability("workflows", "Workflows", "Find, author and follow optional process guidance.",
+               ("list_workflows", "get_workflow", "save_workflow", "activate_workflow",
                 "get_workflow_state", "update_workflow_state")),
     Capability("skills", "Skills", "Discover and load reusable task guidance.",
                ("search_available_skills", "load_skill", "list_skill_resources", "read_skill_resource")),
@@ -40,8 +40,21 @@ CAPABILITIES = (
                ("search_project_memory", "read_project_memory", "propose_project_memory")),
     Capability("artifacts", "Artifacts and shared documents", "Create, inspect and discuss outputs and documents.",
                ("list_artifacts", "get_artifact", "create_artifact", "comment_on_artifact")),
+    Capability("data_analysis", "Data analysis", "Analyse attached tables, save reproducible transformations, and extract or OCR text and tables from PDF pages.",
+               ("analyze_tabular_artifact", "aggregate_tabular_artifact", "create_tabular_analysis_artifact",
+                "replay_tabular_analysis_artifact", "extract_pdf_pages", "extract_pdf_tables",
+                "ocr_pdf_pages")),
+    Capability("image_generation", "Image generation", "Create provider-generated images; may incur additional provider charges.",
+               ("image_generation",)),
     Capability("computer_observation", "Computer observation", "Observe the explicitly selected computer surface.",
                ("computer_observe",)),
+    Capability("browser", "Browser", "Open, inspect and interact with websites in the shared desktop browser.",
+               ("browser_state", "browser_navigate", "browser_snapshot", "browser_screenshot", "browser_diagnostics",
+                "browser_site_storage", "browser_click", "browser_click_at", "browser_fill", "browser_upload",
+                "browser_type", "browser_press", "browser_scroll", "browser_set_viewport", "browser_reload",
+                "browser_back", "browser_forward", "browser_open", "browser_select", "browser_hover",
+                "browser_go_back", "browser_go_forward", "browser_resize", "browser_new_tab", "browser_close_tab",
+                "browser_tabs", "browser_console_messages")),
     Capability("web", "Web research", "Search the web and fetch permitted pages.",
                ("duckduckgo_search", "web_fetch")),
     Capability("connected_services", "Connected services", "Use tools from configured MCP services.", ("mcp:*",)),
@@ -49,10 +62,13 @@ CAPABILITIES = (
 
 CAPABILITY_BY_ID = {capability.id: capability for capability in CAPABILITIES}
 WORKFLOW_OPERATION_NAMES = frozenset({
-    "list_workflows", "search_workflows", "get_workflow", "activate_workflow",
+    "list_workflows", "search_workflows", "get_workflow", "save_workflow", "activate_workflow",
     "get_workflow_state", "update_workflow_state",
 })
 LEGACY_CAPABILITY_GRANTS = {
+    # Older saved role profiles granted browser observation and control separately.
+    "browser_inspection": "browser",
+    "browser_control": "browser",
     "list_available_workflows": "workflows",
     "select_workflow": "workflows",
     "set_workflow_stage": "workflows",

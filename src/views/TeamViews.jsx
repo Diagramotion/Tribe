@@ -216,7 +216,7 @@ export function AgentRolesView({ agents, capabilityCatalog = [], agentConfigured
     <section className="tab-panel detail-view">
       <div className="detail-heading">
         <div><span className="eyebrow">{projectScoped ? "Project team" : "Workspace roles"}</span><h2>{projectScoped ? "Project team" : "Agent roles"}</h2><p>{projectScoped ? "Choose which reusable roles can work in this project. Role instructions and model overrides apply anywhere the role is used." : "Create reusable roles with a clear responsibility and the right level of repository access."}</p></div>
-        <div className="agent-role-heading-actions"><span className="artifact-count">{projectScoped ? `${projectAgentIds.length} of ${agents.length} in team` : `${agents.length} roles`}</span>{!formOpen && !agentConfigured && <button className="button button--quiet" onClick={onConnectModel} type="button"><Plug size={15} /> Connect model</button>}{!formOpen && <IconButton className="agent-role-add" label="Add role" onClick={() => { setCapabilities(capabilityCatalog.map((item) => item.id)); setFormOpen(true); }}><Plus size={17} /></IconButton>}</div>
+        <div className="agent-role-heading-actions"><span className="artifact-count">{projectScoped ? `${projectAgentIds.length} of ${agents.length} in team` : `${agents.length} roles`}</span>{!formOpen && !agentConfigured && <button className="button button--quiet" onClick={onConnectModel} type="button"><Plug size={15} /> Connect model</button>}{!formOpen && <IconButton className="agent-role-add" label="Add role" onClick={() => { setCapabilities(capabilityCatalog.filter((item) => !["image_generation", "data_analysis"].includes(item.id)).map((item) => item.id)); setFormOpen(true); }}><Plus size={17} /></IconButton>}</div>
       </div>
       {formOpen && <form className="knowledge-form agent-role-form" id="agent-role-form" onSubmit={submit}>
         <strong>{editingId ? `Edit ${name || editingId}` : "Create a role"}</strong>
@@ -227,7 +227,7 @@ export function AgentRolesView({ agents, capabilityCatalog = [], agentConfigured
         </div>
         <fieldset className="agent-tool-permissions">
           <legend>Capabilities</legend>
-          <p>Grant groups of related tools. The role’s repository access and approval rules still apply.</p>
+          <p>Grant groups of related tools. The role’s repository access and approval rules still apply. Image generation and data analysis are off for new roles; image generation may incur provider charges.</p>
           <div className="agent-tool-permission-actions">
             <button className="text-button" onClick={() => setCapabilities(capabilityCatalog.map((item) => item.id))} type="button">Allow all</button>
             <button className="text-button" onClick={() => setCapabilities([])} type="button">Clear all</button>

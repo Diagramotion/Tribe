@@ -8,7 +8,6 @@ import shlex
 from typing import Any
 from urllib.parse import urlsplit
 
-
 _NODE_TAP_SUMMARY = {
     "tests": re.compile(r"(?m)^# tests (\d+)\s*$"),
     "pass": re.compile(r"(?m)^# pass (\d+)\s*$"),
@@ -53,24 +52,41 @@ def node_test_run_evidence(command: str, output: object) -> dict[str, object] | 
 
 
 _BROWSER_ACTIONS = {
+    "open": ("opening a page", "opened a page"),
+    "new_tab": ("opening a new page", "opened a new page"),
+    "close_tab": ("closing a page", "closed a page"),
+    "screenshot": ("capturing a page preview", "captured a page preview"),
+    "select": ("choosing a page option", "chose a page option"),
+    "hover": ("moving over a page control", "moved over a page control"),
+    "resize": ("resizing the browser", "resized the browser"),
+    "press": ("using the page keyboard", "used the page keyboard"),
+    "scroll": ("scrolling the page", "scrolled the page"),
     "navigate": ("opening a page", "opened a page"),
+    "state": ("checking the browser", "checked the browser"),
+    "diagnostics": ("checking page diagnostics", "checked page diagnostics"),
+    "site_storage": ("checking site storage", "checked site storage"),
     "navigate_back": ("going back in the browser", "went back in the browser"),
     "go_back": ("going back in the browser", "went back in the browser"),
     "go_forward": ("moving forward in the browser", "moved forward in the browser"),
     "snapshot": ("inspecting a page", "inspected a page"),
     "click": ("interacting with a page", "interacted with a page"),
+    "click_at": ("interacting with a page", "interacted with a page"),
     "click_by_text": ("interacting with a page", "interacted with a page"),
     "type": ("entering text on a page", "entered text on a page"),
     "fill": ("filling a page form", "filled a page form"),
     "fill_form": ("filling a page form", "filled a page form"),
+    "upload": ("asking to select files for a page", "selected files for a page"),
     "press_key": ("using the page keyboard", "used the page keyboard"),
-    "hover": ("interacting with a page", "interacted with a page"),
     "drag": ("interacting with a page", "interacted with a page"),
     "select_option": ("choosing a page option", "chose a page option"),
     "wait_for": ("waiting for the page", "finished waiting for the page"),
     "take_screenshot": ("capturing a page screenshot", "captured a page screenshot"),
     "console_messages": ("checking page messages", "checked page messages"),
     "network_requests": ("reviewing page network activity", "reviewed page network activity"),
+    "viewport": ("changing the browser size", "changed the browser size"),
+    "reload": ("reloading the page", "reloaded the page"),
+    "back": ("going back in the browser", "went back in the browser"),
+    "forward": ("moving forward in the browser", "moved forward in the browser"),
     "resize": ("resizing the browser", "resized the browser"),
     "tabs": ("checking browser tabs", "checked browser tabs"),
     "handle_dialog": ("responding to a page dialog", "responded to a page dialog"),
@@ -122,7 +138,7 @@ def summarize_tool_arguments(tool_name: str, value: Any) -> str:
     arguments = _arguments(value)
     action = _browser_action(tool_name)
     if action is not None:
-        if action == "navigate":
+        if action in {"navigate", "open", "new_tab"}:
             target = next((arguments.get(key) for key in ("url", "uri", "target_url")
                            if isinstance(arguments.get(key), str)), None)
             host = _safe_web_host(target)

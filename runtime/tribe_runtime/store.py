@@ -3756,7 +3756,8 @@ class MissionStore:
                              usage: dict[str, int | str | None] | None = None,
                              usage_attempt: int | None = None,
                              interactive_artifact_ids: tuple[str, ...] = (),
-                             publish_output: bool = True) -> None:
+                             publish_output: bool = True,
+                             image_artifact_ids: tuple[str, ...] = ()) -> None:
         timestamp = now()
         usage_reported = usage is not None
         raw_usage = usage or {}
@@ -3802,8 +3803,10 @@ class MissionStore:
                 cost_usd = format(prior_cost + Decimal(cost_usd or "0"), "f")
             usage_reported = usage_reported or any(prior_usage.values()) or bool(prior_cost)
             usage_model = usage_model or row["usage_model"]
-            if (publish_output and output_text
-                    and output_text.lower() not in {"no-op", "no action", "no useful action is needed."}):
+            if (publish_output and (output_text or image_artifact_ids)
+                    and (image_artifact_ids or output_text.lower() not in {
+                        "no-op", "no action", "no useful action is needed."
+                    })):
                 try:
                     started_at = datetime.fromisoformat(row["created_at"])
                     finished_at = datetime.fromisoformat(timestamp)
@@ -3823,6 +3826,15 @@ class MissionStore:
                         ).fetchone()
                         if artifact and artifact_id not in valid_interactive_ids:
                             valid_interactive_ids.append(artifact_id)
+                valid_image_ids = []
+                for artifact_id in image_artifact_ids:
+                    artifact = db.execute(
+                        "SELECT id FROM artifacts WHERE id=? AND mission_id=? AND created_by=? "
+                        "AND media_type IN ('image/png','image/jpeg','image/webp')",
+                        (artifact_id, mission_id, agent_id),
+                    ).fetchone()
+                    if artifact and artifact_id not in valid_image_ids:
+                        valid_image_ids.append(artifact_id)
                 self._append(db, "agent.message.created", agent_id, mission_id, {
                     "text": output_text, "recipient": None,
                     "channelAudience": "conversation",
@@ -3831,6 +3843,7 @@ class MissionStore:
                     "inputTokens": usage_values.get("input_tokens") if usage_reported else None,
                     "outputTokens": usage_values.get("output_tokens") if usage_reported else None,
                     "interactiveArtifactIds": valid_interactive_ids,
+                    "imageArtifactIds": valid_image_ids,
                 })
             self._append(db, "agent.activity", agent_id, mission_id, {
                 "status": "Ready", "triggerSequence": trigger_sequence,

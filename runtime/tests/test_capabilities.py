@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import ast
-from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from tribe_runtime.agents import AgentDefinition
+from tribe_runtime.agents import AgentDefinition, discover_agents
 from tribe_runtime.capabilities import (
     CAPABILITIES,
     TOOL_TO_CAPABILITIES,
@@ -14,7 +14,6 @@ from tribe_runtime.capabilities import (
     tools_for_capabilities,
 )
 from tribe_runtime.recipes import _parse, list_recipes, save_recipe
-
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 
@@ -54,6 +53,26 @@ class CapabilityContractTests(unittest.TestCase):
         self.assertIn("workflows", grants)
         self.assertNotIn("finalize_plan", grants)
         self.assertNotIn("complete_discovery", grants)
+
+    def test_builder_profile_can_use_the_visible_browser_for_web_app_delivery(self) -> None:
+        definitions = discover_agents(RUNTIME_ROOT.parent / "agents")
+        builder = next(definition for definition in definitions if definition.id == "builder")
+        self.assertIn("browser", builder.capabilities)
+        self.assertIn("browser_snapshot", builder.tool_permissions)
+        self.assertIn("browser_diagnostics", builder.tool_permissions)
+        self.assertIn("browser_site_storage", builder.tool_permissions)
+        self.assertIn("browser_click", builder.tool_permissions)
+        self.assertIn("browser_upload", builder.tool_permissions)
+
+    def test_legacy_browser_grants_migrate_to_the_shared_browser_capability(self) -> None:
+        self.assertEqual(
+            capabilities_for_grants(("browser_inspection", "browser_control")),
+            ("browser",),
+        )
+        browser = next(item for item in CAPABILITIES if item.id == "browser")
+        self.assertIn("browser_snapshot", browser.tools)
+        self.assertIn("browser_click", browser.tools)
+        self.assertIn("browser_upload", browser.tools)
 
     def test_stage_guidance_is_a_valid_workflow_without_global_instructions(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tribe-workflow-") as temporary:

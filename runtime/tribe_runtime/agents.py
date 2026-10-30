@@ -71,6 +71,7 @@ class AgentRunResult:
     usage: dict[str, int | str | None] | None = None
     model: str | None = None
     interactive_artifact_ids: tuple[str, ...] = ()
+    image_artifact_ids: tuple[str, ...] = ()
 
 
 def discover_agents(directory: Path) -> list[AgentDefinition]:

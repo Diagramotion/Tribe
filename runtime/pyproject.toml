@@ -9,15 +9,24 @@ description = "Local-first event and agent runtime for Tribe"
 requires-python = ">=3.11"
 dependencies = [
     "keyring>=25.6",
- "pyyaml>=6,<7",
- "smriti-mcp>=0.1.5,<0.2",
- "tzdata>=2024.1; platform_system == 'Windows'",
+    "openpyxl>=3.1.5,<4",
+    "defusedxml>=0.7.1,<0.8",
+    "pypdf>=6.21.4,<7",
+    "pdfplumber>=0.11.10,<0.12",
+    "pypdfium2>=5.7,<6",
+    "rapidocr==3.10.0",
+    "onnxruntime>=1.23.1,<1.24",
+    "opencv-python-headless>=4.10,<5",
+    "pyyaml>=6,<7",
+    "smriti-mcp>=0.1.5,<0.2",
+    "tzdata>=2024.1; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]
 ai = [
     "pydantic-ai-harness[skills]==0.61.0",
     "pydantic-ai-slim[anthropic,cerebras,cohere,duckduckgo,google,groq,mcp,mistral,openai,openrouter,web-fetch,xai]==2.61.0",
+    "playwright>=1.52,<2",
 ]
 desktop = ["pyinstaller>=6.10,<7"]
 
@@ -32,4 +41,6 @@ target-version = "py311"
 tribe_runtime = [
     "builtin_skills/*/SKILL.md",
     "builtin_skills/*/examples/*.html",
+    "THIRD_PARTY_NOTICES.md",
+    "third_party/*.txt",
 ]

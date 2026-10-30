@@ -14,7 +14,13 @@
     "desktop:prepare": "python scripts/prepare-macos-swift-runtime.py",
     "runtime:package": "python scripts/package-runtime.py",
     "test:sites": "node --test tests/sites-worker.test.mjs",
-    "test:ui": "node --test tests/activity.test.mjs tests/channel-scroll.test.mjs tests/plan.test.mjs tests/runtime-events.test.mjs tests/canvas-diff.test.mjs tests/canvas-export.test.mjs tests/canvas-selection.test.mjs tests/artifact-preview.test.mjs tests/artifact-anchor.test.mjs tests/computer-capture.test.mjs tests/interactive-artifact.test.mjs tests/settings-view.test.mjs tests/remote-service-form.test.mjs tests/schedules.test.mjs tests/schedule-view.test.mjs tests/slash-commands.test.mjs"
+    "test:ui": "node --test tests/activity.test.mjs tests/channel-scroll.test.mjs tests/plan.test.mjs tests/runtime-events.test.mjs tests/canvas-diff.test.mjs tests/canvas-export.test.mjs tests/canvas-selection.test.mjs tests/artifact-preview.test.mjs tests/artifact-anchor.test.mjs tests/computer-capture.test.mjs tests/interactive-artifact.test.mjs tests/settings-view.test.mjs tests/remote-service-form.test.mjs tests/schedules.test.mjs tests/schedule-view.test.mjs tests/slash-commands.test.mjs tests/workflow-designer.test.mjs",
+    "desktop:electron": "node scripts/electron-dev.mjs",
+    "desktop:electron:build": "npm run build && npm run runtime:package && electron-builder",
+    "desktop:electron:mac": "npm run build && npm run runtime:package && electron-builder --mac",
+    "desktop:electron:windows": "npm run build && npm run runtime:package && electron-builder --win",
+    "test:browser": "node --test electron/browser-*.test.cjs",
+    "test:browser:e2e": "node scripts/browser-agent-e2e.mjs"
   },
   "dependencies": {
     "@codemirror/lang-css": "^6.3.1",
@@ -36,6 +42,7 @@
     "@tauri-apps/plugin-dialog": "^2.8.3",
     "@tauri-apps/plugin-shell": "^2.5.0",
     "@vitejs/plugin-react": "5.0.4",
+    "@xyflow/react": "^12.12.0",
     "codemirror": "^6.0.2",
     "diff": "^9.0.0",
     "mermaid": "^12.2.0",
@@ -49,6 +56,52 @@
     "vite": "6.4.2"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.12.4"
+    "@tauri-apps/cli": "^2.12.4",
+    "electron": "^45.1.0",
+    "electron-builder": "^26.18.0"
+  },
+  "main": "electron/main.cjs",
+  "build": {
+    "appId": "dev.tribe.desktop",
+    "productName": "Tribe",
+    "directories": {
+      "output": "release/electron"
+    },
+    "files": [
+      "electron/**/*",
+      "dist/client/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "src-tauri/binaries",
+        "to": "runtime",
+        "filter": [
+          "tribe-runtime-*"
+        ]
+      },
+      {
+        "from": "agents",
+        "to": "agents"
+      }
+    ],
+    "mac": {
+      "icon": "src-tauri/icons/icon.icns",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools"
+    },
+    "win": {
+      "icon": "src-tauri/icons/icon.ico",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
   }
 }

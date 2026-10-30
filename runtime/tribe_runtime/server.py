@@ -15,6 +15,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -30,19 +31,37 @@ from .agents import (
     update_agent_definition,
     write_agent_definition,
 )
+from .browser_sessions import BrowserSessionManager
 from .capabilities import capability_catalog
 from .commands import BackgroundCommandRunner
 from .computer_use import MAX_IMAGE_BYTES, ComputerObservationBroker
-from .credentials import get_api_key, provider_for_model, provider_supports_custom_url, save_api_key, validate_openai_base_url
+from .credentials import (
+    get_api_key,
+    provider_for_model,
+    provider_supports_custom_url,
+    save_api_key,
+    validate_openai_base_url,
+)
 from .instance_lock import RuntimeInstanceLock
 from .mcp_registry import MCPRegistry
+from .pdf_analysis import render_pdf_page
+from .project_memory import (
+    accept_project_memory,
+    list_project_memory,
+    save_project_memory,
+    set_project_memory_status,
+)
 from .providers import list_ollama_models, list_provider_models
-from .project_memory import accept_project_memory, list_project_memory, save_project_memory, set_project_memory_status
-from .recipes import get_recipe, list_recipes, save_recipe
+from .recipes import get_recipe, list_recipe_versions, list_recipes, save_recipe
 from .skills import SkillCatalog
 from .store import MissionStore, default_data_directory
+from .tabular_analysis import preview_xlsx_artifact
 from .workspace import WorkspaceTools, browse_repository, project_git_diff, project_git_status
-from .workspace_restore import MAX_BACKUP_BYTES, WorkspaceRestore, activate_pending_workspace_restore
+from .workspace_restore import (
+    MAX_BACKUP_BYTES,
+    WorkspaceRestore,
+    activate_pending_workspace_restore,
+)
 
 LOGGER = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
@@ -90,11 +109,14 @@ AGENT_DEFINITIONS = load_agent_definitions(BUILTIN_AGENT_DIRECTORY, USER_AGENT_D
 STORE.ensure_project_agent_memberships([agent.id for agent in AGENT_DEFINITIONS])
 AGENT_REGISTRY_LOCK = threading.Lock()
 COMPUTER = ComputerObservationBroker()
-SUPERVISOR = AgentSupervisor(STORE, AGENT_DEFINITIONS, computer_observations=COMPUTER)
+BROWSER = BrowserSessionManager()
+SUPERVISOR = AgentSupervisor(STORE, AGENT_DEFINITIONS, computer_observations=COMPUTER,
+                             browser_sessions=BROWSER)
 COMMANDS = BackgroundCommandRunner(STORE)
 RESTORE_PENDING = threading.Event()
 RESTORE_LOCK = threading.Lock()
 atexit.register(COMMANDS.close)
+atexit.register(BROWSER.close_all)
 
 
 def _workspace_agent_ids() -> list[str]:
@@ -154,7 +176,7 @@ class Handler(BaseHTTPRequestHandler):
         if origin and self._local_origin():
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
-            self.send_header("Access-Control-Expose-Headers", "Content-Disposition")
+            self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-PDF-Page-Count")
 
     def _body(self) -> dict:
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
@@ -254,6 +276,33 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
             return self._json(200, {"status": "ok", "runtime": "local", "agents": SUPERVISOR.status})
+        if parsed.path == "/api/browser/runtime":
+            return self._json(200, {"installed": BROWSER.browser_installed(), "headless": True})
+        browser_view_match = re.fullmatch(r"/api/missions/([0-9a-f-]{36})/browser", parsed.path)
+        if browser_view_match:
+            mission_id = browser_view_match.group(1)
+            if not STORE.mission(mission_id):
+                return self._json(404, {"error": "mission_not_found"})
+            return self._json(200, BROWSER.view(mission_id))
+        browser_image_match = re.fullmatch(
+            r"/api/missions/([0-9a-f-]{36})/browser/([0-9a-f-]{36})/screenshot", parsed.path
+        )
+        if browser_image_match:
+            mission_id, session_id = browser_image_match.groups()
+            image = BROWSER.screenshot_for(session_id, mission_id)
+            if image is None:
+                return self._json(404, {"error": "browser_screenshot_not_found"})
+            self.send_response(200)
+            self._cors_headers()
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(image)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(image)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         if parsed.path == "/api/computer/requests":
             requests = []
             for request in COMPUTER.pending():
@@ -302,6 +351,7 @@ class Handler(BaseHTTPRequestHandler):
                 "agentDirectory": str(USER_AGENT_DIRECTORY),
                 "experimentalContextPruning": STORE.get_setting("experimental_context_pruning") == "true",
                 "contextPruningSummary": STORE.context_pruning_summary(),
+                "imageGenerationModel": STORE.get_setting("image_generation_model") or "",
             })
         if parsed.path == "/api/models":
             default_model = SUPERVISOR.status.get("model")
@@ -435,6 +485,29 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(status, {"error": str(error)})
             except OSError:
                 return self._json(422, {"error": "repository_path_could_not_be_read"})
+        recipe_versions_match = re.fullmatch(r"/api/recipes/([a-z0-9_-]{2,64})/versions", parsed.path)
+        if recipe_versions_match:
+            try:
+                return self._json(200, {"versions": list_recipe_versions(
+                    BUILTIN_RECIPE_DIRECTORY, USER_RECIPE_DIRECTORY, recipe_versions_match.group(1),
+                )})
+            except (OSError, ValueError):
+                return self._json(422, {"error": "workflow_library_could_not_be_read"})
+        recipe_version_match = re.fullmatch(r"/api/recipes/([a-z0-9_-]{2,64})", parsed.path)
+        if recipe_version_match:
+            query = parse_qs(parsed.query)
+            try:
+                raw_version = query.get("version", [None])[0]
+                version = int(raw_version) if raw_version is not None else None
+                recipe = get_recipe(
+                    BUILTIN_RECIPE_DIRECTORY, USER_RECIPE_DIRECTORY,
+                    recipe_version_match.group(1), version,
+                )
+                if recipe is None:
+                    return self._json(404, {"error": "workflow_version_not_found"})
+                return self._json(200, {"recipe": recipe.snapshot() | {"source": recipe.source}})
+            except (OSError, ValueError):
+                return self._json(422, {"error": "workflow_definition_invalid"})
         if parsed.path == "/api/recipes":
             try:
                 return self._json(200, {"recipes": [recipe.snapshot() | {"source": recipe.source}
@@ -621,6 +694,51 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(422, {"error": "invalid_event_page"})
             events, has_more = STORE.events_after_page(mission_id, after, limit)
             return self._json(200, {"events": events, "hasMore": has_more})
+        pdf_page_match = re.fullmatch(r"/api/artifacts/([0-9a-f-]{36})/pdf-page", parsed.path)
+        if pdf_page_match:
+            found = STORE.artifact_content(pdf_page_match.group(1))
+            if not found:
+                return self._json(404, {"error": "artifact_not_found"})
+            artifact, content = found
+            try:
+                page_number = int(parse_qs(parsed.query).get("page", ["1"])[0])
+                image, page_count = render_pdf_page(
+                    artifact["name"], artifact.get("media_type", ""), content,
+                    page_number=page_number,
+                )
+            except (ValueError, TypeError) as error:
+                return self._json(422, {"error": str(error)})
+            self.send_response(200)
+            self._cors_headers()
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(image)))
+            self.send_header("X-PDF-Page-Count", str(page_count))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(image)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        xlsx_preview_match = re.fullmatch(r"/api/artifacts/([0-9a-f-]{36})/xlsx-preview", parsed.path)
+        if xlsx_preview_match:
+            found = STORE.artifact_content(xlsx_preview_match.group(1))
+            if not found:
+                return self._json(404, {"error": "artifact_not_found"})
+            artifact, content = found
+            query = parse_qs(parsed.query)
+            try:
+                offset = int(query.get("offset", ["0"])[0])
+                limit = int(query.get("limit", ["50"])[0])
+                header_rows = int(query.get("headerRows", ["1"])[0])
+                preview = preview_xlsx_artifact(
+                    artifact["name"], artifact.get("media_type", ""), content,
+                    query.get("sheet", [""])[0], offset, limit,
+                    query.get("search", [""])[0], header_rows,
+                )
+            except (ValueError, TypeError) as error:
+                return self._json(422, {"error": str(error)})
+            return self._json(200, {"preview": preview})
         artifact_match = re.fullmatch(r"/api/artifacts/([0-9a-f-]{36})", parsed.path)
         if artifact_match:
             found = STORE.artifact_content(artifact_match.group(1))
@@ -666,10 +784,64 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body()
             if self.path == "/api/shutdown":
                 COMPUTER.close()
+                BROWSER.close_all()
                 self._json(202, {"status": "shutting_down"})
                 threading.Thread(target=self.server.shutdown, daemon=True,
                                  name="tribe-runtime-shutdown").start()
                 return
+            if self.path == "/api/browser/install":
+                try:
+                    BROWSER.install_browser()
+                    return self._json(200, {"installed": True})
+                except (OSError, RuntimeError) as error:
+                    return self._json(503, {"error": str(error)[:300]})
+            browser_stop_match = re.fullmatch(
+                r"/api/missions/([0-9a-f-]{36})/browser/([0-9a-f-]{36})/stop", self.path
+            )
+            if browser_stop_match:
+                mission_id, session_id = browser_stop_match.groups()
+                if not STORE.mission(mission_id):
+                    return self._json(404, {"error": "mission_not_found"})
+                if not BROWSER.stop(session_id, mission_id):
+                    return self._json(404, {"error": "browser_session_not_found"})
+                return self._json(200, {"stopped": True})
+            browser_open_match = re.fullmatch(r"/api/missions/([0-9a-f-]{36})/browser", self.path)
+            browser_action_match = re.fullmatch(
+                r"/api/missions/([0-9a-f-]{36})/browser/([0-9a-f-]{36})/(navigate|back|forward|reload|interact)",
+                self.path,
+            )
+            if browser_open_match or browser_action_match:
+                mission_id = (browser_open_match or browser_action_match).group(1)
+                mission = STORE.mission(mission_id)
+                if not mission:
+                    return self._json(404, {"error": "mission_not_found"})
+                try:
+                    policy = STORE.project_web_access(mission["project_id"])
+                    allowed = policy["allowedDomains"] if policy["enabled"] else []
+                    if browser_open_match:
+                        url = str(body.get("url", ""))
+                        result = BROWSER.open(mission["project_id"], mission_id, "user", url, allowed)
+                    else:
+                        session_id, action = browser_action_match.groups()[1:]
+                        if action == "navigate":
+                            result = BROWSER.navigate_session(mission_id, session_id,
+                                                              str(body.get("url", "")), allowed)
+                        elif action == "interact":
+                            result = BROWSER.interact(
+                                mission_id, session_id, str(body.get("action", "")),
+                                x=body.get("x", 0), y=body.get("y", 0),
+                                value=body.get("value", ""), key=body.get("key", ""),
+                                delta_y=body.get("deltaY", 0),
+                            )
+                        else:
+                            result = BROWSER.session_action(mission_id, session_id, action)
+                    return self._json(200, {"session": result})
+                except ValueError as error:
+                    message = str(error) or "browser_action_failed"
+                    status = 403 if "allowed website list" in message else 422
+                    return self._json(status, {"error": message})
+                except RuntimeError as error:
+                    return self._json(503, {"error": str(error) or "browser_unavailable"})
             computer_completion = re.fullmatch(
                 r"/api/computer/requests/([0-9a-f-]{36})/complete", self.path
             )
@@ -935,15 +1107,20 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(422, {"error": str(error)})
             if self.path == "/api/recipes":
                 try:
+                    save_options = {}
+                    if "expected_version" in body:
+                        save_options["expected_version"] = body["expected_version"]
                     recipe = save_recipe(USER_RECIPE_DIRECTORY, str(body.get("id", "")),
                                          str(body.get("title", "")), str(body.get("description", "")),
                                          str(body.get("instructions", "")), BUILTIN_RECIPE_DIRECTORY,
                                          body.get("stages"), body.get("objective"), body.get("rules"),
                                          body.get("tags"), body.get("initial_stage"),
-                                         body.get("terminal_stages"), body.get("transitions"))
+                                         body.get("terminal_stages"), body.get("transitions"),
+                                         **save_options)
                     return self._json(201, {"recipe": recipe.snapshot() | {"source": recipe.source}})
                 except ValueError as error:
-                    return self._json(422, {"error": str(error)})
+                    status = 409 if str(error) == "workflow_version_conflict" else 422
+                    return self._json(status, {"error": str(error), "currentVersion": getattr(error, "current_version", None)})
                 except OSError:
                     return self._json(422, {"error": "workflow_could_not_be_saved"})
             if self.path == "/api/projects":
@@ -965,9 +1142,13 @@ class Handler(BaseHTTPRequestHandler):
                         or len(fields[1]) > 200 or len(fields[2]) > 200 or len(fields[3]) > 10_000):
                     return self._json(422, {"error": "repository_name_mission_title_and_goal_required"})
                 recipe_id = str(body.get("recipeId") or "").strip()
+                raw_version = body.get("recipeVersion")
+                recipe_version = raw_version if isinstance(raw_version, int) and not isinstance(raw_version, bool) else None
+                if raw_version is not None and (recipe_version is None or recipe_version < 1):
+                    return self._json(422, {"error": "recipe_version_invalid"})
                 workflow = None
                 if recipe_id:
-                    recipe = get_recipe(BUILTIN_RECIPE_DIRECTORY, USER_RECIPE_DIRECTORY, recipe_id)
+                    recipe = get_recipe(BUILTIN_RECIPE_DIRECTORY, USER_RECIPE_DIRECTORY, recipe_id, recipe_version)
                     if recipe is None:
                         return self._json(422, {"error": "workflow_recipe_not_found"})
                     workflow = recipe.snapshot()
@@ -1146,7 +1327,11 @@ class Handler(BaseHTTPRequestHandler):
                 model_preference = raw_model_preference.strip() or None if isinstance(raw_model_preference, str) else None
                 effort_preference = raw_effort_preference.strip().lower() or None if isinstance(raw_effort_preference, str) else None
                 recipe_id = str(body.get("recipeId") or "").strip()
-                workflow = get_recipe(BUILTIN_RECIPE_DIRECTORY, USER_RECIPE_DIRECTORY, recipe_id) if recipe_id else None
+                raw_version = body.get("recipeVersion")
+                recipe_version = raw_version if isinstance(raw_version, int) and not isinstance(raw_version, bool) else None
+                if raw_version is not None and (recipe_version is None or recipe_version < 1):
+                    return self._json(422, {"error": "recipe_version_invalid"})
+                workflow = get_recipe(BUILTIN_RECIPE_DIRECTORY, USER_RECIPE_DIRECTORY, recipe_id, recipe_version) if recipe_id else None
                 if recipe_id and not workflow:
                     return self._json(422, {"error": "recipe_not_found"})
                 mission = STORE.create_mission(str(body.get("projectId", "")), title, goal,
@@ -1408,6 +1593,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "local_origin_required"})
         if RESTORE_PENDING.is_set():
             return self._json(503, {"error": "workspace_restore_shutting_down"})
+        if self.path == "/api/settings/image-generation":
+            try:
+                body = self._body()
+                model = body.get("model", "")
+                supported_models = {
+                    "openai:gpt-image-2.5-flare": "openai",
+                    "openai:gpt-image-2.5-sunburst": "openai",
+                    "openai:gpt-image-2": "openai",
+                    "google:gemini-3.1-flash-image": "google",
+                    "xai:grok-imagine-image": "xai",
+                }
+                if not isinstance(model, str) or model not in {"", *supported_models}:
+                    return self._json(422, {"error": "image_generation_model_unsupported"})
+                if model:
+                    provider = supported_models[model]
+                    if STORE.provider_connection(provider).get("enabled") is False:
+                        return self._json(422, {"error": "image_generation_provider_disabled"})
+                    if not get_api_key(f"{provider}:image-generation"):
+                        return self._json(422, {"error": "image_generation_provider_not_configured"})
+                STORE.set_setting("image_generation_model", model)
+                return self._json(200, {"model": model})
+            except json.JSONDecodeError:
+                return self._json(400, {"error": "invalid_request"})
         if self.path == "/api/settings/context-pruning":
             try:
                 body = self._body()
@@ -1429,8 +1637,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not enabled:
                     default_model = SUPERVISOR.status.get("model")
                     default_provider = provider_for_model(default_model) if default_model else ""
+                    image_model = STORE.get_setting("image_generation_model") or ""
+                    image_provider = provider_for_model(image_model) if image_model else ""
                     with AGENT_REGISTRY_LOCK:
                         pinned = any(agent.model and provider_for_model(agent.model) == provider for agent in AGENT_DEFINITIONS)
+                    if image_provider == provider:
+                        return self._json(409, {"error": "image_generation_provider_in_use"})
                     if default_provider == provider or pinned:
                         return self._json(409, {"error": "provider_is_in_use"})
                 connection = STORE.set_provider_enabled(provider, enabled)
@@ -1791,6 +2003,9 @@ class Handler(BaseHTTPRequestHandler):
             return True  # Native local clients do not send Origin.
         parsed = urlparse(origin)
         host = (parsed.hostname or "").lower()
+        configured_dev_origin = os.environ.get("TRIBE_DEV_ORIGIN", "").rstrip("/")
+        if origin.rstrip("/") == configured_dev_origin and parsed.scheme == "http" and host in {"localhost", "127.0.0.1", "::1"}:
+            return True
         if parsed.scheme == "tauri":
             return host == "localhost"
         if host == "tauri.localhost":
@@ -1801,6 +2016,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     host, port = "127.0.0.1", int(os.environ.get("TRIBE_PORT", "4317"))
+    if os.environ.get("TRIBE_BROWSER_API_PORT"):
+        from .agent_runtime import configure_browser_api_token
+        configure_browser_api_token(sys.stdin.readline(256).strip())
     if not 0 <= port <= 65535:
         raise ValueError("TRIBE_PORT must be between 0 and 65535")
     server = None
@@ -1842,6 +2060,7 @@ def main() -> None:
             if price_updater is not None:
                 price_updater.stop()
             COMMANDS.close()
+            BROWSER.close_all()
             SUPERVISOR.close()
             if server is not None:
                 server.server_close()

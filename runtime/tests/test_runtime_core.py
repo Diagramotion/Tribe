@@ -27,25 +27,28 @@ from zoneinfo import ZoneInfo
 
 from pydantic_ai import RunContext
 
+from tribe_runtime import project_memory
 from tribe_runtime.agent_runtime import (
     AgentDependencies,
     AgentSupervisor,
     AgentWorker,
     PydanticAIProvider,
-    _build_agent,
-    _agent_conversation_id,
-    _continuable_prior_runs,
     _agent_can_read_context_event,
-    _has_unresolved_harness_tool_effects,
-    _durable_tool_output,
-    _count_compaction_receipts,
+    _agent_conversation_id,
     _agent_failure_kind,
-    _project_team_context,
-    _user_facing_agent_text,
+    _build_agent,
+    _continuable_prior_runs,
+    _count_compaction_receipts,
+    _durable_tool_output,
+    _has_unresolved_harness_tool_effects,
+    _reject_text_encoded_tool_call,
     _next_agent_reply_metadata,
+    _project_team_context,
     _provider_retry_delay,
     _scheduled_provider_retry_delay,
+    _browser_api_request_timeout,
     _tools_for_agent,
+    _user_facing_agent_text,
 )
 from tribe_runtime.agents import (
     AgentDefinition,
@@ -57,7 +60,6 @@ from tribe_runtime.agents import (
 )
 from tribe_runtime.harness_capabilities import _compaction_keep_tokens, build_capabilities
 from tribe_runtime.mcp_registry import MCPRegistry
-from tribe_runtime import project_memory
 from tribe_runtime.recipes import get_recipe, list_recipes, save_recipe
 from tribe_runtime.skills import SkillCatalog
 from tribe_runtime.store import SCHEMA_VERSION, MissionStore
@@ -81,6 +83,28 @@ def _database_connection(path: Path):
 
 
 class RuntimeCase(unittest.TestCase):
+    def test_browser_actions_allow_time_for_native_user_confirmation(self) -> None:
+        for action in ("click", "fill", "type", "press", "upload"):
+            with self.subTest(action=action):
+                self.assertEqual(_browser_api_request_timeout(action), 300)
+        self.assertEqual(_browser_api_request_timeout("navigate"), 25)
+        self.assertEqual(_browser_api_request_timeout("snapshot"), 10)
+
+    def test_rejects_plain_text_browser_tool_call(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "no browser action was performed"):
+            _reject_text_encoded_tool_call(
+                '{"name":"browser_navigate","arguments":{"url":"https://example.com"}}'
+            )
+
+    def test_rejects_plain_text_deferred_tool_search(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "native tool-calling support"):
+            _reject_text_encoded_tool_call(
+                '{"name":"search_tools","arguments":{"queries":["browser"]}}'
+            )
+
+    def test_keeps_ordinary_json_response(self) -> None:
+        _reject_text_encoded_tool_call('{"name":"example","arguments":{}}')
+
     def test_compaction_retained_context_scales_below_eight_thousand_tokens(self) -> None:
         self.assertEqual(_compaction_keep_tokens(16_000), 3_200)
         self.assertEqual(_compaction_keep_tokens(1_000_000), 200_000)
@@ -1018,6 +1042,87 @@ for line in sys.stdin:
                 self.assertEqual(row["status"], "consumed")
             finally:
                 worker.join(timeout=1)
+
+    def test_browser_action_requires_exact_approval_and_redacts_form_values(self) -> None:
+        from pydantic_ai import Agent
+        from pydantic_ai.models.test import TestModel
+        from pydantic_ai_harness.step_persistence import SqliteStepStore
+
+        workspace = WorkspaceTools(self.store, self.mission["id"], "builder")
+        capabilities = build_capabilities(
+            workspace, SkillCatalog(self.repository), trigger_sequence=1,
+            step_store=SqliteStepStore(database=self.store.data_dir / "browser-approval-steps.sqlite3"),
+            tool_permissions=("browser_control",),
+        )
+        called: list[tuple[str, str]] = []
+        agent = Agent(TestModel(call_tools=["browser_fill"]))
+
+        @agent.tool_plain
+        def browser_fill(selector: str, value: str) -> str:
+            called.append((selector, value))
+            return "filled"
+
+        self.reveal_deferred_test_tools(agent, capabilities)
+        failures: list[BaseException] = []
+
+        def run_agent() -> None:
+            try:
+                asyncio.run(agent.run(
+                    "Enter the supplied value in the page.",
+                    capabilities=capabilities,
+                    conversation_id=f"test:{self.mission['id']}:builder",
+                ))
+            except Exception as error:  # noqa: BLE001 - capture provider-thread failures for assertions
+                failures.append(RuntimeError("".join(__import__("traceback").format_exception(error))))
+
+        worker = threading.Thread(target=run_agent)
+        worker.start()
+        try:
+            deadline = time.monotonic() + 10
+            interaction = None
+            while time.monotonic() < deadline:
+                pending = self.store.pending_interactions()
+                if pending:
+                    interaction = pending[0]
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(interaction, f"browser action must pause; failures={failures}")
+            self.assertEqual(interaction["title"], "Use browser · fill")
+            self.assertEqual(interaction["target"], "Browser session")
+            self.assertIn("text omitted", interaction["details"])
+            row = self.store.deferred_tool_approvals(self.mission["id"], "builder")[0]
+            self.assertEqual(row["tool_arguments"]["value"], "[redacted]")
+            self.assertEqual(row["tool_arguments"]["selector"], "[redacted]")
+            self.assertNotIn('"value":"a"', row["message_history"])
+            self.assertEqual(called, [])
+            self.store.resolve_interaction(interaction["id"], "approved_once")
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive(), "approved browser action did not resume")
+            self.assertFalse(failures, str(failures))
+            self.assertEqual(called, [("a", "a")])
+        finally:
+            worker.join(timeout=1)
+
+    def test_browser_click_schemas_use_each_browser_adapter_contract(self) -> None:
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build", "builder.md",
+            tool_permissions=("browser_control",),
+        )
+        agent = _build_agent(definition, "openai:test-model")
+
+        click_schema = agent._function_toolset.tools["browser_click"].function_schema.json_schema
+        self.assertEqual(click_schema["required"], ["ref"])
+        self.assertNotIn("role", click_schema["properties"])
+
+        hover_schema = agent._function_toolset.tools["browser_hover"].function_schema.json_schema
+        self.assertEqual(hover_schema["required"], ["name"])
+        self.assertEqual(hover_schema["properties"]["role"]["default"], "button")
+        self.assertIn("button", hover_schema["properties"]["role"]["enum"])
+        self.assertNotIn("selector", hover_schema["properties"])
+
+        coordinate_schema = agent._function_toolset.tools["browser_click_at"].function_schema.json_schema
+        self.assertEqual(coordinate_schema["required"], ["x", "y"])
+        self.assertIn("browser_type", agent._function_toolset.tools)
 
     def test_mcp_secret_values_are_project_scoped_and_stored_in_the_os_keyring(self) -> None:
         registry = MCPRegistry(self.store)
@@ -2288,7 +2393,9 @@ TAP version 13
     def test_worker_does_not_retry_when_harness_ledger_has_an_unresolved_tool_effect(self) -> None:
         from pydantic_ai.exceptions import ModelConnectionError
         from pydantic_ai_harness.step_persistence import (
-            RunRecord, SqliteStepStore, ToolEffectRecord,
+            RunRecord,
+            SqliteStepStore,
+            ToolEffectRecord,
         )
 
         trigger = self.store.append(
@@ -3133,7 +3240,9 @@ os._exit(27)
 
     def test_harness_tool_effect_ledger_blocks_unsafe_provider_retry(self) -> None:
         from pydantic_ai_harness.step_persistence import (
-            RunRecord, SqliteStepStore, ToolEffectRecord,
+            RunRecord,
+            SqliteStepStore,
+            ToolEffectRecord,
         )
 
         step_store = SqliteStepStore(database=self.store.data_dir / "agent_steps.sqlite3")
@@ -4369,8 +4478,10 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         ):
             catalog = SkillCatalog(self.repository)
 
-        self.assertEqual(len(catalog.list()), 4)
-        self.assertEqual(catalog.native_skill_names, frozenset({"interactive-app-authoring", "review"}))
+        self.assertEqual(len(catalog.list()), 6)
+        self.assertEqual(catalog.native_skill_names, frozenset({
+            "interactive-app-authoring", "workflow-authoring", "review", "data-visualisation",
+        }))
         workspace = WorkspaceTools(self.store, self.mission["id"], "builder")
         capabilities = build_capabilities(workspace, catalog)
         self.assertNotIn("Skills", {type(item).__name__ for item in capabilities})
@@ -4557,7 +4668,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         skills = catalog.list()
         by_name = {skill["name"]: skill for skill in skills}
         self.assertEqual(set(by_name), {
-            "interactive-app-authoring", "release", "schema", "review", "accessibility",
+            "interactive-app-authoring", "workflow-authoring", "release", "schema", "review",
+            "accessibility", "data-visualisation",
         })
         self.assertEqual(by_name["interactive-app-authoring"]["source"], "Tribe · Built-in")
         self.assertEqual(by_name["release"]["description"], "Instructions for release. Use for preparing deployments.")
@@ -4598,7 +4710,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
 
         skills = catalog.list()
         self.assertEqual({skill["name"] for skill in skills}, {
-            "Security audit", "Release checklist", "interactive-app-authoring",
+            "Security audit", "Release checklist", "interactive-app-authoring", "workflow-authoring",
+            "data-visualisation",
         })
         sources = {skill["name"]: skill["source"] for skill in skills}
         self.assertEqual(sources["Security audit"], "User · Codex plugin")

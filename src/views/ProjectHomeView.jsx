@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowUp, CaretDown, CaretRight, Check, ClockCounterClockwise, FolderSimple, Gear, MagnifyingGlass, Sparkle, UsersThree } from "@phosphor-icons/react";
+import { ArrowUp, CaretDown, CaretRight, Check, ClockCounterClockwise, Flag, FolderSimple, Gear, GitBranch, MagnifyingGlass, Sparkle, UsersThree } from "@phosphor-icons/react";
 import { compactChatTitle } from "../domain/chat-title.js";
 import { missionStatusLabel } from "../domain/labels.js";
 import { insertSlashCommand, slashCommandOptions } from "../domain/slash-commands.js";
@@ -22,6 +22,7 @@ export function ProjectHomeView({ project, missions, skills = [], recipes = [], 
   const modelMenuRef = useRef(null);
   const modelListSearchRef = useRef(null);
   const slashOptions = slashCommandOptions(prompt, recipes, skills);
+  const activeSlashOptionId = `mission-slash-option-${activeSlashOption}`;
   const unavailableStatuses = new Set(["Provider setup failed", "Not configured"]);
   const readyAgents = agentConfigured ? agents.filter((agent) => !unavailableStatuses.has(agent.status)) : [];
   const canStartChat = agentConfigured && readyAgents.length > 0;
@@ -73,6 +74,10 @@ export function ProjectHomeView({ project, missions, skills = [], recipes = [], 
     if (modelListOpen && modelChoices.length > 8) modelListSearchRef.current?.focus();
   }, [modelListOpen]);
 
+  useEffect(() => {
+    if (slashOptions.length) document.getElementById(activeSlashOptionId)?.scrollIntoView({ block: "nearest" });
+  }, [activeSlashOptionId, slashOptions.length]);
+
   async function startMission(event) {
     event.preventDefault();
     if (!prompt.trim() || !canStartChat || submitting) return;
@@ -100,7 +105,7 @@ export function ProjectHomeView({ project, missions, skills = [], recipes = [], 
       setActiveSlashOption((current) => (current - 1 + slashOptions.length) % slashOptions.length);
       return;
     }
-    if (slashOptions.length && event.key === "Enter" && !event.shiftKey) {
+    if (slashOptions.length && (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey))) {
       event.preventDefault();
       selectSlashOption(slashOptions[activeSlashOption] ?? slashOptions[0]);
       return;
@@ -166,11 +171,19 @@ export function ProjectHomeView({ project, missions, skills = [], recipes = [], 
         <form className="project-home-composer" onSubmit={startMission}>
           <label className="visually-hidden" htmlFor="new-mission-prompt">Message this project</label>
           {slashOptions.length > 0 && <div className="project-home-slash-menu" id="mission-slash-commands" role="listbox" aria-label="Chat commands">
-            {slashOptions.map((option, index) => <button aria-selected={index === activeSlashOption} className={index === activeSlashOption ? "project-home-slash-option project-home-slash-option--active" : "project-home-slash-option"} key={option.id} onClick={() => selectSlashOption(option)} role="option" type="button">
-              <strong>{option.label}</strong><small>{option.description}</small><code>{option.insert.trim()}</code>
-            </button>)}
+            <div className="project-home-slash-heading"><span>Commands</span><div><kbd>↑</kbd><kbd>↓</kbd><small>navigate</small><kbd>↵</kbd><small>select</small></div></div>
+            {slashOptions.map((option, index) => {
+              const kind = option.id === "goal" ? "Goal" : option.id === "workflow" || option.id.startsWith("workflow:") ? "Workflow" : "Skill";
+              const Icon = kind === "Goal" ? Flag : kind === "Workflow" ? GitBranch : Sparkle;
+              const command = kind === "Goal" ? "/goal" : kind === "Workflow" ? "/workflow" : "/skill";
+              return <button aria-selected={index === activeSlashOption} className={index === activeSlashOption ? "project-home-slash-option project-home-slash-option--active" : "project-home-slash-option"} id={`mission-slash-option-${index}`} key={option.id} onClick={() => selectSlashOption(option)} role="option" type="button">
+                <span className={`project-home-slash-icon project-home-slash-icon--${kind.toLowerCase()}`}><Icon aria-hidden="true" size={17} weight="regular" /></span>
+                <span className="project-home-slash-copy"><span><strong>{option.label}</strong><small>{kind}</small></span><span className="project-home-slash-description">{option.description}</span></span>
+                <code>{command}</code>
+              </button>;
+            })}
           </div>}
-          <textarea aria-controls="mission-slash-commands" autoFocus maxLength={20000} id="new-mission-prompt" onChange={(event) => { setPrompt(event.target.value); setActiveSlashOption(0); event.currentTarget.style.height = "55px"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 280)}px`; }} onKeyDown={handleComposerKeyDown} placeholder="Ask a question or describe a task…" ref={promptRef} rows={2} value={prompt} />
+          <textarea aria-activedescendant={slashOptions.length ? activeSlashOptionId : undefined} aria-autocomplete="list" aria-controls="mission-slash-commands" aria-expanded={slashOptions.length > 0} autoComplete="off" autoFocus id="new-mission-prompt" maxLength={20000} onChange={(event) => { setPrompt(event.target.value); setActiveSlashOption(0); event.currentTarget.style.height = "55px"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 280)}px`; }} onKeyDown={handleComposerKeyDown} placeholder="Ask a question or describe a task…" ref={promptRef} role="combobox" rows={2} value={prompt} />
           <div className="project-home-composer-footer">
             <div className="project-home-composer-context"><span className="project-context-chip"><FolderSimple size={14} />{project?.name || "Project"}</span><span className="project-home-composer-hint">Type <kbd>/</kbd> for commands</span></div>
             <div className="composer-model-menu-wrap" ref={modelMenuRef}>
