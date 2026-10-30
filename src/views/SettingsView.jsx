@@ -40,8 +40,11 @@ const imageGenerationOptions = [
   { id: "openai:gpt-image-2.5-flare", provider: "openai", label: "OpenAI · GPT Image 2.5 Flare · Fast" },
   { id: "openai:gpt-image-2.5-sunburst", provider: "openai", label: "OpenAI · GPT Image 2.5 Sunburst · Precision" },
   { id: "openai:gpt-image-2", provider: "openai", label: "OpenAI · GPT Image 2" },
-  { id: "google:gemini-3.1-flash-image", provider: "google", label: "Google · Gemini 3.1 Flash Image" },
-  { id: "xai:grok-imagine-image", provider: "xai", label: "xAI · Grok Imagine" },
+  { id: "google:gemini-3.1-flash-lite-image", provider: "google", label: "Google · Gemini 3.1 Flash Lite Image · Fast" },
+  { id: "google:gemini-3.1-flash-image", provider: "google", label: "Google · Gemini 3.1 Flash Image · Balanced" },
+  { id: "google:gemini-3-pro-image", provider: "google", label: "Google · Gemini 3 Pro Image · Precision" },
+  { id: "xai:grok-imagine-image-2.0", provider: "xai", label: "xAI · Grok Imagine 2.0" },
+  { id: "xai:grok-imagine-image", provider: "xai", label: "xAI · Grok Imagine (legacy)" },
 ];
 
 function UsageBreakdown({ heading, items, nameKey }) {

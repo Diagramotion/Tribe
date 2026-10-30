@@ -1601,7 +1601,10 @@ class Handler(BaseHTTPRequestHandler):
                     "openai:gpt-image-2.5-flare": "openai",
                     "openai:gpt-image-2.5-sunburst": "openai",
                     "openai:gpt-image-2": "openai",
+                    "google:gemini-3.1-flash-lite-image": "google",
                     "google:gemini-3.1-flash-image": "google",
+                    "google:gemini-3-pro-image": "google",
+                    "xai:grok-imagine-image-2.0": "xai",
                     "xai:grok-imagine-image": "xai",
                 }
                 if not isinstance(model, str) or model not in {"", *supported_models}:

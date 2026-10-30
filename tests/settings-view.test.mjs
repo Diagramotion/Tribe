@@ -9,12 +9,14 @@ let vite;
 const hmrPort = 40_000 + (process.pid % 5_000) * 3 + 2;
 let SettingsView;
 let ProjectCreateDialog;
+let ChartPreview;
 
 before(async () => {
   globalThis.window = { __TAURI_INTERNALS__: {}, setTimeout };
   vite = await createServer({ server: { middlewareMode: true, hmr: { port: hmrPort } }, appType: "custom" });
   ({ SettingsView } = await vite.ssrLoadModule("/src/views/SettingsView.jsx"));
   ({ ProjectCreateDialog } = await vite.ssrLoadModule("/src/components/ProjectCreateDialog.jsx"));
+  ({ ChartPreview } = await vite.ssrLoadModule("/src/components/ChartPreview.jsx"));
 });
 
 after(async () => {
@@ -44,6 +46,12 @@ test("every Workspace Settings category renders without missing UI components", 
     const html = renderToStaticMarkup(React.createElement(SettingsView, { ...props, initialSection }));
     assert.match(html, new RegExp(expectedText));
     assert.match(html, /role="tabpanel"/);
+    if (initialSection === "models") {
+      assert.match(html, /value="google:gemini-3\.1-flash-lite-image"/);
+      assert.match(html, /value="google:gemini-3-pro-image"/);
+      assert.match(html, /value="xai:grok-imagine-image-2\.0"/);
+      assert.match(html, /value="xai:grok-imagine-image"/);
+    }
   }
 });
 
@@ -105,4 +113,29 @@ test("usage settings show month-to-date spend and disclose unpriced runs", () =>
   assert.match(html, /builder/);
   assert.match(html, /No cumulative limit by default/);
   assert.match(html, /placeholder="No limit"/);
+});
+
+test("chart responses render as accessible SVG with exact values and exports", () => {
+  const html = renderToStaticMarkup(React.createElement(ChartPreview, {
+    spec: {
+      type: "percent-stacked-bar", title: "Revenue mix",
+      xLabel: "Quarter", yLabel: "Revenue", valueLabel: "USD",
+      seriesNames: ["Direct", "Partner"],
+      rows: [
+        { series: "Direct", x: "Q1", y: 11, share: 55 },
+        { series: "Partner", x: "Q1", y: 9, share: 45 },
+      ],
+    },
+    source: "Provider result",
+  }));
+
+  assert.match(html, /<figure class="chart-preview">/);
+  assert.match(html, /aria-label="Revenue mix" class="chart-svg" role="img"/);
+  assert.match(html, /View data/);
+  assert.match(html, /<td>11<\/td>/);
+  assert.match(html, /<td>55\.0%<\/td>/);
+  assert.match(html, /Download chart as CSV/);
+  assert.match(html, /Download chart as SVG/);
+  assert.match(html, /Download chart as PNG/);
+  assert.match(html, /Chart source: Provider result/);
 });

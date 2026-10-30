@@ -4,7 +4,8 @@ import remarkGfm from "remark-gfm";
 import { Check, Copy, WarningCircle } from "@phosphor-icons/react";
 import { languageLoaders } from "./ReadOnlyCodeEditor.jsx";
 import { DiagramPreview } from "./DiagramPreview.jsx";
-import { ChartPreview, parseChartSpec } from "./ChartPreview.jsx";
+import { ChartPreview } from "./ChartPreview.jsx";
+import { parseChartSpec } from "../domain/chart-spec.js";
 
 const codeFenceLanguageAliases = {
   javascript: "js", javascriptreact: "jsx", js: "js", jsx: "jsx",
