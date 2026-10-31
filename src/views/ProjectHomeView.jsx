@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowUp, CaretDown, CaretRight, Check, ClockCounterClockwise, Flag, FolderSimple, Gear, GitBranch, MagnifyingGlass, Sparkle, UsersThree } from "@phosphor-icons/react";
+import { ArrowUp, CaretDown, CaretRight, Check, ClockCounterClockwise, Flag, FolderSimple, Gear, GitBranch, MagnifyingGlass, Sparkle, UsersThree, GlobeSimple } from "@phosphor-icons/react";
 import { compactChatTitle } from "../domain/chat-title.js";
 import { missionStatusLabel } from "../domain/labels.js";
 import { insertSlashCommand, slashCommandOptions } from "../domain/slash-commands.js";
@@ -10,6 +10,7 @@ export function ProjectHomeView({ project, missions, skills = [], recipes = [], 
   const [prompt, setPrompt] = useState("");
   const [activeSlashOption, setActiveSlashOption] = useState(0);
   const [submitting, setSubmitting] = useState(false);
+  const [deepResearch, setDeepResearch] = useState(false);
   const [modelCatalog, setModelCatalog] = useState([]);
   const [catalogDefaultModel, setCatalogDefaultModel] = useState(null);
   const [modelPreference, setModelPreference] = useState("");
@@ -29,6 +30,7 @@ export function ProjectHomeView({ project, missions, skills = [], recipes = [], 
 
   useEffect(() => {
     setPrompt("");
+    setDeepResearch(false);
     setSubmitting(false);
     setModelPreference("");
     setEffortPreference("");
@@ -83,7 +85,10 @@ export function ProjectHomeView({ project, missions, skills = [], recipes = [], 
     if (!prompt.trim() || !canStartChat || submitting) return;
     setSubmitting(true);
     try {
-      if (await onCreateMission(prompt.trim(), modelPreference || null, effortPreference || null)) setPrompt("");
+      if (await onCreateMission(prompt.trim(), modelPreference || null, effortPreference || null, { deepResearch })) {
+        setPrompt("");
+        setDeepResearch(false);
+      }
     } finally {
       setSubmitting(false);
     }
@@ -186,6 +191,7 @@ export function ProjectHomeView({ project, missions, skills = [], recipes = [], 
           <textarea aria-activedescendant={slashOptions.length ? activeSlashOptionId : undefined} aria-autocomplete="list" aria-controls="mission-slash-commands" aria-expanded={slashOptions.length > 0} autoComplete="off" autoFocus id="new-mission-prompt" maxLength={20000} onChange={(event) => { setPrompt(event.target.value); setActiveSlashOption(0); event.currentTarget.style.height = "55px"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 280)}px`; }} onKeyDown={handleComposerKeyDown} placeholder="Ask a question or describe a task…" ref={promptRef} role="combobox" rows={2} value={prompt} />
           <div className="project-home-composer-footer">
             <div className="project-home-composer-context"><span className="project-context-chip"><FolderSimple size={14} />{project?.name || "Project"}</span><span className="project-home-composer-hint">Type <kbd>/</kbd> for commands</span></div>
+            <button aria-pressed={deepResearch} className={`research-mode-toggle${deepResearch ? " research-mode-toggle--active" : ""}`} disabled={submitting} onClick={() => setDeepResearch((value) => !value)} title="The Planner leads the investigation and assigns focused work to selected project roles with web access." type="button"><GlobeSimple aria-hidden="true" size={15} /><span>Deep Research</span></button>
             <div className="composer-model-menu-wrap" ref={modelMenuRef}>
               <button aria-expanded={modelMenuOpen} aria-haspopup="dialog" aria-label={`Model ${triggerModelLabel}${initialAgent?.model ? `, pinned for ${initialAgent.name}` : ""}, effort ${effortLabel}`} className={"composer-model-trigger" + (modelMenuOpen ? " composer-model-trigger--open" : "")} onClick={() => { setModelListOpen(false); setModelListSearch(""); setModelMenuOpen((open) => !open); }} type="button">
                 <Sparkle aria-hidden="true" className="composer-model-trigger-icon" size={15} weight="fill" />

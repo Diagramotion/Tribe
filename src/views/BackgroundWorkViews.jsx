@@ -1,8 +1,23 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  ArrowClockwise, BellSimple, CheckCircle, CircleNotch, ClockCounterClockwise, Pause, PencilSimple, Play, Stop, TerminalWindow, WarningCircle, X,
+  ArrowClockwise, BellSimple, CalendarBlank, CheckCircle, CircleNotch, ClipboardText, ClockCounterClockwise, GlobeHemisphereWest, Pause, PencilSimple, Play, Plus, Stop, TerminalWindow, WarningCircle, X,
 } from "@phosphor-icons/react";
+import { SelectControl } from "../components/SelectControl.jsx";
 import { schedulePresentation } from "../domain/schedules.js";
+import { cronFields, hourWindowFromCron, monthlyDayFromCron, scheduleCronExpression, selectedDaysFromCron, WEEKDAYS } from "../domain/schedule-recurrence.js";
+import { useDialogFocus } from "../hooks/useDialogFocus.js";
+
+const scheduleTemplates = [
+  { title: "Daily research brief", description: "Get a sourced roundup of a topic you choose.", prompt: "Research the latest developments on [topic]. Summarise the important changes and include links to your sources.", cadence: "daily", icon: GlobeHemisphereWest },
+  { title: "Weekly project review", description: "Check recent progress, open work and blockers.", prompt: "Review this project's recent progress, open work and blockers. Summarise what changed and recommend the next steps.", cadence: "weekly", icon: ClipboardText },
+  { title: "Follow a topic", description: "Check for meaningful updates and explain why they matter.", prompt: "Look for meaningful updates about [topic]. If anything changed, explain why it matters and include sources.", cadence: "weekdays", icon: BellSimple },
+  { title: "Plan the week", description: "Review project priorities and prepare a concise plan.", prompt: "Review this project's priorities and prepare a concise plan for the coming week.", cadence: "weekly", icon: CalendarBlank },
+];
+const hourOptions = Array.from({ length: 24 }, (_, hour) => ({ value: String(hour), label: `${String(hour).padStart(2, "0")}:00` }));
+const clockHourOptions = Array.from({ length: 24 }, (_, hour) => ({ value: String(hour).padStart(2, "0"), label: String(hour).padStart(2, "0") }));
+const minuteOptions = Array.from({ length: 60 }, (_, minute) => ({ value: String(minute).padStart(2, "0"), label: String(minute).padStart(2, "0") }));
+const cronFieldLabels = ["Minute", "Hour", "Day of month", "Month", "Day of week"];
+const cronFieldHints = ["0–59", "0–23", "1–31", "1–12 or JAN–DEC", "0–6 or SUN–SAT"];
 
 const runStatusLabels = {
   queued: "Queued",
@@ -13,6 +28,15 @@ const runStatusLabels = {
   cancelled: "Stopped",
   failed: "Needs attention",
 };
+
+function ScheduleTimeFields({ label, value, onChange }) {
+  const [hour = "09", minute = "00"] = (value || "09:00").split(":");
+  return <div className="schedule-time-fields">
+    <SelectControl className="schedule-select--time-part" label={`${label} hour`} onChange={(nextHour) => onChange(`${nextHour}:${minute}`)} options={clockHourOptions} size="compact" value={hour} />
+    <span aria-hidden="true">:</span>
+    <SelectControl className="schedule-select--time-part" label={`${label} minute`} onChange={(nextMinute) => onChange(`${hour}:${nextMinute}`)} options={minuteOptions} size="compact" value={minute} />
+  </div>;
+}
 
 export function RunsView({ mission, runs, agentRequests = [], onStop }) {
   return <section className="tab-panel detail-view command-view">
@@ -50,12 +74,17 @@ function localDateTime(value, timezone) {
 
 export function SchedulesView({ project, projects = [], schedules, agentsConfigured, workspace = false, desktopNotificationsOn = false, onEnableDesktopNotifications, onTestDesktopNotifications, onCreate, onEdit, onAction, onLoadMoreRuns }) {
   const localTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const dialogRef = useRef(null);
   const [selectedProjectId, setSelectedProjectId] = useState(project?.id ?? projects[0]?.id ?? "");
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [cadence, setCadence] = useState("daily");
   const [deliveryTime, setDeliveryTime] = useState("09:00");
-  const [cronExpression, setCronExpression] = useState("0 9 * * MON-FRI");
+  const [weeklyDays, setWeeklyDays] = useState(["1"]);
+  const [monthlyDay, setMonthlyDay] = useState("1");
+  const [hourlyStartHour, setHourlyStartHour] = useState("9");
+  const [hourlyEndHour, setHourlyEndHour] = useState("17");
+  const [cronParts, setCronParts] = useState(["0", "9", "*", "*", "MON-FRI"]);
   const [targetMissionId, setTargetMissionId] = useState("");
   const [editingTargetUnavailable, setEditingTargetUnavailable] = useState(false);
   const [runAt, setRunAt] = useState(() => {
@@ -64,6 +93,7 @@ export function SchedulesView({ project, projects = [], schedules, agentsConfigu
     return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}T${String(value.getHours()).padStart(2, "0")}:${String(value.getMinutes()).padStart(2, "0")}`;
   });
   const [editingId, setEditingId] = useState(null);
+  const [formOpen, setFormOpen] = useState(false);
   const [editingProjectId, setEditingProjectId] = useState("");
   const [editingTimezone, setEditingTimezone] = useState("");
   const [pending, setPending] = useState(false);
@@ -76,6 +106,8 @@ export function SchedulesView({ project, projects = [], schedules, agentsConfigu
     ? project
     : projects.find((item) => item.id === selectedProjectId);
   const targetChats = (selectedProject?.missions ?? []).filter((item) => !item.archived_at);
+  const scheduleTimezone = editingTimezone || localTimezone || "UTC";
+  useDialogFocus(dialogRef, formOpen);
 
   useEffect(() => {
     if (project?.id) setSelectedProjectId(project.id);
@@ -109,13 +141,15 @@ export function SchedulesView({ project, projects = [], schedules, agentsConfigu
   async function submit(event) {
     event.preventDefault();
     setPending(true);
+    const cronExpression = scheduleCronExpression({ cadence, deliveryTime, weeklyDays, monthlyDay, hourlyStartHour, hourlyEndHour, cronParts });
     const result = editingId
-      ? await onEdit(editingProjectId || selectedProjectId, editingId, title.trim(), prompt.trim(), cadence, editingTimezone, deliveryTime, cadence === "once" ? runAt : null, cronExpression.trim(), targetMissionId)
-      : await onCreate(project?.id ?? selectedProjectId, title.trim(), prompt.trim(), cadence, deliveryTime, cadence === "once" ? runAt : null, cronExpression.trim(), targetMissionId);
+      ? await onEdit(editingProjectId || selectedProjectId, editingId, title.trim(), prompt.trim(), cadence, editingTimezone, deliveryTime, cadence === "once" ? runAt : null, cronExpression, targetMissionId)
+      : await onCreate(project?.id ?? selectedProjectId, title.trim(), prompt.trim(), cadence, deliveryTime, cadence === "once" ? runAt : null, cronExpression, targetMissionId);
     setPending(false);
     if (result) {
       setTitle(""); setPrompt(""); setEditingId(null); setEditingTimezone(""); setEditingProjectId(""); setTargetMissionId("");
       setEditingTargetUnavailable(false);
+      setFormOpen(false);
     }
   }
   async function enableNotifications() {
@@ -135,14 +169,39 @@ export function SchedulesView({ project, projects = [], schedules, agentsConfigu
       ? project
       : projects.find((item) => item.id === schedule.project_id);
     setEditingId(schedule.id);
+    setFormOpen(true);
     setEditingProjectId(schedule.project_id ?? project?.id ?? "");
     if (schedule.project_id) setSelectedProjectId(schedule.project_id);
     setEditingTimezone(schedule.timezone);
     setTitle(schedule.title);
     setPrompt(schedule.prompt);
-    setCadence(schedule.cadence);
+    setWeeklyDays(["1"]);
+    setMonthlyDay("1");
+    setHourlyStartHour("9");
+    setHourlyEndHour("17");
+    const existingCron = schedule.cron_expression ?? "";
+    const parsedCron = cronFields(existingCron);
+    let editorCadence = schedule.cadence;
+    if (existingCron && schedule.cadence === "weekly") {
+      const days = selectedDaysFromCron(existingCron);
+      if (days) setWeeklyDays(days);
+      else editorCadence = "cron";
+    } else if (existingCron && schedule.cadence === "monthly") {
+      const day = monthlyDayFromCron(existingCron);
+      if (day) setMonthlyDay(String(day));
+      else editorCadence = "cron";
+    } else if (existingCron && schedule.cadence === "hourly") {
+      const window = hourWindowFromCron(existingCron);
+      if (window) {
+        setHourlyStartHour(String(window[0]));
+        setHourlyEndHour(String(window[1]));
+      } else editorCadence = "cron";
+    } else if (existingCron && !["cron", "weekly", "monthly", "hourly"].includes(schedule.cadence)) {
+      editorCadence = "cron";
+    }
+    if (editorCadence === "cron" && parsedCron) setCronParts(parsedCron);
+    setCadence(editorCadence);
     setDeliveryTime(schedule.delivery_time);
-    setCronExpression(schedule.cron_expression ?? "");
     setTargetMissionId(schedule.target_mission_id ?? "");
     setEditingTargetUnavailable(Boolean(schedule.target_mission_id
       && !(scheduleProject?.missions ?? []).some((item) => item.id === schedule.target_mission_id && !item.archived_at)));
@@ -154,46 +213,114 @@ export function SchedulesView({ project, projects = [], schedules, agentsConfigu
       schedule.timezone,
     ));
   }
+  function openTemplate(template) {
+    setEditingId(null);
+    setTitle(template.title);
+    setPrompt(template.prompt);
+    setCadence(template.cadence);
+    setDeliveryTime("09:00");
+    setWeeklyDays(["1"]);
+    setMonthlyDay("1");
+    setHourlyStartHour("9");
+    setHourlyEndHour("17");
+    setCronParts(["0", "9", "*", "*", "MON-FRI"]);
+    setTargetMissionId("");
+    setFormOpen(true);
+  }
+  function openNewSchedule() {
+    setEditingId(null);
+    setTitle("");
+    setPrompt("");
+    setCadence("daily");
+    setDeliveryTime("09:00");
+    setWeeklyDays(["1"]);
+    setMonthlyDay("1");
+    setHourlyStartHour("9");
+    setHourlyEndHour("17");
+    setCronParts(["0", "9", "*", "*", "MON-FRI"]);
+    setTargetMissionId("");
+    setFormOpen(true);
+  }
+  function closeForm() {
+    if (pending) return;
+    setFormOpen(false);
+    setEditingId(null);
+    setEditingTimezone("");
+    setEditingProjectId("");
+    setTargetMissionId("");
+    setTitle("");
+    setPrompt("");
+    setDeliveryTime("09:00");
+    setCadence("daily");
+    setWeeklyDays(["1"]);
+    setMonthlyDay("1");
+    setHourlyStartHour("9");
+    setHourlyEndHour("17");
+    setCronParts(["0", "9", "*", "*", "MON-FRI"]);
+  }
+  function handleDialogKeyDown(event) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeForm();
+    }
+  }
+  function toggleWeekday(day) {
+    setWeeklyDays((current) => current.includes(day)
+      ? current.length === 1 ? current : current.filter((value) => value !== day)
+      : [...current, day]);
+  }
   return <section className="tab-panel detail-view command-view schedule-view">
     <div className="detail-heading schedule-heading">
       <p>{workspace ? "Manage scheduled chats across your projects." : "Schedule a project chat to run once or repeat."} Tribe must be open with a connected model; paused chats and chats waiting for you hold their next run.</p>
-      {workspace && typeof window !== "undefined" && window.__TAURI_INTERNALS__ && <div className="schedule-notification-control">
+      <div className="schedule-heading-actions">
+        {workspace && typeof window !== "undefined" && window.__TAURI_INTERNALS__ && <div className="schedule-notification-control">
         {desktopNotificationsOn
           ? <><span>Desktop notifications enabled</span><button className="button button--quiet" disabled={testingNotifications} onClick={testNotifications} type="button">{testingNotifications ? "Sending…" : "Test notification"}</button></>
           : <button className="button button--quiet" disabled={requestingNotifications} onClick={enableNotifications} type="button"><BellSimple size={15} />{requestingNotifications ? "Requesting…" : "Enable desktop notifications"}</button>}
-      </div>}
-    </div>
-    <form className="command-launcher" onSubmit={submit}>
-      {workspace && <label htmlFor="schedule-project">Project<select disabled={Boolean(editingId) || projects.length === 0} id="schedule-project" onChange={(event) => setSelectedProjectId(event.target.value)} value={selectedProjectId}>{projects.length === 0 && <option value="">No projects available</option>}{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}
-      <label htmlFor="schedule-title">Goal</label>
-      <input id="schedule-title" maxLength={200} onChange={(event) => setTitle(event.target.value)} placeholder="e.g. Review open issues" value={title} />
-      <label htmlFor="schedule-prompt">What should the agents do?</label>
-      <textarea id="schedule-prompt" maxLength={10000} onChange={(event) => setPrompt(event.target.value)} placeholder="What should the agents investigate or do?" rows={3} value={prompt} />
-      <label htmlFor="schedule-target">Run in<select id="schedule-target" onChange={(event) => { setTargetMissionId(event.target.value); setEditingTargetUnavailable(false); }} value={targetMissionId}>
-        <option value="">A new chat</option>
-        {editingTargetUnavailable && <option value={targetMissionId}>Selected chat unavailable · choose another</option>}
-        {targetChats.map((item) => <option key={item.id} value={item.id}>{item.title}{item.status === "completed" ? " · completed" : item.status === "paused" ? " · paused" : ""}</option>)}
-      </select></label>
-      <div className={`command-launch-row${cadence === "cron" ? " command-launch-row--cron" : ""}`}>
-        <select aria-label="Repeat" onChange={(event) => setCadence(event.target.value)} value={cadence}>
-          <option value="once">Once</option><option value="hourly">Hourly</option>
-          <option value="daily">Daily</option><option value="weekdays">Weekdays</option>
-          <option value="weekly">Weekly</option><option value="monthly">Monthly</option>
-          <option value="cron">Custom (cron)</option>
-        </select>
-        {cadence === "once" && <label className="schedule-time-label">Run once at<input aria-label="Run once at" onChange={(event) => setRunAt(event.target.value)} type="datetime-local" value={runAt} /></label>}
-        {cadence === "cron" && <label className="schedule-time-label">Cron expression<input aria-label="Cron expression" autoComplete="off" onChange={(event) => setCronExpression(event.target.value)} placeholder="0 9 * * MON-FRI" spellCheck="false" value={cronExpression} /></label>}
-        {["daily", "weekdays", "weekly", "monthly"].includes(cadence) && <label className="schedule-time-label">
-          {cadence === "weekly" ? "Monday at" : cadence === "monthly" ? "First day at" : "Run at"}
-          <input aria-label="Run time" onChange={(event) => setDeliveryTime(event.target.value)} type="time" value={deliveryTime} />
-        </label>}
-        <button className="button button--primary" disabled={!(project?.id ?? selectedProjectId) || pending || !title.trim() || !prompt.trim() || (cadence === "once" && !runAt) || (cadence === "cron" && !cronExpression.trim())} type="submit">{pending ? "Saving…" : editingId ? "Save changes" : "Create schedule"}</button>
-        {editingId && <button className="button button--quiet" onClick={() => { setEditingId(null); setEditingTimezone(""); setEditingProjectId(""); setTargetMissionId(""); setTitle(""); setPrompt(""); }} type="button">Cancel edit</button>}
+        </div>}
+        {!formOpen && schedules.length > 0 && <button className="button button--primary" onClick={openNewSchedule} type="button"><Plus size={15} />New scheduled task</button>}
       </div>
-      <p>Times use your local time{localTimezone ? ` (${localTimezone})` : ""}. Weekly schedules run on Monday, monthly schedules on the first day, and hourly schedules start at the next hour.{cadence === "cron" ? " Custom schedules use five fields: minute, hour, day of month, month and weekday. Example: 0 9 * * MON-FRI." : ""}</p>
-    </form>
+    </div>
+    {schedules.length === 0 && <div className="schedule-empty-state">
+      <span className="schedule-empty-icon"><ClockCounterClockwise size={25} /></span>
+      <h2>Schedule a task</h2>
+      <p>Set up a recurring project check or a one-off task. Your schedules stay attached to their project.</p>
+      <div className="schedule-template-grid">{scheduleTemplates.map((template) => {
+        const TemplateIcon = template.icon;
+        return <button className="schedule-template" key={template.title} onClick={() => openTemplate(template)} type="button">
+          <span className="schedule-template-icon"><TemplateIcon size={18} /></span>
+          <span><strong>{template.title}</strong><small>{template.description}</small></span>
+        </button>;
+      })}</div>
+      <button className="button button--quiet schedule-start-from-scratch" onClick={openNewSchedule} type="button">Create from scratch</button>
+    </div>}
+    {formOpen && <div className="dialog-backdrop schedule-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeForm(); }} role="presentation">
+      <form aria-labelledby="schedule-dialog-title" aria-modal="true" className="mission-dialog schedule-dialog" onKeyDown={handleDialogKeyDown} onSubmit={submit} ref={dialogRef} role="dialog" tabIndex={-1}>
+        <div className="dialog-heading"><div><h2 id="schedule-dialog-title">{editingId ? "Edit scheduled task" : "Schedule a task"}</h2></div><button aria-label="Close" className="icon-button" disabled={pending} onClick={closeForm} type="button"><X size={17} /></button></div>
+        {workspace && <div className="schedule-select-field schedule-select-field--project"><span>Project</span><SelectControl className="schedule-select--project" disabled={Boolean(editingId) || projects.length === 0} label="Project" onChange={setSelectedProjectId} options={projects.length ? projects.map((item) => ({ value: item.id, label: item.name })) : [{ value: "", label: "No projects available", disabled: true }]} size="full" value={selectedProjectId} /></div>}
+        <label htmlFor="schedule-title">Task name<input autoFocus data-dialog-initial-focus id="schedule-title" maxLength={200} onChange={(event) => setTitle(event.target.value)} placeholder="e.g. Daily research brief" value={title} /></label>
+        <label htmlFor="schedule-prompt">Instructions<textarea id="schedule-prompt" maxLength={10000} placeholder="What should the agents do?" rows={4} onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label>
+        <div className="schedule-timing-controls">
+          <div className="schedule-select-row"><span>Repeat</span><SelectControl label="Repeat" onChange={setCadence} options={[{ value: "once", label: "Once" }, { value: "hourly", label: "Hourly" }, { value: "daily", label: "Daily" }, { value: "weekdays", label: "Weekdays" }, { value: "weekly", label: "Weekly" }, { value: "monthly", label: "Monthly" }, { value: "cron", label: "Custom cron" }]} size="regular" value={cadence} /></div>
+          {cadence === "once" && <div className="schedule-select-row schedule-one-off-row"><label htmlFor="schedule-run-date">Run at</label><div className="schedule-one-off-controls"><input aria-label="Run date" id="schedule-run-date" onChange={(event) => { const date = event.target.value; setRunAt(date ? `${date}T${runAt.slice(11, 16) || "09:00"}` : ""); }} type="date" value={runAt.slice(0, 10)} /><ScheduleTimeFields label="Run time" onChange={(time) => { const date = runAt.slice(0, 10); if (date) setRunAt(`${date}T${time}`); }} value={runAt.slice(11, 16)} /></div></div>}
+          {cadence === "hourly" && <div className="schedule-hour-window"><div className="schedule-hour-select"><span>From</span><SelectControl className="schedule-select--hour" label="Start hour" onChange={setHourlyStartHour} options={hourOptions} size="narrow" value={hourlyStartHour} /></div><span aria-hidden="true">to</span><div className="schedule-hour-select"><span className="visually-hidden">To</span><SelectControl className="schedule-select--hour" label="End hour" onChange={setHourlyEndHour} options={hourOptions} size="narrow" value={hourlyEndHour} /></div></div>}
+          {cadence === "weekly" && <div aria-label="Days of the week" className="schedule-weekdays" role="group">{WEEKDAYS.map((day) => <button aria-label={day.name} aria-pressed={weeklyDays.includes(day.value)} className={weeklyDays.includes(day.value) ? "schedule-weekday schedule-weekday--selected" : "schedule-weekday"} key={day.value} onClick={() => toggleWeekday(day.value)} type="button">{day.short}</button>)}</div>}
+          {cadence === "monthly" && <div className="schedule-select-row"><span>Day of month</span><SelectControl className="schedule-select--day" label="Day of month" onChange={setMonthlyDay} options={Array.from({ length: 31 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} size="compact" value={monthlyDay} /></div>}
+          {["daily", "weekdays", "weekly", "monthly"].includes(cadence) && <div className="schedule-select-row"><span>Time</span><ScheduleTimeFields label="Run time" onChange={setDeliveryTime} value={deliveryTime} /></div>}
+          {cadence === "cron" && <label className="schedule-timezone-row"><span>Timezone</span><span>{scheduleTimezone}</span></label>}
+          {cadence === "cron" && <div className="schedule-cron-fields">{cronParts.map((part, index) => <label key={cronFieldLabels[index]} htmlFor={`schedule-cron-field-${index}`}><span>{cronFieldLabels[index]}</span><input autoComplete="off" id={`schedule-cron-field-${index}`} maxLength={32} onChange={(event) => setCronParts((current) => current.map((value, field) => field === index ? event.target.value : value))} placeholder={cronFieldHints[index]} spellCheck="false" value={part} /></label>)}</div>}
+          <small>{cadence === "hourly" ? "Runs at each hour in the window, including both ends; an earlier end time continues overnight." : cadence === "weekly" ? "Choose one or more days. Runs at the selected local time." : cadence === "monthly" ? "Runs on this date each month; months without that date are skipped." : cadence === "cron" ? "Five fields: minute, hour, day of month, month, day of week. Supports lists, ranges, steps and names such as JAN or MON." : `Local time${scheduleTimezone ? ` · ${scheduleTimezone}` : ""}`}</small>
+        </div>
+        <details className="schedule-advanced"><summary>Advanced</summary>
+          <div className="schedule-select-field"><span>Run in</span><SelectControl className="schedule-select--target" label="Run in" onChange={(nextValue) => { setTargetMissionId(nextValue); setEditingTargetUnavailable(false); }} options={[{ value: "", label: "A new chat" }, ...(editingTargetUnavailable ? [{ value: targetMissionId, label: "Selected chat unavailable · choose another" }] : []), ...targetChats.map((item) => ({ value: item.id, label: `${item.title}${item.status === "completed" ? " · completed" : item.status === "paused" ? " · paused" : ""}` }))]} size="full" value={targetMissionId} /></div>
+          {cadence === "cron" && <p>Examples: <code>0 9 * * MON-FRI</code> for weekdays at 09:00, or <code>*/15 8-17 * * 1-5</code> every 15 minutes on weekdays.</p>}
+        </details>
+        <div className="dialog-actions"><button className="button button--quiet" disabled={pending} onClick={closeForm} type="button">Cancel</button><button className="button button--primary" disabled={!(project?.id ?? selectedProjectId) || pending || !title.trim() || !prompt.trim() || (cadence === "once" && !runAt) || (cadence === "weekly" && weeklyDays.length === 0) || (cadence === "cron" && cronParts.some((part) => !part.trim()))} type="submit">{pending ? "Saving…" : editingId ? "Save changes" : "Create"}</button></div>
+      </form>
+    </div>}
     {schedules.length > 0 && <div className="command-list-heading"><h3>Your schedules</h3><span>{schedules.length} {schedules.length === 1 ? "schedule" : "schedules"}</span></div>}
-    <div className={`command-run-list ${schedules.length === 0 ? "command-run-list--empty" : ""}`}>{schedules.length === 0 && <div className="command-empty"><span><ClockCounterClockwise size={20} /></span><div><strong>No scheduled chats</strong><p>Chats you schedule will appear here.</p></div></div>}
+    {schedules.length > 0 && <div className="command-run-list">
       {schedules.map((schedule) => {
         const { oneOffInProgress, statusLabel, nextRun } = schedulePresentation(schedule, agentsConfigured);
         const baseRuns = schedule.runs ?? [];
@@ -205,7 +332,7 @@ export function SchedulesView({ project, projects = [], schedules, agentsConfigu
           <div className="command-run-status command-run-status--completed"><ClockCounterClockwise size={17} /></div>
           <div className="command-run-body">
             <div className="command-run-meta"><strong>{schedule.title}</strong><span>{statusLabel} · {schedule.cadence === "cron" ? "Custom" : schedule.cadence}</span></div>
-            {schedule.cadence === "cron" && <small className="schedule-expression">{schedule.cron_expression}</small>}
+            {schedule.cron_expression && <small className="schedule-expression">{schedule.cron_expression}</small>}
             {workspace && <small>{schedule.project_name}</small>}
             {schedule.target_mission_id && <small>Chat · {schedule.target_mission_title ?? "Unavailable"}{schedule.target_mission_archived_at ? " · archived" : ""}</small>}
             <small>{nextRun}</small>
@@ -233,7 +360,7 @@ export function SchedulesView({ project, projects = [], schedules, agentsConfigu
           </div>
         </article>;
       })}
-    </div>
+    </div>}
   </section>;
 }
 

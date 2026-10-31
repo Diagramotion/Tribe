@@ -64,6 +64,7 @@ import { projectSetupError } from "./domain/project-setup.js";
 import { parseMissionPrompt } from "./domain/slash-commands.js";
 import { modelDisplayName, sortModelCatalog } from "./domain/model-catalog.js";
 import { IconButton, Sidebar } from "./components/WorkspaceSidebar.jsx";
+import { SelectControl } from "./components/SelectControl.jsx";
 import { AddRemoteServiceForm } from "./components/AddRemoteServiceForm.jsx";
 import { useDialogFocus } from "./hooks/useDialogFocus.js";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary.jsx";
@@ -1353,7 +1354,7 @@ export function App() {
     return sent;
   }
 
-  async function sendMessage(text, recipient = null, canvasContext = null, attachments = []) {
+  async function sendMessage(text, recipient = null, canvasContext = null, attachments = [], options = {}) {
     if (!mission) return;
     if (mission.archived_at) {
       notify("Restore this chat before posting to its channel.");
@@ -1367,7 +1368,7 @@ export function App() {
       const { event } = await runtime.sendMessage(mission.id, text, recipient, canvasContext ? {
         artifactId: canvasContext.artifactId, revision: canvasContext.revision,
         selectedText: canvasContext.selectedText ?? "",
-      } : null, attachments.map(({ id }) => id));
+      } : null, attachments.map(({ id }) => id), options);
       applyEvent(event);
       notify(agentRuntime.enabled
         ? "Message sent to the team."
@@ -1469,9 +1470,9 @@ export function App() {
     }
   }
 
-  async function sendGeneralChatMessage(text) {
+  async function sendGeneralChatMessage(text, options = {}) {
     if (!selectedGeneralChat) return "general_chat_not_found";
-    const { chat, responseError } = await runtime.sendGeneralChatMessage(selectedGeneralChat.id, text);
+    const { chat, responseError } = await runtime.sendGeneralChatMessage(selectedGeneralChat.id, text, options);
     setSelectedGeneralChat(chat);
     setGeneralChats((current) => [chat, ...current.filter((item) => item.id !== chat.id)]);
     return responseError;
@@ -1484,7 +1485,7 @@ export function App() {
     setGeneralChats((current) => current.map((item) => item.id === chat.id ? chat : item));
   }
 
-  async function createMission(initialPrompt, modelPreference = null, effortPreference = null) {
+  async function createMission(initialPrompt, modelPreference = null, effortPreference = null, options = {}) {
     const parsed = parseMissionPrompt(initialPrompt, recipes, skills);
     if (parsed.error) {
       notify(parsed.error);
@@ -1497,7 +1498,7 @@ export function App() {
     try {
       const { mission: created } = await runtime.createMission(
         project.id, title, goal, parsed.recipeId, goal, parsed.selectedSkills,
-        modelPreference, effortPreference, parsed.recipeVersion,
+        modelPreference, effortPreference, parsed.recipeVersion, options,
       );
       const pauseActive = (items) => items.map((item) => item.status === "active" && !item.archived_at
         ? { ...item, status: "paused" } : item);
@@ -2463,18 +2464,22 @@ export function App() {
     notify("Project history downloaded");
   }
 
-  async function resolveInteraction(decision) {
+  async function resolveInteraction(decision, accessScope = null) {
     if (!activeInteraction) return;
     const resolution = activeInteraction.type === "approval"
       ? decision === "Approved once" ? "approved_once" : "denied"
       : `answered: ${decision}`;
     try {
-      const { interaction } = await runtime.resolveInteraction(activeInteraction.id, resolution);
+      const { interaction } = await runtime.resolveInteraction(activeInteraction.id, resolution, accessScope);
       if (interaction.event) applyEvent(interaction.event);
       if (interaction.unblocked_event) applyEvent(interaction.unblocked_event);
       refreshPendingRequests();
       notify(activeInteraction.type === "approval"
-        ? resolution === "Denied" ? "Action declined." : "Action approved once."
+        ? resolution === "denied" ? "Action declined."
+          : accessScope === "chat" ? "Public web access allowed for this chat."
+            : accessScope === "project" ? "Public web access allowed for this project."
+              : accessScope === "workspace" ? "Public web access allowed across this workspace."
+                : "Action approved once."
         : `Answer sent to ${activeInteraction.agent}.`);
     } catch (error) {
       notify(`Decision was not saved: ${error.message}`);
@@ -2806,7 +2811,7 @@ export function App() {
   }
 
   function renderMissionView() {
-    if (selectedGeneralChat) return <GeneralChatView chat={selectedGeneralChat} getModelCatalog={runtime.getModelCatalog} onModelPreferenceChange={setGeneralChatModelPreference} onSend={sendGeneralChatMessage} onConnectModel={() => openWorkspaceSettings("models")} />;
+    if (selectedGeneralChat) return <GeneralChatView chat={selectedGeneralChat} getModelCatalog={runtime.getModelCatalog} onModelPreferenceChange={setGeneralChatModelPreference} onSend={sendGeneralChatMessage} onConnectModel={() => openWorkspaceSettings("models")} onOpenWebSearch={() => openWorkspaceSettings("web-search")} />;
     if (!mission) return <ProjectHomeView agentConfigured={agentRuntime.enabled} agents={projectAgents} workspaceModel={agentRuntime.model} onConnectModel={() => openWorkspaceSettings("models")} onCreateMission={createMission} onEditProjectGoal={openProjectGoalEditor} onManageModelMetadata={(modelId) => openWorkspaceSettings("models", modelId)} onManageTeam={() => openProjectSettings(project, "team")} onSelectMission={selectMission} project={project} missions={missions} recipes={recipes} skills={skills} />;
     return <MissionView
       mission={mission}
@@ -3164,7 +3169,7 @@ export function App() {
                   <div><strong>Find available models</strong><small>Search this provider’s catalogue. Ollama and OpenAI-compatible providers are supported.</small></div>
                   <button className="button button--quiet" disabled={providerModelsDiscovering} onClick={discoverAvailableModels} type="button">{providerModelsDiscovering ? "Searching…" : "Find models"}</button>
                 </div>
-                {providerModels?.length > 0 && <label>Available models<select aria-label="Available models" onChange={(event) => { if (event.target.value) setModelInput(`${modelProvider(modelInput) || "openai"}:${event.target.value}`); }} value={modelInput.includes(":") && modelProvider(modelInput) === (modelProvider(modelInput) || "openai") ? modelInput.slice(modelInput.indexOf(":") + 1) : ""}><option value="">Choose a model</option>{providerModels.map((model) => <option key={model.id} value={model.id}>{modelDisplayName(model)}{model.contextWindow ? ` · ${new Intl.NumberFormat().format(model.contextWindow)} context` : ""}</option>)}</select></label>}
+                {providerModels?.length > 0 && <label>Available models<SelectControl aria-label="Available models" onChange={(value) => { if (value) setModelInput(`${modelProvider(modelInput) || "openai"}:${value}`); }} options={[{ value: "", label: "Choose a model" }, ...providerModels.map((model) => ({ value: model.id, label: `${modelDisplayName(model)}${model.contextWindow ? ` · ${new Intl.NumberFormat().format(model.contextWindow)} context` : ""}` }))]} size="full" value={modelInput.includes(":") && modelProvider(modelInput) === (modelProvider(modelInput) || "openai") ? modelInput.slice(modelInput.indexOf(":") + 1) : ""} /></label>}
                 <label>Provider<input autoFocus list="tribe-model-providers" onChange={(event) => changeModelProvider(event.target.value)} placeholder="openai" value={modelProvider(modelInput) || "openai"} /><datalist id="tribe-model-providers">{Object.entries(providerNames).map(([id, name]) => <option key={id} value={id}>{name}</option>)}</datalist><small>Popular providers are listed. You can enter another provider name.</small></label>
                 <label>Model<input onChange={(event) => changeModelName(event.target.value)} placeholder={modelProvider(modelInput) === "openrouter" ? "provider/model-name" : "Model name"} value={modelInput.includes(":") ? modelInput.slice(modelInput.indexOf(":") + 1) : modelInput} /></label>
                 <>

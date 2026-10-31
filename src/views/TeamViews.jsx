@@ -2,9 +2,11 @@ import { useEffect, useState } from "react";
 import { Archive, MagnifyingGlass, PencilSimple, Plug, Plus, Sparkle, X } from "@phosphor-icons/react";
 import { AgentIcon } from "./MissionView.jsx";
 import { IconButton } from "../components/WorkspaceSidebar.jsx";
+import { SelectControl } from "../components/SelectControl.jsx";
 import { runtime } from "../api/runtime.js";
 import { agentStatusLabel } from "../domain/labels.js";
 import { modelDisplayName, sortModelCatalog } from "../domain/model-catalog.js";
+import { createResearchRoleDraft, RESEARCH_ROLE_TEMPLATES } from "../domain/research-role-templates.js";
 
 const skillAcronyms = { ai: "AI", api: "API", cli: "CLI", css: "CSS", gfm: "GFM", html: "HTML", ios: "iOS", mcp: "MCP", pdf: "PDF", sql: "SQL", ui: "UI", url: "URL", ux: "UX" };
 const skillSummaries = {
@@ -129,6 +131,8 @@ export function AgentRolesView({ agents, capabilityCatalog = [], agentConfigured
   const [modelCatalogLoading, setModelCatalogLoading] = useState(false);
   const [modelCatalogError, setModelCatalogError] = useState("");
   const projectScoped = Array.isArray(projectAgentIds);
+  const researchCapabilities = ["conversation", "task_coordination", "artifacts", "web"]
+    .filter((capability) => capabilityCatalog.some((item) => item.id === capability));
 
   useEffect(() => {
     let current = true;
@@ -212,14 +216,30 @@ export function AgentRolesView({ agents, capabilityCatalog = [], agentConfigured
     setFormOpen(false);
   }
 
+  function applyRoleTemplate(template) {
+    const draft = createResearchRoleDraft(
+      template.id, agents.map((agent) => agent.id), researchCapabilities,
+    );
+    if (!draft) return;
+    setId(draft.id);
+    setName(draft.name);
+    setRole(draft.role);
+    setInstructions(draft.instructions);
+    setModel(draft.model);
+    setEffort(draft.effort);
+    setRepositoryAccess(draft.repositoryAccess);
+    setCapabilities(draft.capabilities);
+  }
+
   return (
     <section className="tab-panel detail-view">
       <div className="detail-heading">
-        <div><span className="eyebrow">{projectScoped ? "Project team" : "Workspace roles"}</span><h2>{projectScoped ? "Project team" : "Agent roles"}</h2><p>{projectScoped ? "Choose which reusable roles can work in this project. Role instructions and model overrides apply anywhere the role is used." : "Create reusable roles with a clear responsibility and the right level of repository access."}</p></div>
-        <div className="agent-role-heading-actions"><span className="artifact-count">{projectScoped ? `${projectAgentIds.length} of ${agents.length} in team` : `${agents.length} roles`}</span>{!formOpen && !agentConfigured && <button className="button button--quiet" onClick={onConnectModel} type="button"><Plug size={15} /> Connect model</button>}{!formOpen && <IconButton className="agent-role-add" label="Add role" onClick={() => { setCapabilities(capabilityCatalog.filter((item) => !["image_generation", "data_analysis"].includes(item.id)).map((item) => item.id)); setFormOpen(true); }}><Plus size={17} /></IconButton>}</div>
+        <div><span className="eyebrow">{projectScoped ? "Project team" : "Workspace roles"}</span><h2>{projectScoped ? "Project team" : "Agent roles"}</h2><p>{projectScoped ? "Choose which reusable roles can work in this project. The Planner leads Deep Research; add focused researchers to the selected team below." : "Create reusable roles with a clear responsibility and the right level of repository access."}</p></div>
+        <div className="agent-role-heading-actions"><span className="artifact-count">{projectScoped ? `${projectAgentIds.length} of ${agents.length} in team` : `${agents.length} roles`}</span>{!formOpen && !agentConfigured && <button className="button button--quiet" onClick={onConnectModel} type="button"><Plug size={15} /> Connect model</button>}{!formOpen && <IconButton className="agent-role-add" label="Add role" onClick={() => { setCapabilities([]); setFormOpen(true); }}><Plus size={17} /></IconButton>}</div>
       </div>
       {formOpen && <form className="knowledge-form agent-role-form" id="agent-role-form" onSubmit={submit}>
         <strong>{editingId ? `Edit ${name || editingId}` : "Create a role"}</strong>
+        {!editingId && <div className="agent-role-templates"><span>Start with a research template</span><div>{RESEARCH_ROLE_TEMPLATES.map((template) => <button className="agent-role-template" key={template.id} onClick={() => applyRoleTemplate(template)} type="button"><MagnifyingGlass aria-hidden="true" size={15} /><span><strong>{template.name}</strong><small>{template.summary}</small></span></button>)}</div><small>Templates grant web research, shared artifacts and task coordination. Review the grants before saving.</small></div>}
         <div className="agent-role-fields">
           <label>Role key<input autoComplete="off" maxLength={50} onChange={(event) => setId(event.target.value)} pattern="[a-z][a-z0-9_-]*" placeholder="security-auditor" readOnly={Boolean(editingId)} required value={id} /><small>Used in agent-to-agent messages. This key stays fixed after creation.</small></label>
           <label>Name<input maxLength={200} onChange={(event) => setName(event.target.value)} placeholder="Security auditor" required value={name} /></label>
@@ -244,13 +264,12 @@ export function AgentRolesView({ agents, capabilityCatalog = [], agentConfigured
           </div>
         </fieldset>
         <div className="agent-role-fields">
-          <label>Model override (optional)<select onChange={(event) => {
-            const nextModel = event.target.value;
+          <label>Model override (optional)<SelectControl onChange={(nextModel) => {
             setModel(nextModel);
             const nextMetadata = modelCatalog.find((entry) => entry.id === nextModel);
             if (effort && Array.isArray(nextMetadata?.reasoningEfforts) && !nextMetadata.reasoningEfforts.includes(effort)) setEffort("");
-          }} value={model}><option value="">Use the chat or workspace model</option>{sortModelCatalog(modelCatalog.filter((entry) => entry.providerEnabled !== false && entry.allowed && entry.toolCalling !== false)).map((entry) => <option key={entry.id} value={entry.id}>{modelDisplayName(entry)} · {entry.provider}</option>)}{model && !modelCatalog.some((entry) => entry.id === model) && <option value={model}>{model} · Current override</option>}</select><small>{modelCatalogLoading ? "Loading allowed models…" : modelCatalogError ? "Could not load the model list; the saved override is preserved." : "Leave blank to inherit the chat choice; Auto uses the workspace default. A role model override always takes precedence."}</small>{!modelCatalogLoading && modelCatalog.length === 0 && !model && onManageModels && <button className="text-button agent-model-settings-link" onClick={onManageModels} type="button">Open model settings</button>}</label>
-          <label>Reasoning effort<select disabled={Boolean(model && selectedModelMetadata && modelEffortsKnown && agentEffortLevels.length === 0)} onChange={(event) => setEffort(event.target.value)} value={effort}><option value="">Use chat/model default</option>{agentEffortLevels.map((level) => <option key={level} value={level}>{level === "xhigh" ? "Extra high" : level[0].toUpperCase() + level.slice(1)}{effortLevelsVerified ? "" : " · unverified"}</option>)}{effort && !agentEffortLevels.includes(effort) && <option value={effort}>{effort} · Current override{effortLevelsVerified ? " · not listed" : " · unverified"}</option>}</select><small>{effortHelperText}</small>{!modelCatalogLoading && onManageModels && (!model || !selectedModelMetadata || !modelEffortsKnown) && <button className="text-button agent-model-settings-link" onClick={onManageModels} type="button">Review model capabilities</button>}</label>
+          }} options={[{ value: "", label: "Use the chat or workspace model" }, ...sortModelCatalog(modelCatalog.filter((entry) => entry.providerEnabled !== false && entry.allowed && entry.toolCalling !== false)).map((entry) => ({ value: entry.id, label: `${modelDisplayName(entry)} · ${entry.provider}` })), ...(model && !modelCatalog.some((entry) => entry.id === model) ? [{ value: model, label: `${model} · Current override` }] : [])]} size="full" value={model} /><small>{modelCatalogLoading ? "Loading allowed models…" : modelCatalogError ? "Could not load the model list; the saved override is preserved." : "Leave blank to inherit the chat choice; Auto uses the workspace default. A role model override always takes precedence."}</small>{!modelCatalogLoading && modelCatalog.length === 0 && !model && onManageModels && <button className="text-button agent-model-settings-link" onClick={onManageModels} type="button">Open model settings</button>}</label>
+          <label>Reasoning effort<SelectControl disabled={Boolean(model && selectedModelMetadata && modelEffortsKnown && agentEffortLevels.length === 0)} onChange={setEffort} options={[{ value: "", label: "Use chat/model default" }, ...agentEffortLevels.map((level) => ({ value: level, label: `${level === "xhigh" ? "Extra high" : level[0].toUpperCase() + level.slice(1)}${effortLevelsVerified ? "" : " · unverified"}` })), ...(effort && !agentEffortLevels.includes(effort) ? [{ value: effort, label: `${effort} · Current override${effortLevelsVerified ? " · not listed" : " · unverified"}` }] : [])]} size="full" value={effort} /><small>{effortHelperText}</small>{!modelCatalogLoading && onManageModels && (!model || !selectedModelMetadata || !modelEffortsKnown) && <button className="text-button agent-model-settings-link" onClick={onManageModels} type="button">Review model capabilities</button>}</label>
         </div>
           <fieldset className="repository-access-picker">
             <legend>Repository access</legend>

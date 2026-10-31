@@ -47,6 +47,7 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
       : null;
     return { id: event.id, kind: "message", actor, actorId: event.actorId, actorType, isScheduled, recipient, recipientId,
       channelAudience: event.payload.channelAudience,
+      researchMode: event.payload.researchMode ?? null,
       workItemId: event.payload.workItemId, triggerSequence: event.payload.triggerSequence,
       toolCallId: event.payload.toolCallId,
       durationMs: event.payload.durationMs,
@@ -70,6 +71,11 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
   }
   if (event.type.startsWith("interaction.") && event.type.endsWith(".resolved")) {
     const item = event.payload.interaction;
+    if (item.access_grant?.capability === "public_web_read") {
+      const scope = { chat: "this chat", project: "this project", workspace: "the workspace" }[item.access_grant.scope];
+      return { id: event.id, kind: "change", actor, time: formatTime(event.createdAt),
+        text: `You allowed read-only public web access for ${scope} · ${item.title}` };
+    }
     const resolution = { "Approved once": "approved this action once", Denied: "declined this action" }[item.resolution] ?? item.resolution.toLowerCase();
     return { id: event.id, kind: "change", actor, time: formatTime(event.createdAt), text: `You ${resolution} · ${item.title}` };
   }
@@ -78,6 +84,7 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
     const action = event.type.endsWith("claimed") ? "started" : event.type.endsWith("completed") ? "completed" : event.type.endsWith("updated") ? "updated" : event.type.endsWith("released") ? "released" : "added";
     return { id: event.id, kind: "change", actor, actorId: event.actorId, groupable: true,
       workItemId: item.id, workItemTitle: item.title,
+      researchMode: /research context:\s*deep research investigation/i.test(item.detail ?? "") ? "deep_research" : null,
       time: formatTime(event.createdAt), text: `${actor} ${action} task` };
   }
   if (event.type === "plan.finalized") {
@@ -638,10 +645,16 @@ export function filterTimelineMessages(messages, { agentId = "", workItemId = ""
 }
 
 export function mapInteraction(item) {
+  const toolName = item.tool_name ?? item.toolName;
+  const publicWebRead = ["duckduckgo_search", "web_fetch"].includes(toolName);
   return { id: item.id, type: item.interaction_type, title: item.title,
-    target: item.target, reason: item.details, detail: item.details, agent: item.requested_by,
+    target: item.target,
+    reason: publicWebRead
+      ? "Read-only public web request. Ongoing access still follows this project’s website settings and the selected role’s permissions."
+      : item.details,
+    detail: item.details, agent: item.requested_by,
     missionId: item.mission_id, missionTitle: item.mission_title,
-    missionGoal: item.mission_goal, missionStatus: item.mission_status,
+    missionGoal: item.mission_goal, missionStatus: item.mission_status, toolName,
     projectId: item.project_id, projectName: item.project_name };
 }
 

@@ -173,6 +173,10 @@ def build_capabilities(
             return args
         if call.tool_call_id in approved_calls:
             return args
+        if is_web_action and project_id and workspace.store.has_access_grant(
+            workspace.mission_id, project_id, "public_web_read",
+        ):
+            return args
         if mcp_tool is not None:
             server_name, tool_name = mcp_tool
             raise ApprovalRequired({
@@ -230,7 +234,9 @@ def build_capabilities(
                 target = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)[:2000]
                 details = (
                     f"Exact web request:\n{json.dumps(args if isinstance(args, dict) else {}, indent=2, ensure_ascii=False)[:4000]}\n\n"
-                    "This sends a read-only request to an external service. Approval applies once to this exact request."
+                    "This sends a read-only request to an external service. You can approve this request once, "
+                    "or allow read-only public web access for this chat, project, or workspace. "
+                    "Project web settings and the selected role's web access still apply."
                 )
             else:
                 title = "Run a command outside the safe set"

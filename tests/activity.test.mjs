@@ -65,6 +65,13 @@ test("scheduled prompts appear as scheduled tasks in the shared chat", () => {
   assert.equal(message.isScheduled, true);
 });
 
+test("project chat messages retain the Deep Research mode marker", () => {
+  const message = timelineMessage(event(1, "message.created", {
+    text: "Compare these two systems.", researchMode: "deep_research",
+  }, "user"));
+  assert.equal(message.researchMode, "deep_research");
+});
+
 test("mission completion appears as a final chat reply instead of a status card", () => {
   const checks = [{
     criterion: "The export is downloadable",
@@ -507,12 +514,26 @@ test("agent run metadata appears only on the last message from that run", () => 
 test("plan activity keeps the task title separate from the action copy", () => {
   const [entry] = timelineEntries([
     event(6, "plan.item.created", {
-      workItem: { id: "work-3", title: "Implement the shopping list" },
+      workItem: { id: "work-3", title: "Implement the shopping list", detail: "ordinary task" },
     }, "planner"),
   ]);
 
   assert.equal(entry.text, "Planner added task");
   assert.equal(entry.workItemTitle, "Implement the shopping list");
+});
+
+test("Deep Research task activity carries the visible investigation label", () => {
+  const [entry] = timelineEntries([
+    event(7, "plan.item.created", {
+      workItem: {
+        id: "work-research", title: "Check the second angle",
+        detail: "Research context: Deep Research investigation.",
+      },
+    }, "planner"),
+  ]);
+
+  assert.equal(entry.researchMode, "deep_research");
+  assert.equal(entry.workItemTitle, "Check the second angle");
 });
 
 test("a released work claim is shown as a release, not a new task", () => {
