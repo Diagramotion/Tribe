@@ -26,12 +26,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from tzlocal import get_localzone_name
 
 from .canvas import comment_publications, document_publications, validate_content, visible_message
 from .credentials import provider_for_model
 from .tool_activity import node_test_run_evidence
 
-SCHEMA_VERSION = 35
+SCHEMA_VERSION = 42
 MAX_AGENT_RETRY_WINDOW_SECONDS = 24 * 60 * 60
 DEFAULT_AGENT_RUN_TOKEN_LIMIT: int | None = None
 TERMINAL_AGENT_RUN_STATUSES = {"completed", "failed", "interrupted"}
@@ -58,6 +59,125 @@ def _is_supported_git_remote(remote: str) -> bool:
 
 def now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+_CRON_MONTHS = {name: index for index, name in enumerate(
+    ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"), 1,
+)}
+_CRON_WEEKDAYS = {name: index for index, name in enumerate(
+    ("SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"),
+)}
+
+
+def _cron_field_values(field: str, minimum: int, maximum: int,
+                       aliases: dict[str, int] | None = None) -> set[int]:
+    aliases = aliases or {}
+
+    def number(value: str) -> int:
+        upper = value.upper()
+        if upper in aliases:
+            return aliases[upper]
+        if not value.isdigit():
+            raise ValueError("cron_expression_invalid")
+        result = int(value)
+        if result < minimum or result > maximum:
+            raise ValueError("cron_expression_invalid")
+        return result
+
+    values: set[int] = set()
+    for part in field.split(","):
+        if not part:
+            raise ValueError("cron_expression_invalid")
+        base, separator, step_text = part.partition("/")
+        if separator and (not step_text.isdigit() or int(step_text) < 1):
+            raise ValueError("cron_expression_invalid")
+        step = int(step_text) if separator else 1
+        if base == "*":
+            start, end = minimum, maximum
+        elif "-" in base:
+            lower, upper = base.split("-", 1)
+            start, end = number(lower), number(upper)
+            if start > end:
+                raise ValueError("cron_expression_invalid")
+        else:
+            start = number(base)
+            end = maximum if separator else start
+        values.update(range(start, end + 1, step))
+    if not values:
+        raise ValueError("cron_expression_invalid")
+    if maximum == 7 and 7 in values:  # Cron accepts both 0 and 7 for Sunday.
+        values.discard(7)
+        values.add(0)
+    return values
+
+
+def _parse_cron_expression(expression: str) -> tuple[set[int], set[int], set[int], set[int], set[int], bool, bool]:
+    if not isinstance(expression, str) or not expression.strip() or len(expression) > 256:
+        raise ValueError("cron_expression_invalid")
+    fields = expression.split()
+    if len(fields) != 5:
+        raise ValueError("cron_expression_must_have_five_fields")
+    minute, hour, day, month, weekday = fields
+    return (
+        _cron_field_values(minute, 0, 59),
+        _cron_field_values(hour, 0, 23),
+        _cron_field_values(day, 1, 31),
+        _cron_field_values(month, 1, 12, _CRON_MONTHS),
+        _cron_field_values(weekday, 0, 7, _CRON_WEEKDAYS),
+        day == "*",
+        weekday == "*",
+    )
+
+
+def _next_cron_occurrence(expression: str, zone: ZoneInfo, after: datetime) -> datetime:
+    minutes, hours, month_days, months, weekdays, any_month_day, any_weekday = (
+        _parse_cron_expression(expression)
+    )
+    after_utc = after.astimezone(UTC)
+    local_date = after_utc.astimezone(zone).date()
+    # Eight years covers leap-day schedules and avoids accepting expressions
+    # that can never produce an occurrence.
+    for offset in range(366 * 8 + 2):
+        candidate_date = local_date + timedelta(days=offset)
+        if candidate_date.month not in months:
+            continue
+        day_match = candidate_date.day in month_days
+        weekday_match = ((candidate_date.weekday() + 1) % 7) in weekdays
+        if any_month_day:
+            day_match = True
+        if any_weekday:
+            weekday_match = True
+        if not (day_match and weekday_match if any_month_day or any_weekday
+                else day_match or weekday_match):
+            continue
+        candidates: list[datetime] = []
+        for hour_value in hours:
+            for minute_value in minutes:
+                local_candidate = datetime.combine(
+                    candidate_date, time(hour_value, minute_value), tzinfo=zone,
+                )
+                for fold in (0, 1):
+                    local_candidate = local_candidate.replace(fold=fold)
+                    utc_candidate = local_candidate.astimezone(UTC)
+                    round_trip = utc_candidate.astimezone(zone)
+                    if round_trip.replace(tzinfo=None) != local_candidate.replace(tzinfo=None):
+                        continue  # Skip non-existent wall-clock times during a DST jump.
+                    if utc_candidate > after_utc:
+                        candidates.append(utc_candidate)
+        if candidates:
+            return min(candidates)
+    raise ValueError("cron_expression_has_no_occurrence_within_eight_years")
+
+
+def _project_workspace_root(candidate: Path) -> Path:
+    try:
+        check = subprocess.run(["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+                              capture_output=True, text=True, check=False, timeout=5)
+    except FileNotFoundError:
+        return candidate
+    if check.returncode != 0:
+        return candidate
+    return Path(check.stdout.strip()).resolve(strict=True)
 
 
 def _sha256_file(path: Path) -> str:
@@ -398,6 +518,22 @@ class MissionStore:
                     project_id TEXT NOT NULL, mission_id TEXT NOT NULL, event_type TEXT NOT NULL,
                     actor_id TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS general_chats (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL, model_preference TEXT
+                );
+                CREATE TABLE IF NOT EXISTS general_chat_messages (
+                    id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL REFERENCES general_chats(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+                    body TEXT NOT NULL, model TEXT, duration_ms INTEGER,
+                    sources TEXT NOT NULL DEFAULT '[]',
+                    input_tokens INTEGER, output_tokens INTEGER, created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS general_chat_messages_order
+                    ON general_chat_messages(chat_id, created_at, id);
+                CREATE INDEX IF NOT EXISTS general_chats_updated
+                    ON general_chats(updated_at DESC, id DESC);
                 CREATE INDEX IF NOT EXISTS events_mission_sequence ON events(mission_id, sequence);
                 CREATE UNIQUE INDEX IF NOT EXISTS projects_repository_unique ON projects(repository);
                 CREATE TABLE IF NOT EXISTS work_items (
@@ -627,6 +763,24 @@ class MissionStore:
                     source_event_sequence INTEGER, created_at TEXT NOT NULL,
                     reviewed_by TEXT, reviewed_at TEXT, memory_id TEXT
                 );
+                CREATE TABLE IF NOT EXISTS project_memory_migration_reviews (
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    entry_id TEXT NOT NULL, legacy_hash TEXT NOT NULL, smriti_hash TEXT NOT NULL,
+                    resolution TEXT NOT NULL, reviewed_by TEXT NOT NULL, reviewed_at TEXT NOT NULL,
+                    PRIMARY KEY(project_id, entry_id, legacy_hash, smriti_hash)
+                );
+                CREATE INDEX IF NOT EXISTS project_memory_migration_reviews_history
+                    ON project_memory_migration_reviews(project_id, reviewed_at DESC);
+                CREATE TABLE IF NOT EXISTS project_memory_migration_ledger (
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    source_kind TEXT NOT NULL CHECK(source_kind IN ('legacy','proposal')),
+                    source_id TEXT NOT NULL, memory_id TEXT NOT NULL,
+                    source_hash TEXT NOT NULL, smriti_hash TEXT NOT NULL,
+                    title TEXT NOT NULL, migrated_at TEXT NOT NULL,
+                    PRIMARY KEY(project_id,source_kind,source_id)
+                );
+                CREATE INDEX IF NOT EXISTS project_memory_migration_ledger_project
+                    ON project_memory_migration_ledger(project_id,migrated_at DESC);
                 CREATE INDEX IF NOT EXISTS knowledge_proposals_project
                     ON knowledge_proposals(project_id,status,created_at DESC);
                 CREATE UNIQUE INDEX IF NOT EXISTS knowledge_proposals_pending_unique
@@ -679,13 +833,16 @@ class MissionStore:
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
                     title TEXT NOT NULL, prompt TEXT NOT NULL, cadence TEXT NOT NULL,
                     timezone TEXT NOT NULL, delivery_time TEXT NOT NULL DEFAULT '09:00',
+                    cron_expression TEXT NOT NULL DEFAULT '',
+                    target_mission_id TEXT NOT NULL DEFAULT '',
                     next_run_at TEXT NOT NULL, status TEXT NOT NULL,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS schedules_due ON schedules(status, next_run_at);
                 CREATE TABLE IF NOT EXISTS scheduled_runs (
                     id TEXT PRIMARY KEY, schedule_id TEXT NOT NULL REFERENCES schedules(id),
-                    mission_id TEXT NOT NULL REFERENCES missions(id), scheduled_for TEXT NOT NULL,
+                    mission_id TEXT NOT NULL REFERENCES missions(id), trigger_sequence INTEGER NOT NULL DEFAULT 0,
+                    invocation_started_at TEXT, scheduled_for TEXT NOT NULL,
                     started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, error TEXT
                 );
                 CREATE INDEX IF NOT EXISTS scheduled_runs_history
@@ -756,6 +913,24 @@ class MissionStore:
                         except (ValueError, ZoneInfoNotFoundError):
                             delivery_time = "09:00"
                         db.execute("UPDATE schedules SET delivery_time=? WHERE id=?", (delivery_time, row["id"]))
+                if "cron_expression" not in schedule_columns:
+                    db.execute("ALTER TABLE schedules ADD COLUMN cron_expression TEXT NOT NULL DEFAULT ''")
+                if "target_mission_id" not in schedule_columns:
+                    db.execute("ALTER TABLE schedules ADD COLUMN target_mission_id TEXT NOT NULL DEFAULT ''")
+                scheduled_run_columns = {row[1] for row in db.execute("PRAGMA table_info(scheduled_runs)")}
+                if "trigger_sequence" not in scheduled_run_columns:
+                    db.execute("ALTER TABLE scheduled_runs ADD COLUMN trigger_sequence INTEGER NOT NULL DEFAULT 0")
+                if "invocation_started_at" not in scheduled_run_columns:
+                    db.execute("ALTER TABLE scheduled_runs ADD COLUMN invocation_started_at TEXT")
+                general_chat_message_columns = {
+                    row[1] for row in db.execute("PRAGMA table_info(general_chat_messages)")
+                }
+                if "sources" not in general_chat_message_columns:
+                    db.execute("ALTER TABLE general_chat_messages ADD COLUMN sources TEXT NOT NULL DEFAULT '[]'")
+                db.execute(
+                    "UPDATE scheduled_runs SET invocation_started_at=started_at "
+                    "WHERE status IN ('running','paused','blocked') AND invocation_started_at IS NULL"
+                )
                 usage_budget_columns = {row[1] for row in db.execute("PRAGMA table_info(project_usage_budgets)")}
                 if "max_run_cost_usd" not in usage_budget_columns:
                     db.execute("ALTER TABLE project_usage_budgets ADD COLUMN max_run_cost_usd TEXT")
@@ -923,12 +1098,7 @@ class MissionStore:
                 "commandRuns": [self._background_run(dict(row)) for row in db.execute(
                     "SELECT * FROM background_runs WHERE mission_id = ? ORDER BY started_at DESC", (mission["id"],)
                 )] if mission else [],
-                "knowledge": [dict(row) for row in db.execute(
-                    """SELECT k.*,m.title AS source_mission_title FROM project_knowledge k
-                       LEFT JOIN missions m ON m.id=k.source_mission_id
-                       WHERE k.project_id=? ORDER BY k.title COLLATE NOCASE""",
-                    (project["id"],),
-                )],
+                "knowledge": [],
                 "knowledgeProposals": [dict(row) for row in db.execute(
                     """SELECT p.*,m.title AS source_mission_title FROM knowledge_proposals p
                        JOIN missions m ON m.id=p.mission_id WHERE p.project_id=? AND p.status='pending'
@@ -1038,11 +1208,7 @@ class MissionStore:
         candidate = Path(repository_path).expanduser().resolve(strict=True)
         if not candidate.is_dir():
             raise ValueError("repository_path_must_be_a_directory")
-        check = subprocess.run(["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
-                               capture_output=True, text=True, check=False, timeout=5)
-        if check.returncode != 0:
-            raise ValueError("project_path_must_be_a_git_repository")
-        repository = Path(check.stdout.strip()).resolve(strict=True)
+        repository = _project_workspace_root(candidate)
         reference_files = self._validated_project_reference_files(repository, reference_files)
         project = {"id": str(uuid.uuid4()), "name": name.strip(), "repository": str(repository),
                    "goal": (project_goal or goal).strip(), "created_at": now(), "referenceFiles": reference_files}
@@ -1083,11 +1249,7 @@ class MissionStore:
         candidate = Path(repository_path).expanduser().resolve(strict=True)
         if not candidate.is_dir():
             raise ValueError("repository_path_must_be_a_directory")
-        check = subprocess.run(["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
-                               capture_output=True, text=True, check=False, timeout=5)
-        if check.returncode != 0:
-            raise ValueError("project_path_must_be_a_git_repository")
-        repository = Path(check.stdout.strip()).resolve(strict=True)
+        repository = _project_workspace_root(candidate)
         project = {
             "id": str(uuid.uuid4()), "name": name.strip(), "repository": str(repository),
             "goal": "", "created_at": now(), "referenceFiles": [], "missions": [],
@@ -1520,7 +1682,7 @@ class MissionStore:
                     f"SELECT 1 FROM interactions WHERE mission_id IN ({placeholders}) AND status='pending' LIMIT 1",
                     f"SELECT 1 FROM agent_event_runs WHERE mission_id IN ({placeholders}) AND status IN ('running','cancelling','retrying') LIMIT 1",
                     f"SELECT 1 FROM background_runs WHERE mission_id IN ({placeholders}) AND status='running' LIMIT 1",
-                    f"SELECT 1 FROM scheduled_runs WHERE mission_id IN ({placeholders}) AND status IN ('running','paused','blocked') LIMIT 1",
+                    f"SELECT 1 FROM scheduled_runs WHERE mission_id IN ({placeholders}) AND status IN ('queued','running','paused','blocked') LIMIT 1",
                     f"SELECT 1 FROM isolated_workspaces WHERE mission_id IN ({placeholders}) LIMIT 1",
                     f"SELECT 1 FROM repository_file_deletions WHERE mission_id IN ({placeholders}) AND status='started' LIMIT 1",
                 ))
@@ -1679,30 +1841,86 @@ class MissionStore:
         return {"id": project_id, "name": project["name"], "chatCount": len(mission_ids)}
 
     @staticmethod
-    def _schedule_due(cadence: str, zone: ZoneInfo, delivery_time: str, after: datetime) -> datetime:
+    def _schedule_due(cadence: str, zone: ZoneInfo, delivery_time: str, after: datetime,
+                      cron_expression: str = "") -> datetime:
         local = after.astimezone(zone)
+        if cadence == "cron":
+            return _next_cron_occurrence(cron_expression, zone, after)
         if cadence == "hourly":
             return after.astimezone(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         if cadence == "once":
             return after.astimezone(UTC)
         target_time = time.fromisoformat(delivery_time)
-        if cadence == "daily":
-            day = local.date()
-        else:
+        if cadence == "monthly":
+            day = local.date().replace(day=1)
+        elif cadence == "weekly":
             day = local.date() + timedelta(days=(7 - local.weekday()) % 7)
+        else:
+            day = local.date()
         candidate = datetime.combine(day, target_time, tzinfo=zone)
         if candidate <= local:
-            day += timedelta(days=1 if cadence == "daily" else 7)
+            if cadence == "monthly":
+                year = day.year + (1 if day.month == 12 else 0)
+                month = 1 if day.month == 12 else day.month + 1
+                day = day.replace(year=year, month=month)
+            elif cadence == "weekly":
+                day += timedelta(days=7)
+            elif cadence == "weekdays":
+                day += timedelta(days=1)
+                while day.weekday() >= 5:
+                    day += timedelta(days=1)
+            else:
+                day += timedelta(days=1)
+            candidate = datetime.combine(day, target_time, tzinfo=zone)
+        if cadence == "weekdays" and day.weekday() >= 5:
+            day += timedelta(days=7 - day.weekday())
             candidate = datetime.combine(day, target_time, tzinfo=zone)
         return candidate.astimezone(UTC)
 
-    def create_schedule(self, project_id: str, title: str, prompt: str, cadence: str, timezone: str,
-                        delivery_time: str = "09:00") -> dict[str, Any]:
-        if cadence not in {"hourly", "daily", "weekly", "once"}:
-            raise ValueError("cadence_must_be_once_hourly_daily_or_weekly")
+    @staticmethod
+    def local_timezone_name() -> str:
+        """Return the device's IANA timezone name for local scheduled-task defaults."""
+        configured = os.environ.get("TZ", "").strip().removeprefix(":")
+        if configured and not configured.startswith("/"):
+            try:
+                ZoneInfo(configured)
+                return configured
+            except (ValueError, ZoneInfoNotFoundError):
+                pass
+        try:
+            parts = Path("/etc/localtime").resolve(strict=True).parts
+            if "zoneinfo" in parts:
+                candidate = "/".join(parts[parts.index("zoneinfo") + 1:])
+                ZoneInfo(candidate)
+                return candidate
+        except (OSError, ValueError, ZoneInfoNotFoundError):
+            pass
+        try:
+            configured_file = Path("/etc/timezone").read_text(encoding="utf-8").strip()
+            ZoneInfo(configured_file)
+            return configured_file
+        except (OSError, ValueError, ZoneInfoNotFoundError):
+            pass
+        try:
+            candidate = get_localzone_name()
+            ZoneInfo(candidate)
+            return candidate
+        except (OSError, ValueError, ZoneInfoNotFoundError):
+            raise ValueError("local_timezone_unavailable") from None
+
+    @staticmethod
+    def _validate_schedule(title: str, prompt: str, cadence: str, timezone: str,
+                           delivery_time: str, run_at: str | None,
+                           current: datetime, cron_expression: str = "") -> tuple[ZoneInfo, datetime]:
+        if not isinstance(title, str) or not title.strip() or len(title.strip()) > 200:
+            raise ValueError("schedule_title_invalid")
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt.strip()) > 10_000:
+            raise ValueError("schedule_prompt_invalid")
+        if cadence not in {"hourly", "daily", "weekdays", "weekly", "monthly", "once", "cron"}:
+            raise ValueError("cadence_must_be_hourly_daily_weekdays_weekly_monthly_once_or_cron")
         try:
             zone = ZoneInfo(timezone)
-        except (ZoneInfoNotFoundError, ValueError) as error:
+        except (ZoneInfoNotFoundError, TypeError, ValueError) as error:
             raise ValueError("timezone_must_be_a_valid_IANA_timezone") from error
         try:
             parsed_delivery_time = time.fromisoformat(delivery_time)
@@ -1710,22 +1928,65 @@ class MissionStore:
                 raise ValueError
         except (TypeError, ValueError) as error:
             raise ValueError("delivery_time_must_be_HH_MM") from error
+        if cadence == "cron":
+            _parse_cron_expression(cron_expression)
+            return zone, MissionStore._schedule_due(cadence, zone, delivery_time, current, cron_expression)
+        if cadence != "once":
+            return zone, MissionStore._schedule_due(cadence, zone, delivery_time, current)
+        if not isinstance(run_at, str) or not run_at.strip():
+            raise ValueError("one_time_schedule_requires_run_at")
+        try:
+            local_due = datetime.fromisoformat(run_at)
+            if local_due.tzinfo is not None:
+                raise ValueError
+            due = local_due.replace(tzinfo=zone).astimezone(UTC)
+            if due.astimezone(zone).replace(tzinfo=None) != local_due:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("run_at_must_be_a_valid_local_datetime") from error
+        if due <= current:
+            raise ValueError("run_at_must_be_in_the_future")
+        return zone, due
+
+    def create_schedule(self, project_id: str, title: str, prompt: str, cadence: str, timezone: str,
+                        delivery_time: str = "09:00", run_at: str | None = None,
+                        cron_expression: str = "", target_mission_id: str = "") -> dict[str, Any]:
         current = datetime.now(UTC)
-        due = self._schedule_due(cadence, zone, delivery_time, current)
+        zone, due = self._validate_schedule(
+            title, prompt, cadence, timezone, delivery_time, run_at, current, cron_expression,
+        )
         stamp = now()
-        schedule = {"id": str(uuid.uuid4()), "project_id": project_id, "title": title, "prompt": prompt,
+        schedule = {"id": str(uuid.uuid4()), "project_id": project_id, "title": title.strip(), "prompt": prompt.strip(),
                     "cadence": cadence, "timezone": timezone, "delivery_time": delivery_time,
+                    "cron_expression": cron_expression.strip() if cadence == "cron" else "",
+                    "target_mission_id": target_mission_id or "",
                     "next_run_at": due.isoformat(),
                     "status": "active", "created_at": stamp, "updated_at": stamp}
         with self._lock, self._connect() as db:
             if not db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
                 raise ValueError("project_not_found")
-            db.execute("INSERT INTO schedules (id,project_id,title,prompt,cadence,timezone,delivery_time,next_run_at,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", tuple(schedule.values()))
+            self._validate_schedule_target(db, project_id, schedule["target_mission_id"])
+            db.execute("INSERT INTO schedules (id,project_id,title,prompt,cadence,timezone,delivery_time,cron_expression,target_mission_id,next_run_at,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", tuple(schedule.values()))
         return schedule
+
+    @staticmethod
+    def _validate_schedule_target(db: sqlite3.Connection, project_id: str, target_mission_id: str) -> None:
+        if not target_mission_id:
+            return
+        target = db.execute(
+            "SELECT project_id, archived_at FROM missions WHERE id=?", (target_mission_id,),
+        ).fetchone()
+        if not target or target["project_id"] != project_id:
+            raise ValueError("schedule_target_chat_must_belong_to_project")
+        if target["archived_at"]:
+            raise ValueError("schedule_target_chat_is_archived")
 
     def schedules(self, project_id: str) -> list[dict[str, Any]]:
         with self._connect() as db:
-            schedules = [dict(row) for row in db.execute("SELECT * FROM schedules WHERE project_id=? ORDER BY created_at DESC", (project_id,))]
+            schedules = [dict(row) for row in db.execute(
+                "SELECT s.*,m.title AS target_mission_title,m.status AS target_mission_status,m.archived_at AS target_mission_archived_at "
+                "FROM schedules s LEFT JOIN missions m ON m.id=s.target_mission_id "
+                "WHERE s.project_id=? ORDER BY s.created_at DESC", (project_id,))]
             for schedule in schedules:
                 schedule["runs_total"] = db.execute(
                     "SELECT COUNT(*) FROM scheduled_runs WHERE schedule_id=?", (schedule["id"],)
@@ -1737,6 +1998,74 @@ class MissionStore:
                     (schedule["id"],)
                 )]
             return schedules
+
+    def workspace_schedules(self) -> list[dict[str, Any]]:
+        """Return scheduled chats across projects for the workspace scheduler view."""
+        with self._connect() as db:
+            schedules = [dict(row) for row in db.execute(
+                """SELECT schedules.*, projects.name AS project_name,
+                          missions.title AS target_mission_title,
+                          missions.status AS target_mission_status,
+                          missions.archived_at AS target_mission_archived_at
+                   FROM schedules
+                   JOIN projects ON projects.id=schedules.project_id
+                   LEFT JOIN missions ON missions.id=schedules.target_mission_id
+                   ORDER BY schedules.created_at DESC"""
+            )]
+            for schedule in schedules:
+                schedule["runs_total"] = db.execute(
+                    "SELECT COUNT(*) FROM scheduled_runs WHERE schedule_id=?", (schedule["id"],)
+                ).fetchone()[0]
+                schedule["runs"] = [dict(row) for row in db.execute(
+                    """SELECT scheduled_runs.*, missions.title AS mission_title FROM scheduled_runs
+                       JOIN missions ON missions.id=scheduled_runs.mission_id
+                       WHERE schedule_id=? ORDER BY started_at DESC, scheduled_runs.id DESC LIMIT 10""",
+                    (schedule["id"],),
+                )]
+            return schedules
+
+    def edit_schedule(self, project_id: str, schedule_id: str, title: str, prompt: str, cadence: str,
+                      timezone: str, delivery_time: str = "09:00",
+                      run_at: str | None = None, cron_expression: str = "",
+                      target_mission_id: str | None = None) -> dict[str, Any] | None:
+        current = datetime.now(UTC)
+        _zone, due = self._validate_schedule(
+            title, prompt, cadence, timezone, delivery_time, run_at, current, cron_expression,
+        )
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT status FROM schedules WHERE id=? AND project_id=?",
+                             (schedule_id, project_id)).fetchone()
+            if not row:
+                return None
+            if row["status"] not in {"active", "paused", "failed"}:
+                raise ValueError("schedule_cannot_be_edited_in_its_current_state")
+            stored_target = db.execute("SELECT target_mission_id FROM schedules WHERE id=?", (schedule_id,)).fetchone()[0]
+            effective_target = stored_target if target_mission_id is None else target_mission_id
+            self._validate_schedule_target(db, project_id, effective_target or "")
+            if db.execute(
+                "SELECT 1 FROM scheduled_runs WHERE schedule_id=? AND status IN ('queued','running','paused','blocked')",
+                (schedule_id,),
+            ).fetchone():
+                raise ValueError("schedule_has_a_chat_in_progress")
+            db.execute(
+                """UPDATE schedules SET status=?,title=?,prompt=?,cadence=?,timezone=?,delivery_time=?,cron_expression=?,target_mission_id=?,
+                   next_run_at=?,updated_at=? WHERE id=?""",
+                ("active" if row["status"] == "failed" else row["status"],
+                 title.strip(), prompt.strip(), cadence, timezone, delivery_time,
+                 cron_expression.strip() if cadence == "cron" else "",
+                 effective_target or "",
+                 due.isoformat(), now(), schedule_id),
+            )
+            return dict(db.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone())
+
+    def update_project_schedule(self, project_id: str, schedule_id: str,
+                                action: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            if not db.execute(
+                "SELECT 1 FROM schedules WHERE id=? AND project_id=?", (schedule_id, project_id),
+            ).fetchone():
+                return None
+        return self.update_schedule(schedule_id, action)
 
     def schedule_runs(self, schedule_id: str, limit: int = 10,
                       before_started_at: str | None = None,
@@ -1784,13 +2113,13 @@ class MissionStore:
             allowed = {
                 "pause": {"active"},
                 "resume": {"paused"},
-                "run-now": {"active"},
+                "run-now": {"active", "failed"},
                 "cancel": {"active", "paused"},
             }
             if status not in allowed[action]:
                 raise ValueError(f"schedule_cannot_{action}_from_{status}")
             if action == "run-now" and db.execute(
-                "SELECT 1 FROM scheduled_runs WHERE schedule_id=? AND status IN ('running','paused','blocked')", (schedule_id,)
+                "SELECT 1 FROM scheduled_runs WHERE schedule_id=? AND status IN ('queued','running','paused','blocked')", (schedule_id,)
             ).fetchone():
                 raise ValueError("This schedule already has a mission in progress. Resume or finish it before starting another.")
             status = {"pause": "paused", "resume": "active", "run-now": "active", "cancel": "cancelled"}[action]
@@ -1800,21 +2129,57 @@ class MissionStore:
 
     def claim_due_schedules(self) -> list[dict[str, Any]]:
         claimed = []
+        reserved_missions: set[str] = set()
         current = now()
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            rows = db.execute("SELECT * FROM schedules s WHERE status='active' AND next_run_at<=? AND NOT EXISTS (SELECT 1 FROM scheduled_runs r WHERE r.schedule_id=s.id AND r.status IN ('running','paused','blocked'))", (current,)).fetchall()
+            rows = db.execute("SELECT * FROM schedules s WHERE status='active' AND next_run_at<=? AND NOT EXISTS (SELECT 1 FROM scheduled_runs r WHERE r.schedule_id=s.id AND r.status IN ('queued','running','paused','blocked'))", (current,)).fetchall()
             for schedule in rows:
-                mission_id, run_id = str(uuid.uuid4()), str(uuid.uuid4())
-                title = f"{schedule['title']} · {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M')}"
-                db.execute("INSERT INTO missions(id,project_id,title,goal,status,created_at,background) VALUES (?,?,?,?,?,?,1)", (mission_id, schedule["project_id"], title, schedule["prompt"], "active", current))
-                event = self._append(db, "mission.created", "scheduler", mission_id, {"title": title, "goal": schedule["prompt"], "scheduleId": schedule["id"], "background": True})
-                db.execute("INSERT INTO scheduled_runs VALUES (?,?,?,?,?,?,?,NULL)", (run_id, schedule["id"], mission_id, schedule["next_run_at"], current, None, "running"))
+                mission_id = schedule["target_mission_id"]
+                if mission_id:
+                    target = db.execute(
+                        "SELECT status,archived_at,blocked_reason FROM missions WHERE id=? AND project_id=?",
+                        (mission_id, schedule["project_id"]),
+                    ).fetchone()
+                    if not target or target["archived_at"] or target["status"] in {"paused", "blocked"} or target["blocked_reason"]:
+                        continue
+                    if mission_id in reserved_missions:
+                        continue
+                    if db.execute(
+                        "SELECT 1 FROM scheduled_runs WHERE mission_id=? AND status IN ('queued','running','paused','blocked') LIMIT 1",
+                        (mission_id,),
+                    ).fetchone():
+                        continue
+                    if db.execute(
+                        "SELECT 1 FROM agent_event_runs WHERE mission_id=? AND status IN ('running','retrying','cancelling') LIMIT 1",
+                        (mission_id,),
+                    ).fetchone():
+                        continue
+                    if target["status"] == "completed":
+                        db.execute("UPDATE missions SET status='active' WHERE id=?", (mission_id,))
+                        self._append(db, "mission.resumed", "scheduler", mission_id,
+                                     {"reason": "scheduled task", "scheduleId": schedule["id"]})
+                    event = self._append(db, "message.created", "scheduler", mission_id,
+                                         {"text": schedule["prompt"], "recipient": None,
+                                          "source": "schedule", "scheduleId": schedule["id"]})
+                else:
+                    mission_id = str(uuid.uuid4())
+                    title = f"{schedule['title']} · {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M')}"
+                    db.execute("INSERT INTO missions(id,project_id,title,goal,status,created_at,background) VALUES (?,?,?,?,?,?,1)", (mission_id, schedule["project_id"], title, schedule["prompt"], "active", current))
+                    event = self._append(db, "mission.created", "scheduler", mission_id, {"title": title, "goal": schedule["prompt"], "scheduleId": schedule["id"], "background": True})
+                run_id = str(uuid.uuid4())
+                reserved_missions.add(mission_id)
+                db.execute(
+                    """INSERT INTO scheduled_runs
+                       (id,schedule_id,mission_id,trigger_sequence,invocation_started_at,scheduled_for,started_at,finished_at,status,error)
+                       VALUES (?,?,?,?,NULL,?,?,NULL,'queued',NULL)""",
+                    (run_id, schedule["id"], mission_id, event["sequence"], schedule["next_run_at"], current),
+                )
                 next_status = "active"
                 if next_status == "active":
                     zone = ZoneInfo(schedule["timezone"])
                     due = self._schedule_due(schedule["cadence"], zone, schedule["delivery_time"],
-                                             datetime.fromisoformat(current))
+                                             datetime.fromisoformat(current), schedule["cron_expression"])
                     next_run = due.isoformat()
                 else:
                     next_run = schedule["next_run_at"]
@@ -1825,20 +2190,22 @@ class MissionStore:
 
     def finish_scheduled_run(self, mission_id: str) -> None:
         with self._lock, self._connect() as db:
-            db.execute("UPDATE scheduled_runs SET status='completed',finished_at=? WHERE mission_id=? AND status IN ('running','paused','blocked')", (now(), mission_id))
+            db.execute("UPDATE scheduled_runs SET status='completed',finished_at=? WHERE mission_id=? AND status IN ('queued','running','paused','blocked')", (now(), mission_id))
 
     def reconcile_scheduled_runs(self) -> None:
         """Keep schedule history aligned with the live state of its mission."""
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
-                """SELECT run.mission_id,run.schedule_id,run.status,mission.status AS mission_status,
-                          mission.blocked_reason
+                """SELECT run.id,run.mission_id,run.schedule_id,run.trigger_sequence,
+                          run.status,run.invocation_started_at,
+                          mission.status AS mission_status,mission.blocked_reason
                    FROM scheduled_runs run JOIN missions mission ON mission.id=run.mission_id
-                   WHERE run.status IN ('running','paused','blocked')"""
+                   WHERE run.status IN ('queued','running','paused','blocked')"""
             ).fetchall()
             timestamp = now()
             for run in rows:
+                failure_error = None
                 if run["mission_status"] == "completed":
                     status = "completed"
                 elif run["mission_status"] == "paused":
@@ -1846,13 +2213,35 @@ class MissionStore:
                 elif run["blocked_reason"]:
                     status = "blocked"
                 else:
-                    status = "running"
+                    active_event = None
+                    failed_event = None
+                    if run["invocation_started_at"]:
+                        active_event = db.execute(
+                            """SELECT 1 FROM agent_event_runs
+                               WHERE mission_id=? AND status IN ('running','retrying','cancelling')
+                               LIMIT 1""",
+                            (run["mission_id"],),
+                        ).fetchone()
+                        failed_event = db.execute(
+                            """SELECT status,error FROM agent_event_runs
+                               WHERE mission_id=? AND updated_at>=?
+                                 AND status IN ('failed','interrupted')
+                               ORDER BY updated_at DESC LIMIT 1""",
+                            (run["mission_id"], run["invocation_started_at"]),
+                        ).fetchone()
+                    if failed_event and not active_event:
+                        status = "failed"
+                        failure_error = failed_event["error"]
+                    else:
+                        status = (
+                            "running" if run["invocation_started_at"] else "queued"
+                        )
                 if status == run["status"]:
                     continue
-                finished_at = timestamp if status == "completed" else None
+                finished_at = timestamp if status in {"completed", "failed"} else None
                 db.execute(
-                    "UPDATE scheduled_runs SET status=?,finished_at=? WHERE mission_id=?",
-                    (status, finished_at, run["mission_id"]),
+                    "UPDATE scheduled_runs SET status=?,finished_at=?,error=? WHERE id=?",
+                    (status, finished_at, failure_error, run["id"]),
                 )
                 if status == "completed":
                     db.execute(
@@ -1860,11 +2249,26 @@ class MissionStore:
                            WHERE id=? AND cadence='once' AND status IN ('active','paused')""",
                         (timestamp, run["schedule_id"]),
                     )
+                elif status == "failed":
+                    db.execute(
+                        """UPDATE schedules SET status='failed',updated_at=?
+                           WHERE id=? AND cadence='once' AND status='active'""",
+                        (timestamp, run["schedule_id"]),
+                    )
             db.commit()
 
     def running_scheduled_missions(self) -> list[str]:
         with self._connect() as db:
             return [row[0] for row in db.execute("SELECT mission_id FROM scheduled_runs WHERE status='running'")]
+
+    def queued_scheduled_missions(self) -> list[str]:
+        """Return active chats with durable scheduled prompts awaiting agent startup."""
+        with self._connect() as db:
+            return [row[0] for row in db.execute(
+                """SELECT DISTINCT run.mission_id FROM scheduled_runs run
+                   JOIN missions mission ON mission.id=run.mission_id
+                   WHERE run.status='queued' AND mission.status='active' AND mission.archived_at IS NULL"""
+            )]
 
     def record_review_checkpoint(self, mission_id: str, reviewer_id: str, disposition: str,
                                  summary: str, verification_event_id: str | None = None,
@@ -2128,6 +2532,127 @@ class MissionStore:
                 mission["workflow_context"] = self._workflow_context(db, mission_id)
             return mission
 
+    def create_general_chat(self) -> dict[str, Any]:
+        timestamp = now()
+        chat = {"id": str(uuid.uuid4()), "title": "New chat", "created_at": timestamp,
+                "updated_at": timestamp, "model_preference": None}
+        with self._lock, self._connect() as db:
+            db.execute(
+                "INSERT INTO general_chats(id,title,created_at,updated_at,model_preference) VALUES (?,?,?,?,?)",
+                tuple(chat.values()),
+            )
+        return chat | {"messages": []}
+
+    def general_chats(self) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT id,title,created_at,updated_at,model_preference FROM general_chats "
+                "ORDER BY updated_at DESC,id DESC"
+            )]
+
+    def general_chat(self, chat_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT id,title,created_at,updated_at,model_preference FROM general_chats WHERE id=?",
+                (chat_id,),
+            ).fetchone()
+            if not row:
+                return None
+            chat = dict(row)
+            chat["messages"] = []
+            for message_row in db.execute(
+                "SELECT id,role,body,model,duration_ms,sources,input_tokens,output_tokens,created_at "
+                "FROM general_chat_messages WHERE chat_id=? ORDER BY created_at,id", (chat_id,),
+            ):
+                message = dict(message_row)
+                try:
+                    message["sources"] = json.loads(message["sources"] or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    message["sources"] = []
+                chat["messages"].append(message)
+            return chat
+
+    def set_general_chat_model_preference(
+        self, chat_id: str, model_preference: str | None,
+    ) -> dict[str, Any] | None:
+        if model_preference is not None:
+            self._validate_mission_model_preferences(model_preference, None)
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                "UPDATE general_chats SET model_preference=?,updated_at=? WHERE id=?",
+                (model_preference, now(), chat_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.general_chat(chat_id)
+
+    def append_general_chat_message(
+        self, chat_id: str, role: str, body: str, model: str | None = None,
+        duration_ms: int | None = None, input_tokens: int | None = None,
+        output_tokens: int | None = None, sources: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        if role not in {"user", "assistant"}:
+            raise ValueError("general_chat_role_invalid")
+        if not isinstance(body, str) or not body.strip() or len(body) > 100_000:
+            raise ValueError("general_chat_message_invalid")
+        if duration_ms is not None and (not isinstance(duration_ms, int) or duration_ms < 0):
+            raise ValueError("general_chat_duration_invalid")
+        for value in (input_tokens, output_tokens):
+            if value is not None and (not isinstance(value, int) or value < 0):
+                raise ValueError("general_chat_usage_invalid")
+        normalized_sources = []
+        for source in sources or []:
+            if not isinstance(source, dict):
+                continue
+            title, url, domain = source.get("title"), source.get("url"), source.get("domain")
+            parsed_url = urlsplit(url) if isinstance(url, str) else None
+            if (not isinstance(title, str) or not title.strip() or len(title) > 160
+                    or parsed_url is None or parsed_url.scheme not in {"http", "https"}
+                    or not parsed_url.netloc):
+                continue
+            normalized_sources.append({
+                "title": title.strip(), "url": url[:2048],
+                "domain": domain[:120] if isinstance(domain, str) else parsed_url.hostname or "",
+            })
+            if len(normalized_sources) == 12:
+                break
+        message = {
+            "id": str(uuid.uuid4()), "chat_id": chat_id, "role": role, "body": body,
+            "model": model, "duration_ms": duration_ms, "input_tokens": input_tokens,
+            "output_tokens": output_tokens, "sources": normalized_sources, "created_at": now(),
+        }
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            chat = db.execute("SELECT title FROM general_chats WHERE id=?", (chat_id,)).fetchone()
+            if not chat:
+                db.rollback()
+                raise ValueError("general_chat_not_found")
+            db.execute(
+                "INSERT INTO general_chat_messages "
+                "(id,chat_id,role,body,model,duration_ms,sources,input_tokens,output_tokens,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (message["id"], message["chat_id"], message["role"], message["body"],
+                 message["model"], message["duration_ms"], json.dumps(normalized_sources),
+                 message["input_tokens"], message["output_tokens"], message["created_at"]),
+            )
+            if role == "user" and chat["title"] == "New chat":
+                title = " ".join(body.split())[:80]
+                if len(" ".join(body.split())) > 80:
+                    title = title.rstrip() + "…"
+                db.execute(
+                    "UPDATE general_chats SET title=?,updated_at=? WHERE id=?",
+                    (title or "New chat", message["created_at"], chat_id),
+                )
+            else:
+                db.execute("UPDATE general_chats SET updated_at=? WHERE id=?", (message["created_at"], chat_id))
+            db.commit()
+        return message
+
+    def delete_general_chat(self, chat_id: str) -> bool:
+        with self._lock, self._connect() as db:
+            cursor = db.execute("DELETE FROM general_chats WHERE id=?", (chat_id,))
+            return cursor.rowcount > 0
+
     def select_mission_workflow(self, mission_id: str, actor_id: str,
                                 workflow: dict[str, Any]) -> dict[str, Any]:
         """Attach one workflow to an Auto chat without overriding an existing choice."""
@@ -2320,6 +2845,10 @@ class MissionStore:
             project = dict(row)
             project["referenceFiles"] = self._project_reference_files(db, project_id)
             return project
+
+    def project_ids(self) -> list[str]:
+        with self._connect() as db:
+            return [row[0] for row in db.execute("SELECT id FROM projects ORDER BY created_at,id")]
 
     def mission_ids_for_project(self, project_id: str) -> list[str]:
         with self._connect() as db:
@@ -2553,7 +3082,7 @@ class MissionStore:
                 blockers.append("running_agents")
             if db.execute("SELECT 1 FROM background_runs WHERE status='running' LIMIT 1").fetchone():
                 blockers.append("running_commands")
-            if db.execute("SELECT 1 FROM scheduled_runs WHERE status='running' LIMIT 1").fetchone():
+            if db.execute("SELECT 1 FROM scheduled_runs WHERE status IN ('queued','running') LIMIT 1").fetchone():
                 blockers.append("running_schedules")
             return blockers
 
@@ -2784,53 +3313,80 @@ class MissionStore:
         self.set_setting("model_catalog", json.dumps(models, ensure_ascii=False))
         return models
 
-    @staticmethod
-    def _knowledge_entry(db: sqlite3.Connection, entry_id: str) -> dict[str, Any]:
-        row = db.execute(
-            """SELECT k.*,m.title AS source_mission_title FROM project_knowledge k
-               LEFT JOIN missions m ON m.id=k.source_mission_id WHERE k.id=?""", (entry_id,),
-        ).fetchone()
-        return dict(row)
+    def project_memory_migration_review(self, project_id: str, entry_id: str,
+                                        legacy_hash: str, smriti_hash: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT * FROM project_memory_migration_reviews
+                   WHERE project_id=? AND entry_id=? AND legacy_hash=? AND smriti_hash=?""",
+                (project_id, entry_id, legacy_hash, smriti_hash),
+            ).fetchone()
+            return dict(row) if row else None
 
-    def save_knowledge(self, project_id: str, mission_id: str | None, actor_id: str,
-                       title: str, content: str) -> dict[str, Any]:
-        title, content = title.strip(), content.strip()
-        if not title or len(title) > 200 or not content or len(content) > 20_000:
-            raise ValueError("knowledge_title_and_content_required")
+    def record_project_memory_migration_review(self, project_id: str, entry_id: str,
+                                               legacy_hash: str, smriti_hash: str,
+                                               resolution: str, reviewed_by: str = "user") -> dict[str, Any]:
+        if resolution not in {"keep_smriti", "use_legacy", "copy_legacy_to_project"}:
+            raise ValueError("memory_migration_resolution_invalid")
+        timestamp = now()
+        with self._lock, self._connect() as db:
+            db.execute(
+                """INSERT OR IGNORE INTO project_memory_migration_reviews(
+                       project_id,entry_id,legacy_hash,smriti_hash,resolution,reviewed_by,reviewed_at
+                   ) VALUES (?,?,?,?,?,?,?)""",
+                (project_id, entry_id, legacy_hash, smriti_hash, resolution, reviewed_by, timestamp),
+            )
+            row = db.execute(
+                """SELECT * FROM project_memory_migration_reviews
+                   WHERE project_id=? AND entry_id=? AND legacy_hash=? AND smriti_hash=?""",
+                (project_id, entry_id, legacy_hash, smriti_hash),
+            ).fetchone()
+            return dict(row)
+
+    def project_memory_migration_ledger(self, project_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            if project_id:
+                rows = db.execute(
+                    "SELECT * FROM project_memory_migration_ledger WHERE project_id=?",
+                    (project_id,),
+                )
+            else:
+                rows = db.execute("SELECT * FROM project_memory_migration_ledger")
+            return [dict(row) for row in rows]
+
+    def project_memory_migration_reviews(self, project_id: str) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM project_memory_migration_reviews WHERE project_id=? ORDER BY reviewed_at",
+                (project_id,),
+            )]
+
+    def record_project_memory_migrations(self, records: list[dict[str, Any]]) -> int:
+        """Record verified source fingerprints and retire legacy content atomically."""
+        if not records:
+            return 0
         timestamp = now()
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            mission = db.execute("SELECT project_id,title FROM missions WHERE id=?", (mission_id,)).fetchone() if mission_id else None
-            if mission_id and (not mission or mission["project_id"] != project_id):
-                db.rollback()
-                raise ValueError("mission_does_not_belong_to_project")
-            existing = db.execute(
-                "SELECT id,created_at FROM project_knowledge WHERE project_id=? AND title=?",
-                (project_id, title),
-            ).fetchone()
-            entry_id = existing["id"] if existing else str(uuid.uuid4())
-            created_at = existing["created_at"] if existing and existing["created_at"] else timestamp
-            db.execute(
-                """INSERT INTO project_knowledge(
-                       id,project_id,title,content,created_by,updated_at,source_mission_id,
-                       source_event_sequence,created_at,updated_by,status
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?, 'active')
-                   ON CONFLICT(project_id,title) DO UPDATE SET content=excluded.content,
-                       updated_at=excluded.updated_at,source_mission_id=excluded.source_mission_id,
-                       source_event_sequence=excluded.source_event_sequence,
-                       updated_by=excluded.updated_by,status='active'""",
-                (entry_id, project_id, title, content, actor_id, timestamp, mission_id,
-                 None, created_at, actor_id),
-            )
-            event = self._append(db, "knowledge.entry.saved", actor_id, mission_id, {
-                "entry": self._knowledge_entry(db, entry_id),
-            }) if mission_id else None
-            if event:
-                db.execute("UPDATE project_knowledge SET source_event_sequence=? WHERE id=?",
-                           (event["sequence"], entry_id))
-            entry = self._knowledge_entry(db, entry_id)
+            inserted = 0
+            for record in records:
+                cursor = db.execute(
+                    """INSERT OR IGNORE INTO project_memory_migration_ledger(
+                           project_id,source_kind,source_id,memory_id,source_hash,
+                           smriti_hash,title,migrated_at
+                       ) VALUES (?,?,?,?,?,?,?,?)""",
+                    (record["project_id"], record["source_kind"], record["source_id"],
+                     record["memory_id"], record["source_hash"], record["smriti_hash"],
+                     record["title"], timestamp),
+                )
+                inserted += cursor.rowcount
+                if record["source_kind"] == "legacy":
+                    db.execute(
+                        "DELETE FROM project_knowledge WHERE project_id=? AND id=?",
+                        (record["project_id"], record["source_id"]),
+                    )
             db.commit()
-            return entry
+            return inserted
 
     def project_knowledge(self, project_id: str, include_archived: bool = False) -> list[dict[str, Any]]:
         status_filter = "" if include_archived else " AND k.status='active'"
@@ -2850,6 +3406,15 @@ class MissionStore:
                     JOIN missions m ON m.id=p.mission_id WHERE p.project_id=?{status_filter}
                     ORDER BY p.created_at DESC""", (project_id,),
             )]
+
+    def knowledge_proposal(self, proposal_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT p.*,m.title AS source_mission_title FROM knowledge_proposals p
+                   JOIN missions m ON m.id=p.mission_id WHERE p.id=?""",
+                (proposal_id,),
+            ).fetchone()
+            return dict(row) if row else None
 
     def propose_knowledge(self, project_id: str, mission_id: str, agent_id: str,
                           title: str, content: str) -> dict[str, Any]:
@@ -2895,7 +3460,7 @@ class MissionStore:
             return proposal
 
     def review_knowledge_proposal(self, proposal_id: str, actor_id: str,
-                                  decision: str) -> dict[str, Any]:
+                                  decision: str, memory_id: str | None = None) -> dict[str, Any]:
         if decision not in {"accept", "dismiss"}:
             raise ValueError("knowledge_decision_must_be_accept_or_dismiss")
         with self._lock, self._connect() as db:
@@ -2906,13 +3471,7 @@ class MissionStore:
                 raise ValueError("knowledge_proposal_missing_or_already_reviewed")
             timestamp = now()
             status = "accepted" if decision == "accept" else "dismissed"
-            existing = None
-            if decision == "accept":
-                existing = db.execute(
-                    "SELECT id,created_at FROM project_knowledge WHERE project_id=? AND title=?",
-                    (row["project_id"], row["title"]),
-                ).fetchone()
-            memory_id = (existing["id"] if existing else row["id"]) if decision == "accept" else None
+            memory_id = (memory_id or row["id"]) if decision == "accept" else None
             db.execute(
                 "UPDATE knowledge_proposals SET status=?,reviewed_by=?,reviewed_at=?,memory_id=? WHERE id=?",
                 (status, actor_id, timestamp, memory_id, proposal_id),
@@ -2920,12 +3479,11 @@ class MissionStore:
             entry = None
             if decision == "accept":
                 entry_id = memory_id
-                created_at = existing["created_at"] if existing and existing["created_at"] else timestamp
                 entry = {
                     "id": entry_id, "project_id": row["project_id"],
                     "title": row["title"], "content": row["content"],
                     "created_by": row["proposed_by"], "updated_by": actor_id,
-                    "created_at": created_at, "updated_at": timestamp,
+                    "created_at": timestamp, "updated_at": timestamp,
                     "source_mission_id": row["mission_id"],
                     "source_event_sequence": row["source_event_sequence"],
                     "status": "active",
@@ -2939,36 +3497,6 @@ class MissionStore:
             })
             db.commit()
             return {"proposal": proposal, "entry": entry}
-
-    def archive_knowledge(self, knowledge_id: str, mission_id: str, actor_id: str = "user") -> dict[str, Any]:
-        with self._lock, self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            entry = db.execute("SELECT * FROM project_knowledge WHERE id=?", (knowledge_id,)).fetchone()
-            mission = db.execute("SELECT project_id FROM missions WHERE id=?", (mission_id,)).fetchone()
-            if not entry or not mission or mission["project_id"] != entry["project_id"]:
-                db.rollback()
-                raise ValueError("knowledge_entry_or_mission_not_found")
-            db.execute("UPDATE project_knowledge SET status='archived',updated_by=?,updated_at=? WHERE id=?",
-                       (actor_id, now(), knowledge_id))
-            updated = self._knowledge_entry(db, knowledge_id)
-            self._append(db, "knowledge.entry.archived", actor_id, mission_id, {"entry": updated})
-            db.commit()
-            return updated
-
-    def restore_knowledge(self, knowledge_id: str, mission_id: str, actor_id: str = "user") -> dict[str, Any]:
-        with self._lock, self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            entry = db.execute("SELECT * FROM project_knowledge WHERE id=?", (knowledge_id,)).fetchone()
-            mission = db.execute("SELECT project_id FROM missions WHERE id=?", (mission_id,)).fetchone()
-            if not entry or not mission or mission["project_id"] != entry["project_id"]:
-                db.rollback()
-                raise ValueError("knowledge_entry_or_mission_not_found")
-            db.execute("UPDATE project_knowledge SET status='active',updated_by=?,updated_at=? WHERE id=?",
-                       (actor_id, now(), knowledge_id))
-            updated = self._knowledge_entry(db, knowledge_id)
-            self._append(db, "knowledge.entry.restored", actor_id, mission_id, {"entry": updated})
-            db.commit()
-            return updated
 
     def latest_sequence(self, mission_id: str) -> int:
         with self._connect() as db:
@@ -3529,6 +4057,12 @@ class MissionStore:
                         "SELECT * FROM agent_event_runs WHERE agent_id=? AND mission_id=? AND trigger_sequence=?",
                         (agent_id, mission_id, trigger_sequence),
                     ).fetchone())
+                    db.execute(
+                        """UPDATE scheduled_runs SET status='running',
+                           invocation_started_at=COALESCE(invocation_started_at,?),started_at=?
+                           WHERE mission_id=? AND trigger_sequence=? AND status IN ('queued','paused')""",
+                        (timestamp, timestamp, mission_id, trigger_sequence),
+                    )
                     db.commit()
                     result["claimed"] = True
                     result["resume_checkpoint"] = not replay_from_trigger
@@ -3548,6 +4082,12 @@ class MissionStore:
                 "SELECT * FROM agent_event_runs WHERE agent_id = ? AND mission_id = ? AND trigger_sequence = ?",
                 (agent_id, mission_id, trigger_sequence),
             ).fetchone())
+            db.execute(
+                """UPDATE scheduled_runs SET status='running',
+                   invocation_started_at=COALESCE(invocation_started_at,?),started_at=?
+                   WHERE mission_id=? AND trigger_sequence=? AND status IN ('queued','paused')""",
+                (timestamp, timestamp, mission_id, trigger_sequence),
+            )
             db.commit()
             updated["claimed"] = True
             return updated

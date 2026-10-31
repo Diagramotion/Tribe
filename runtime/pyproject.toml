@@ -19,6 +19,7 @@ dependencies = [
     "opencv-python-headless>=4.10,<5",
     "pyyaml>=6,<7",
     "smriti-mcp>=0.1.5,<0.2",
+    "tzlocal>=5.3.1,<5.4",
     "tzdata>=2024.1; platform_system == 'Windows'",
 ]
 
@@ -29,6 +30,7 @@ ai = [
     "playwright>=1.52,<2",
 ]
 desktop = ["pyinstaller>=6.10,<7"]
+test = ["pytest>=8,<10"]
 
 [project.scripts]
 tribe-runtime = "tribe_runtime.server:main"

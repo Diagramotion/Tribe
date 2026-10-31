@@ -14,6 +14,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import uuid
 import zipfile
 from contextlib import closing, contextmanager, nullcontext
 from datetime import UTC, datetime
@@ -36,17 +37,17 @@ from tribe_runtime.agent_runtime import (
     _agent_can_read_context_event,
     _agent_conversation_id,
     _agent_failure_kind,
+    _browser_api_request_timeout,
     _build_agent,
     _continuable_prior_runs,
     _count_compaction_receipts,
     _durable_tool_output,
     _has_unresolved_harness_tool_effects,
-    _reject_text_encoded_tool_call,
     _next_agent_reply_metadata,
     _project_team_context,
     _provider_retry_delay,
+    _reject_text_encoded_tool_call,
     _scheduled_provider_retry_delay,
-    _browser_api_request_timeout,
     _tools_for_agent,
     _user_facing_agent_text,
 )
@@ -58,12 +59,18 @@ from tribe_runtime.agents import (
     load_agent_definitions,
     write_agent_definition,
 )
+from tribe_runtime.general_chats import GeneralChatService
 from tribe_runtime.harness_capabilities import _compaction_keep_tokens, build_capabilities
 from tribe_runtime.mcp_registry import MCPRegistry
 from tribe_runtime.recipes import get_recipe, list_recipes, save_recipe
 from tribe_runtime.skills import SkillCatalog
 from tribe_runtime.store import SCHEMA_VERSION, MissionStore
-from tribe_runtime.workspace import WorkspaceTools, browse_repository
+from tribe_runtime.workspace import (
+    WorkspaceTools,
+    browse_repository,
+    project_git_diff,
+    project_git_status,
+)
 from tribe_runtime.workspace_restore import WorkspaceRestore
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -153,6 +160,281 @@ class RuntimeCase(unittest.TestCase):
             ["git", *args], cwd=self.repository, check=True, capture_output=True, text=True
         )
         return result.stdout.strip()
+
+    def insert_legacy_memory(self, title: str, content: str, actor_id: str = "user") -> dict[str, Any]:
+        entry_id = str(uuid.uuid4())
+        timestamp = datetime.now(UTC).isoformat()
+        event = self.store.append("knowledge.entry.saved", actor_id, self.mission["id"], {
+            "entry": {"id": entry_id, "project_id": self.project["id"], "title": title,
+                      "content": content, "created_by": actor_id, "updated_by": actor_id},
+        })
+        with self.store._connect() as db:
+            db.execute(
+                """INSERT INTO project_knowledge(
+                       id,project_id,title,content,created_by,updated_at,source_mission_id,
+                       source_event_sequence,created_at,updated_by,status
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?, 'active')""",
+                (entry_id, self.project["id"], title, content, actor_id, timestamp,
+                 self.mission["id"], event["sequence"], timestamp, actor_id),
+            )
+        return {"id": entry_id, "project_id": self.project["id"], "title": title,
+                "content": content, "created_by": actor_id, "updated_by": actor_id,
+                "source_mission_id": self.mission["id"],
+                "source_event_sequence": event["sequence"], "created_at": timestamp,
+                "updated_at": timestamp, "status": "active"}
+
+    def test_non_git_folder_can_be_registered_as_project(self) -> None:
+        workspace = self.root / "greenfield-register"
+        workspace.mkdir()
+
+        project = self.store.register_project(str(workspace), "Greenfield")
+
+        self.assertEqual(Path(project["repository"]), workspace.resolve())
+        self.assertEqual(self.store.project(project["id"])["repository"], str(workspace.resolve()))
+
+    def test_git_project_paths_still_normalize_to_repository_root(self) -> None:
+        repository_root = self.root / "independent-git-project"
+        repository_root.mkdir()
+        subprocess.run(["git", "init", "-q", str(repository_root)], check=True)
+        nested = repository_root / "nested-project-folder"
+        nested.mkdir()
+
+        project = self.store.register_project(str(nested), "Git project")
+
+        self.assertEqual(Path(project["repository"]), repository_root.resolve())
+
+    def test_non_git_empty_folder_can_start_project_chat(self) -> None:
+        workspace = self.root / "greenfield-chat"
+        workspace.mkdir()
+
+        project, mission = self.store.create_project(
+            str(workspace), "Greenfield", "Start here", "Build a small app"
+        )
+
+        self.assertEqual(Path(project["repository"]), workspace.resolve())
+        self.assertEqual(self.store.project(mission["project_id"])["id"], project["id"])
+        self.assertEqual(project_git_status(workspace)["isGit"], False)
+
+    def test_non_git_greenfield_workspace_supports_agent_files_and_harness_tools(self) -> None:
+        workspace_root = self.root / "greenfield-agent-work"
+        workspace_root.mkdir()
+        project, mission = self.store.create_project(
+            str(workspace_root), "Greenfield", "Start here", "Create the initial app"
+        )
+        item = self.store.create_work_item(mission["id"], "Create the app scaffold")
+        claim = self.store.claim_work(mission["id"], "builder", work_item_id=item["id"])
+        self.assertEqual(claim["id"], item["id"])
+
+        tools = WorkspaceTools(self.store, mission["id"], "builder", item["id"])
+        capabilities = build_capabilities(
+            tools, SkillCatalog(workspace_root),
+            tool_permissions=("read_file", "write_file", "list_directory", "run_command"),
+        )
+        capability_names = {type(capability).__name__ for capability in capabilities}
+        self.assertTrue(tools.root.samefile(workspace_root))
+        self.assertTrue({"LocalWorkspace", "FileSystem", "Shell"}.issubset(capability_names))
+
+        tools.write_file("src/main.py", "print('greenfield')")
+        self.assertEqual((workspace_root / "src/main.py").read_text(), "print('greenfield')")
+        self.assertEqual(browse_repository(workspace_root, "src/main.py")["content"],
+                         "print('greenfield')")
+        self.assertFalse(project_git_status(workspace_root)["isGit"])
+        with self.assertRaisesRegex(ValueError, "project_is_not_git_enabled"):
+            project_git_diff(workspace_root, "src/main.py")
+        with self.assertRaisesRegex(RuntimeError, "requires a Git-enabled project"):
+            tools.start_isolated_work()
+        self.assertEqual(self.store.project(project["id"])["repository"], str(workspace_root.resolve()))
+
+    def test_non_git_empty_project_api_registers_and_browses_the_folder(self) -> None:
+        from tribe_runtime import server as runtime_server
+
+        workspace = self.root / "empty-folder-api"
+        workspace.mkdir()
+        with (
+            patch.object(runtime_server, "STORE", self.store),
+            patch.object(runtime_server, "SUPERVISOR") as supervisor,
+        ):
+            http = runtime_server.LocalHTTPServer(("127.0.0.1", 0), runtime_server.Handler)
+            thread = threading.Thread(target=http.serve_forever, daemon=True)
+            thread.start()
+            try:
+                create_request = urllib.request.Request(
+                    f"http://127.0.0.1:{http.server_port}/api/projects",
+                    data=json.dumps({"repository": str(workspace), "name": "Empty project"}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with urllib.request.urlopen(create_request, timeout=3) as response:
+                    created = json.loads(response.read())
+                    self.assertEqual(response.status, 201)
+
+                project_id = created["project"]["id"]
+                self.assertIsNone(created["mission"])
+                self.assertEqual(Path(created["project"]["repository"]), workspace.resolve())
+                supervisor.start_mission.assert_not_called()
+
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{http.server_port}/api/projects/{project_id}/files", timeout=3,
+                ) as response:
+                    files = json.loads(response.read())
+                self.assertEqual(files["entry"], {
+                    "kind": "directory", "path": "", "entries": [], "truncated": False,
+                })
+
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{http.server_port}/api/projects/{project_id}/git", timeout=3,
+                ) as response:
+                    git = json.loads(response.read())
+                self.assertEqual(git, {"isGit": False, "branch": None, "files": []})
+            finally:
+                http.shutdown()
+                http.server_close()
+                thread.join(timeout=3)
+
+    def test_general_chat_is_durable_and_has_no_project_link(self) -> None:
+        chat = self.store.create_general_chat()
+        self.store.append_general_chat_message(chat["id"], "user", "What is a queue?")
+        self.store.append_general_chat_message(
+            chat["id"], "assistant", "A queue is first in, first out.",
+            "openai:test", duration_ms=321, input_tokens=12, output_tokens=8,
+            sources=[{"title": "Queue (abstract data type)", "url": "https://example.com/queue", "domain": "example.com"}],
+        )
+
+        saved = self.store.general_chat(chat["id"])
+
+        self.assertEqual(saved["title"], "What is a queue?")
+        self.assertEqual([message["role"] for message in saved["messages"]], ["user", "assistant"])
+        self.assertEqual(saved["messages"][1]["input_tokens"], 12)
+        self.assertEqual(saved["messages"][1]["sources"][0]["domain"], "example.com")
+        self.assertNotIn("project_id", saved)
+        self.assertTrue(self.store.delete_general_chat(chat["id"]))
+        self.assertIsNone(self.store.general_chat(chat["id"]))
+
+    def test_general_chat_model_preference_is_validated_and_used_for_replies(self) -> None:
+        self.store.set_setting("model", "openai:workspace-default")
+        chat = self.store.create_general_chat()
+        catalog = [
+            {"id": "openai:workspace-default", "allowed": True, "toolCalling": True},
+            {"id": "openai:chat-choice", "allowed": True, "toolCalling": True},
+        ]
+        with patch.object(self.store, "model_catalog", return_value=catalog):
+            saved = self.store.set_general_chat_model_preference(chat["id"], "openai:chat-choice")
+            self.assertEqual(saved["model_preference"], "openai:chat-choice")
+            with self.assertRaisesRegex(ValueError, "model_not_allowed"):
+                self.store.set_general_chat_model_preference(chat["id"], "openai:disabled")
+
+        service = GeneralChatService(self.store)
+        result = SimpleNamespace(output="Answer", usage=SimpleNamespace(input_tokens=1, output_tokens=1))
+        with patch.object(service, "_run", return_value=(result, 12)) as run:
+            reply = service.send(chat["id"], "Question")
+
+        run.assert_called_once_with("openai:chat-choice", "Question", [])
+        self.assertEqual(reply["chat"]["messages"][-1]["model"], "openai:chat-choice")
+
+    def test_general_chat_model_preference_route_persists_and_rejects_unavailable_models(self) -> None:
+        from tribe_runtime import server as runtime_server
+
+        chat = self.store.create_general_chat()
+        with patch.object(self.store, "model_catalog", return_value=[{
+            "id": "openai:chat-choice", "allowed": True, "toolCalling": True,
+        }]), patch.object(runtime_server, "STORE", self.store):
+            http = runtime_server.LocalHTTPServer(("127.0.0.1", 0), runtime_server.Handler)
+            thread = threading.Thread(target=http.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{http.server_port}/api/general-chats/{chat['id']}/preferences"
+                request = urllib.request.Request(
+                    url, data=json.dumps({"modelPreference": "openai:chat-choice"}).encode(),
+                    headers={"Content-Type": "application/json"}, method="PUT",
+                )
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    payload = json.loads(response.read())
+                self.assertEqual(payload["chat"]["model_preference"], "openai:chat-choice")
+
+                invalid = urllib.request.Request(
+                    url, data=json.dumps({"modelPreference": "openai:not-allowed"}).encode(),
+                    headers={"Content-Type": "application/json"}, method="PUT",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(invalid, timeout=3)
+                with failure.exception as response:
+                    self.assertEqual(response.code, 422)
+                    self.assertEqual(json.loads(response.read())["error"], "model_not_allowed")
+                self.assertEqual(
+                    self.store.general_chat(chat["id"])["model_preference"], "openai:chat-choice",
+                )
+            finally:
+                http.shutdown()
+                http.server_close()
+                thread.join(timeout=3)
+
+    def test_general_chat_agent_exposes_only_workspace_safe_web_search(self) -> None:
+        from pydantic_ai.models.test import TestModel
+
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()), \
+             patch("tribe_runtime.agent_runtime._resolved_provider_base_url", return_value=""), \
+             patch("tribe_runtime.general_chats.get_api_key", return_value=None):
+            agent = GeneralChatService(self.store)._build_agent("openai:test")
+
+        self.assertLessEqual(set(agent._function_toolset.tools), {"duckduckgo_search"})
+
+    def test_general_chat_web_search_preference_off_removes_search(self) -> None:
+        from pydantic_ai.models.test import TestModel
+
+        self.store.set_setting("web_search_preference", "off")
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()), \
+             patch("tribe_runtime.agent_runtime._resolved_provider_base_url", return_value=""), \
+             patch("tribe_runtime.general_chats.get_api_key", return_value=None):
+            agent = GeneralChatService(self.store)._build_agent("openai:test")
+
+        self.assertEqual(set(agent._function_toolset.tools), set())
+
+    def test_general_chat_preserves_web_citations_as_safe_links(self) -> None:
+        from types import SimpleNamespace
+
+        result = SimpleNamespace(
+            output="The answer.",
+            response=SimpleNamespace(parts=[SimpleNamespace(citations=[
+                SimpleNamespace(sources=[
+                    SimpleNamespace(url="https://example.com/source", title="Example source"),
+                    SimpleNamespace(url="file:///private/data", title="Local file"),
+                ]),
+            ])]),
+        )
+
+        sources = GeneralChatService._sources_from_result(result)
+
+        self.assertEqual(sources, [{
+            "title": "Example source", "url": "https://example.com/source", "domain": "example.com",
+        }])
+
+    def test_workspace_skill_catalog_excludes_project_skill_roots(self) -> None:
+        project_skill = self.repository / ".agents" / "skills" / "project-only"
+        project_skill.mkdir(parents=True)
+        (project_skill / "SKILL.md").write_text(
+            "---\nname: Project only\ndescription: Project-specific instructions.\n---\nDo this.\n",
+            encoding="utf-8",
+        )
+
+        scoped = SkillCatalog(self.repository, include_project_skills=False)
+        project_scoped = SkillCatalog(self.repository)
+
+        self.assertFalse(any(item["name"] == "Project only" for item in scoped.list()))
+        self.assertTrue(any(item["name"] == "Project only" for item in project_scoped.list()))
+
+    def test_general_chat_service_persists_provider_reply(self) -> None:
+        from pydantic_ai.models.test import TestModel
+
+        chat = self.store.create_general_chat()
+        self.store.set_setting("model", "openai:test")
+        self.store.set_setting("web_search_preference", "off")
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()), \
+             patch("tribe_runtime.agent_runtime._resolved_provider_base_url", return_value=""), \
+             patch("tribe_runtime.general_chats.get_api_key", return_value=None):
+            result = GeneralChatService(self.store).send(chat["id"], "Explain queues in one sentence")
+
+        self.assertIsNone(result["responseError"])
+        self.assertEqual([item["role"] for item in result["chat"]["messages"]], ["user", "assistant"])
+        self.assertGreaterEqual(result["chat"]["messages"][1]["duration_ms"], 0)
 
     @staticmethod
     def reveal_deferred_test_tools(agent: Any, capabilities: list[Any] | None = None) -> None:
@@ -595,6 +877,62 @@ for line in sys.stdin:
             }
         ))
 
+    def test_scheduler_tools_are_exposed_only_by_profile_permission(self) -> None:
+        permitted = AgentDefinition(
+            "planner", "Planner", "Planning", "", "planner.md",
+            capabilities=("scheduling",),
+        )
+        agent = _build_agent(permitted, "openai:test-model")
+        allowed = {tool.name for tool in _tools_for_agent(
+            agent, "read_only", permitted.tool_permissions,
+        )}
+        denied = {tool.name for tool in _tools_for_agent(agent, "read_only", ())}
+        expected = {
+            "list_project_schedules", "create_project_schedule",
+            "edit_project_schedule", "manage_project_schedule",
+        }
+
+        self.assertTrue(expected <= allowed)
+        self.assertTrue(expected.isdisjoint(denied))
+        self.assertTrue(all(agent._function_toolset.tools[name].defer_loading for name in expected))
+
+    def test_agent_schedules_default_to_device_timezone_and_keep_timezone_on_edit(self) -> None:
+        definition = AgentDefinition(
+            "planner", "Planner", "Planning", "", "planner.md", capabilities=("scheduling",),
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+        )
+        tools = _build_agent(definition, "openai:test-model")._function_toolset.tools
+        create_tool = tools["create_project_schedule"]
+        edit_tool = tools["edit_project_schedule"]
+        self.assertNotIn("timezone", create_tool.function_schema.json_schema.get("required", []))
+
+        with patch.object(self.store, "local_timezone_name", return_value="Pacific/Auckland"):
+            created = create_tool.function(
+                SimpleNamespace(deps=dependencies), "Daily check", "Check project progress", "daily",
+            )
+        self.assertTrue(created["ok"])
+        self.assertEqual(created["schedule"]["timezone"], "Pacific/Auckland")
+
+        created_cron = create_tool.function(
+            SimpleNamespace(deps=dependencies), "Weekday check", "Check project progress", "cron",
+            cron_expression="0 9 * * MON-FRI",
+        )
+        self.assertTrue(created_cron["ok"])
+        self.assertEqual(created_cron["schedule"]["cron_expression"], "0 9 * * MON-FRI")
+
+        existing = self.store.create_schedule(
+            self.project["id"], "Sydney check", "Check delivery", "daily", "Australia/Sydney",
+        )
+        edited = edit_tool.function(
+            SimpleNamespace(deps=dependencies), existing["id"], "Updated check", "Check delivery",
+            "weekly",
+        )
+        self.assertTrue(edited["ok"])
+        self.assertEqual(edited["schedule"]["timezone"], "Australia/Sydney")
+
     def test_new_mission_records_selected_skills_and_initial_message_routing(self) -> None:
         mission = self.store.create_mission(
             self.project["id"], "Explain the project", "Explain the project",
@@ -715,20 +1053,22 @@ for line in sys.stdin:
         with self.assertRaisesRegex(ValueError, "guidance"):
             save_recipe(recipes_dir, "valid-id", "Valid", "A summary.", "", ROOT / "recipes")
 
-    def test_agent_memory_proposal_review_stays_separate_from_the_legacy_migration_source(self) -> None:
-        existing = self.store.save_knowledge(
-            self.project["id"], self.mission["id"], "user", "Build command", "Run npm test."
+    def test_agent_memory_proposal_review_updates_canonical_project_memory(self) -> None:
+        existing = project_memory.save_project_memory(
+            self.store, self.project["id"], self.mission["id"], "user",
+            "Build command", "Run npm test.",
         )
         self.assertEqual(existing["status"], "active")
         self.assertEqual(existing["source_mission_id"], self.mission["id"])
-        self.assertEqual(existing["source_event_sequence"], self.store.latest_sequence(self.mission["id"]))
 
         proposal = self.store.propose_knowledge(
             self.project["id"], self.mission["id"], "builder", "Build command", "Run npm run test."
         )
         self.assertEqual(proposal["status"], "pending")
         self.assertEqual(proposal["source_mission_title"], self.mission["title"])
-        self.assertEqual(self.store.project_knowledge(self.project["id"])[0]["content"], "Run npm test.")
+        self.assertEqual(project_memory.read_project_memory(
+            self.project["id"], existing["id"],
+        )["content"], "Run npm test.")
         self.assertEqual(self.store.knowledge_proposals(self.project["id"])[0]["id"], proposal["id"])
         snapshot = self.store.bootstrap(self.project["id"])
         self.assertEqual(snapshot["knowledgeProposals"][0]["source_mission_title"], self.mission["title"])
@@ -740,26 +1080,74 @@ for line in sys.stdin:
                 self.project["id"], self.mission["id"], "reviewer", "Build command", "Use another command."
             )
 
-        reviewed = self.store.review_knowledge_proposal(proposal["id"], "user", "accept")
+        reviewed = project_memory.review_project_memory_proposal(
+            self.store, proposal["id"], "user", "accept",
+        )
         self.assertEqual(reviewed["proposal"]["status"], "accepted")
         self.assertEqual(reviewed["proposal"]["reviewed_by"], "user")
         self.assertEqual(reviewed["entry"]["content"], "Run npm run test.")
         self.assertEqual(reviewed["entry"]["created_by"], "builder")
         self.assertEqual(reviewed["entry"]["updated_by"], "user")
-        self.assertEqual(self.store.project_knowledge(self.project["id"])[0]["content"], "Run npm test.")
+        self.assertEqual(reviewed["entry"]["id"], existing["id"])
+        self.assertEqual(project_memory.read_project_memory(
+            self.project["id"], existing["id"],
+        )["content"], "Run npm run test.")
 
-        archived = self.store.archive_knowledge(reviewed["entry"]["id"], self.mission["id"])
+        archived = project_memory.set_project_memory_status(
+            self.store, self.project["id"], existing["id"], "archived", self.mission["id"],
+        )
         self.assertEqual(archived["status"], "archived")
-        self.assertEqual(self.store.project_knowledge(self.project["id"]), [])
-        self.assertEqual(self.store.project_knowledge(self.project["id"], include_archived=True)[0]["status"], "archived")
-        restored = self.store.restore_knowledge(archived["id"], self.mission["id"])
+        self.assertEqual(project_memory.list_project_memory(self.store, self.project["id"]), [])
+        self.assertEqual(project_memory.list_project_memory(
+            self.store, self.project["id"], include_archived=True,
+        )[0]["status"], "archived")
+        restored = project_memory.set_project_memory_status(
+            self.store, self.project["id"], existing["id"], "active", self.mission["id"],
+        )
         self.assertEqual(restored["status"], "active")
-        self.assertEqual(self.store.project_knowledge(self.project["id"])[0]["content"], "Run npm test.")
+        self.assertEqual(project_memory.list_project_memory(
+            self.store, self.project["id"],
+        )[0]["content"], "Run npm run test.")
         event_types = [event["type"] for event in self.store.events_after(self.mission["id"], 0)]
         self.assertIn("knowledge.proposed", event_types)
         self.assertIn("knowledge.proposal.reviewed", event_types)
         self.assertIn("knowledge.entry.archived", event_types)
         self.assertIn("knowledge.entry.restored", event_types)
+
+    def test_startup_memory_migration_imports_accepted_entries_and_enforces_project_scope(self) -> None:
+        legacy = self.insert_legacy_memory("Build command", "Run npm test.")
+        proposal = self.store.propose_knowledge(
+            self.project["id"], self.mission["id"], "builder", "Release rule", "Tag after tests pass."
+        )
+        self.store.review_knowledge_proposal(proposal["id"], "user", "accept")
+        other_workspace = self.root / "other-project"
+        other_workspace.mkdir()
+        other_project = self.store.register_project(str(other_workspace), "Other project")
+
+        self.assertEqual(project_memory.migrate_all_project_memory(self.store), 2)
+        self.assertEqual(project_memory.migrate_all_project_memory(self.store), 2)
+        migration = project_memory.audit_project_memory_migration(self.store)
+        self.assertEqual(migration["expected"], 2)
+        self.assertEqual(migration["verified"], 2)
+        self.assertEqual(migration["missing"], [])
+        self.assertEqual(migration["conflicts"], [])
+
+        project_memory._write(self.project["id"], {
+            **legacy, "content": "Conflicting migrated content",
+        })
+        migration = project_memory.audit_project_memory_migration(self.store)
+        self.assertEqual(migration["verified"], 1)
+        self.assertEqual(migration["conflicts"][0]["entry_id"], legacy["id"])
+        self.assertIn("content", migration["conflicts"][0]["fields"])
+        project_memory._write(self.project["id"], legacy)
+
+        entries = project_memory.list_project_memory(self.store, self.project["id"])
+        self.assertEqual({entry["title"] for entry in entries}, {"Build command", "Release rule"})
+        self.assertEqual(project_memory.read_project_memory(other_project["id"], legacy["id"]), None)
+        self.assertEqual(
+            project_memory.search_project_memory(self.store, self.project["id"], "release tag")[0]["title"],
+            "Release rule",
+        )
 
     def test_project_web_access_policy_is_opt_in_validated_and_audited(self) -> None:
         self.assertEqual(self.store.project_web_access(self.project["id"]), {
@@ -6880,6 +7268,81 @@ with workspace._path_lock(Path(repository) / 'README.md'):
 
 
 class ScheduleCase(RuntimeCase):
+    def test_schedule_can_continue_existing_chat_and_marks_message_source(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Morning review", "Review recent changes", "daily", "UTC",
+            target_mission_id=self.mission["id"],
+        )
+        with self.store._connect() as db:
+            db.execute("UPDATE schedules SET next_run_at='2020-01-01T00:00:00+00:00' WHERE id=?", (schedule["id"],))
+
+        claimed = self.store.claim_due_schedules()
+        events = self.store.events_after(self.mission["id"], 0)
+
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0]["missionId"], self.mission["id"])
+        self.assertEqual(self.store.mission(self.mission["id"])["title"], self.mission["title"])
+        self.assertEqual(events[-1]["type"], "message.created")
+        self.assertEqual(events[-1]["actorId"], "scheduler")
+        self.assertEqual(events[-1]["payload"]["source"], "schedule")
+        self.assertEqual(events[-1]["payload"]["text"], "Review recent changes")
+        run = self.store.schedules(self.project["id"])[0]["runs"][0]
+        self.assertEqual(run["status"], "queued")
+        self.assertEqual(run["trigger_sequence"], events[-1]["sequence"])
+        self.assertEqual(self.store.queued_scheduled_missions(), [self.mission["id"]])
+
+        self.store.begin_agent_event("planner", self.mission["id"], events[-1]["sequence"])
+        started = self.store.schedules(self.project["id"])[0]["runs"][0]
+        self.assertEqual(started["status"], "running")
+        self.assertIsNotNone(started["invocation_started_at"])
+        self.assertEqual(self.store.queued_scheduled_missions(), [])
+
+    def test_schedule_reopens_completed_target_chat_before_delivery(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Follow-up", "Check current status", "daily", "UTC",
+            target_mission_id=self.mission["id"],
+        )
+        with self.store._connect() as db:
+            db.execute("UPDATE missions SET status='completed' WHERE id=?", (self.mission["id"],))
+            db.execute("UPDATE schedules SET next_run_at='2020-01-01T00:00:00+00:00' WHERE id=?", (schedule["id"],))
+
+        claimed = self.store.claim_due_schedules()
+        events = self.store.events_after(self.mission["id"], 0)
+
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(self.store.mission(self.mission["id"])["status"], "active")
+        self.assertEqual([event["type"] for event in events[-2:]], ["mission.resumed", "message.created"])
+
+    def test_schedule_target_must_be_unarchived_chat_in_same_project(self) -> None:
+        (self.root / "other").mkdir()
+        other_project, other_mission = self.store.create_project(
+            str(self.root / "other"), "Other project", "Other chat", "Other goal",
+        )
+        with self.assertRaisesRegex(ValueError, "schedule_target_chat_must_belong_to_project"):
+            self.store.create_schedule(
+                self.project["id"], "Wrong project", "Run", "daily", "UTC",
+                target_mission_id=other_mission["id"],
+            )
+        with self.store._connect() as db:
+            db.execute("UPDATE missions SET archived_at='2026-01-01T00:00:00+00:00' WHERE id=?", (self.mission["id"],))
+        with self.assertRaisesRegex(ValueError, "schedule_target_chat_is_archived"):
+            self.store.create_schedule(
+                self.project["id"], "Archived", "Run", "daily", "UTC",
+                target_mission_id=self.mission["id"],
+            )
+
+    def test_paused_target_chat_holds_due_schedule(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Follow-up", "Check status", "daily", "UTC",
+            target_mission_id=self.mission["id"],
+        )
+        with self.store._connect() as db:
+            db.execute("UPDATE missions SET status='paused' WHERE id=?", (self.mission["id"],))
+            db.execute("UPDATE schedules SET next_run_at='2020-01-01T00:00:00+00:00' WHERE id=?", (schedule["id"],))
+
+        self.assertEqual(self.store.claim_due_schedules(), [])
+        self.assertEqual(self.store.schedules(self.project["id"])[0]["runs_total"], 0)
+
     def test_dead_agent_worker_quarantines_run_without_replaying_unknown_tool_call(self) -> None:
         event = self.store.append("message.created", "user", self.mission["id"], {"text": "Implement change"})
         work = self.store.create_work_item(self.mission["id"], "Implement safely", "Make the change")
@@ -7695,6 +8158,98 @@ os._exit(24)
         self.assertIn("cost_usd", columns)
         self.assertEqual(version, SCHEMA_VERSION)
 
+    def test_schema_37_adds_durable_memory_migration_reviews(self) -> None:
+        legacy = self.insert_legacy_memory("Build command", "Run npm test.")
+        with self.store._connect() as db:
+            db.execute("DROP TABLE project_memory_migration_reviews")
+            db.execute("PRAGMA user_version = 36")
+
+        migrated = MissionStore(self.store.path)
+
+        with migrated._connect() as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(project_memory_migration_reviews)")}
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+        self.assertTrue({"project_id", "entry_id", "legacy_hash", "smriti_hash", "resolution"} <= columns)
+        self.assertEqual(version, SCHEMA_VERSION)
+        self.assertEqual(migrated.project_knowledge(self.project["id"])[0]["id"], legacy["id"])
+
+    def test_schema_38_adds_memory_migration_ledger_without_deleting_legacy_rows(self) -> None:
+        legacy = self.insert_legacy_memory("Build command", "Run npm test.")
+        with self.store._connect() as db:
+            db.execute("DROP TABLE project_memory_migration_ledger")
+            db.execute("PRAGMA user_version = 37")
+
+        migrated = MissionStore(self.store.path)
+
+        with migrated._connect() as db:
+            columns = {row[1] for row in db.execute(
+                "PRAGMA table_info(project_memory_migration_ledger)"
+            )}
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+        self.assertTrue({"project_id", "source_kind", "source_id", "memory_id", "source_hash"} <= columns)
+        self.assertEqual(version, SCHEMA_VERSION)
+        self.assertEqual(migrated.project_knowledge(self.project["id"])[0]["id"], legacy["id"])
+
+    def test_schema_39_adds_custom_schedule_expression(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Daily review", "Inspect", "daily", "UTC",
+        )
+        with self.store._connect() as db:
+            db.execute("ALTER TABLE schedules DROP COLUMN cron_expression")
+            db.execute("PRAGMA user_version = 38")
+
+        migrated = MissionStore(self.store.path)
+
+        with migrated._connect() as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(schedules)")}
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            stored = db.execute("SELECT cron_expression FROM schedules WHERE id=?", (schedule["id"],)).fetchone()
+        self.assertIn("cron_expression", columns)
+        self.assertEqual(stored["cron_expression"], "")
+        self.assertEqual(version, SCHEMA_VERSION)
+
+    def test_schema_40_adds_existing_chat_schedule_target(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Daily review", "Inspect", "daily", "UTC",
+        )
+        with self.store._connect() as db:
+            db.execute("ALTER TABLE schedules DROP COLUMN target_mission_id")
+            db.execute("PRAGMA user_version = 39")
+
+        migrated = MissionStore(self.store.path)
+
+        with migrated._connect() as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(schedules)")}
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            stored = db.execute("SELECT target_mission_id FROM schedules WHERE id=?", (schedule["id"],)).fetchone()
+        self.assertIn("target_mission_id", columns)
+        self.assertEqual(stored["target_mission_id"], "")
+        self.assertEqual(version, SCHEMA_VERSION)
+
+    def test_schema_41_tracks_durable_scheduled_invocation_delivery(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Daily review", "Inspect", "daily", "UTC",
+        )
+        self.store.update_schedule(schedule["id"], "run-now")
+        claimed = self.store.claim_due_schedules()[0]
+        self.store.begin_agent_event("planner", claimed["missionId"], claimed["event"]["sequence"])
+        with self.store._connect() as db:
+            db.execute("ALTER TABLE scheduled_runs DROP COLUMN trigger_sequence")
+            db.execute("ALTER TABLE scheduled_runs DROP COLUMN invocation_started_at")
+            db.execute("PRAGMA user_version = 40")
+
+        migrated = MissionStore(self.store.path)
+
+        with migrated._connect() as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(scheduled_runs)")}
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            run = db.execute("SELECT status,started_at,invocation_started_at FROM scheduled_runs").fetchone()
+        self.assertIn("trigger_sequence", columns)
+        self.assertIn("invocation_started_at", columns)
+        self.assertEqual(run["status"], "running")
+        self.assertEqual(run["invocation_started_at"], run["started_at"])
+        self.assertEqual(version, SCHEMA_VERSION)
+
     def test_schema_migrates_agent_run_retry_at_column(self) -> None:
         with self.store._connect() as db:
             db.execute("ALTER TABLE agent_event_runs DROP COLUMN retry_at")
@@ -8372,9 +8927,135 @@ asyncio.run(main())
         next_reservation = self.store.reserve_agent_usage("planner", self.mission["id"], 10, 21)
         self.assertEqual(next_reservation, 50_000)
 
+    def test_local_scheduler_timezone_prefers_valid_TZ_configuration(self) -> None:
+        with patch.dict(os.environ, {"TZ": "Pacific/Auckland"}):
+            self.assertEqual(self.store.local_timezone_name(), "Pacific/Auckland")
+
+    def test_local_scheduler_timezone_falls_back_to_platform_timezone_provider(self) -> None:
+        with (
+            patch.dict(os.environ, {"TZ": ""}),
+            patch.object(Path, "resolve", side_effect=OSError("not available")),
+            patch.object(Path, "read_text", side_effect=OSError("not available")),
+            patch("tribe_runtime.store.get_localzone_name", return_value="Europe/London"),
+        ):
+            self.assertEqual(self.store.local_timezone_name(), "Europe/London")
+
+    def test_one_time_schedule_requires_a_valid_future_local_datetime(self) -> None:
+        with self.assertRaisesRegex(ValueError, "one_time_schedule_requires_run_at"):
+            self.store.create_schedule(
+                self.project["id"], "Review", "Inspect", "once", "UTC"
+            )
+        with self.assertRaisesRegex(ValueError, "run_at_must_be_in_the_future"):
+            self.store.create_schedule(
+                self.project["id"], "Review", "Inspect", "once", "UTC",
+                run_at="2000-01-01T09:00",
+            )
+        schedule = self.store.create_schedule(
+            self.project["id"], "Review", "Inspect", "once", "Australia/Sydney",
+            run_at="2099-01-01T09:00",
+        )
+        due = datetime.fromisoformat(schedule["next_run_at"])
+        self.assertEqual(due.astimezone(ZoneInfo("Australia/Sydney")).hour, 9)
+
+    def test_schedule_can_be_edited_before_a_run_starts(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Daily review", "Inspect current state", "daily", "UTC",
+        )
+
+        updated = self.store.edit_schedule(
+            self.project["id"], schedule["id"], "Weekly review", "Review delivery risks", "weekly", "Australia/Sydney",
+            "10:30",
+        )
+
+        self.assertEqual(updated["title"], "Weekly review")
+        self.assertEqual(updated["prompt"], "Review delivery risks")
+        self.assertEqual(updated["cadence"], "weekly")
+        self.assertEqual(updated["timezone"], "Australia/Sydney")
+        self.assertEqual(updated["delivery_time"], "10:30")
+
+    def test_schedule_cannot_be_edited_while_a_run_is_in_progress(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Hourly review", "Inspect current state", "hourly", "UTC",
+        )
+        self.store.update_schedule(schedule["id"], "run-now")
+        self.store.claim_due_schedules()
+
+        with self.assertRaisesRegex(ValueError, "schedule_has_a_chat_in_progress"):
+            self.store.edit_schedule(
+                self.project["id"], schedule["id"], "Hourly review", "New prompt", "hourly", "UTC",
+            )
+
+    def test_schedule_actions_and_edits_are_bound_to_the_project(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Hourly review", "Inspect current state", "hourly", "UTC",
+        )
+        other_workspace = self.root / "different-project"
+        other_workspace.mkdir()
+        other_project = self.store.register_project(str(other_workspace), "Different project")
+
+        self.assertIsNone(self.store.update_project_schedule(other_project["id"], schedule["id"], "pause"))
+        self.assertIsNone(self.store.edit_schedule(
+            other_project["id"], schedule["id"], "Changed", "Prompt", "daily", "UTC",
+        ))
+        self.assertEqual(self.store.schedules(self.project["id"])[0]["status"], "active")
+
+    def test_workspace_schedule_list_covers_projects_and_names_each_project(self) -> None:
+        first = self.store.create_schedule(
+            self.project["id"], "First review", "Inspect this project", "daily", "UTC",
+        )
+        other_workspace = self.root / "workspace-schedule-project"
+        other_workspace.mkdir()
+        other_project = self.store.register_project(str(other_workspace), "Second project")
+        second = self.store.create_schedule(
+            other_project["id"], "Second review", "Inspect that project", "weekly", "UTC",
+        )
+
+        schedules = self.store.workspace_schedules()
+
+        self.assertEqual({item["id"] for item in schedules}, {first["id"], second["id"]})
+        self.assertEqual(
+            {item["id"]: item["project_name"] for item in schedules},
+            {first["id"]: self.project["name"], second["id"]: "Second project"},
+        )
+
+    def test_workspace_schedule_api_aggregates_all_projects_without_removing_project_scope(self) -> None:
+        from tribe_runtime import server as runtime_server
+
+        first = self.store.create_schedule(
+            self.project["id"], "First review", "Inspect this project", "daily", "UTC",
+        )
+        other_workspace = self.root / "api-schedule-project"
+        other_workspace.mkdir()
+        other_project = self.store.register_project(str(other_workspace), "Second project")
+        second = self.store.create_schedule(
+            other_project["id"], "Second review", "Inspect that project", "weekly", "UTC",
+        )
+        with patch.object(runtime_server, "STORE", self.store):
+            http = runtime_server.LocalHTTPServer(("127.0.0.1", 0), runtime_server.Handler)
+            thread = threading.Thread(target=http.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{http.server_port}/api/schedules", timeout=3,
+                ) as response:
+                    workspace_payload = json.loads(response.read())
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{http.server_port}/api/schedules?project={self.project['id']}",
+                    timeout=3,
+                ) as response:
+                    project_payload = json.loads(response.read())
+            finally:
+                http.shutdown()
+                http.server_close()
+                thread.join(timeout=3)
+
+        self.assertEqual({item["id"] for item in workspace_payload["schedules"]}, {first["id"], second["id"]})
+        self.assertEqual([item["id"] for item in project_payload["schedules"]], [first["id"]])
+
     def test_schedule_dispatch_creates_background_mission_without_pausing_foreground(self) -> None:
         schedule = self.store.create_schedule(
-            self.project["id"], "Nightly review", "Review repository health", "once", "UTC"
+            self.project["id"], "Nightly review", "Review repository health", "once", "UTC",
+            run_at="2099-01-01T09:00",
         )
         self.store.update_schedule(schedule["id"], "run-now")
 
@@ -8387,13 +9068,35 @@ asyncio.run(main())
         self.assertEqual(self.store.mission(self.mission["id"])["status"], "active")
         scheduled = self.store.schedules(self.project["id"])[0]
         self.assertEqual(scheduled["status"], "active")
-        self.assertEqual(scheduled["runs"][0]["status"], "running")
+        self.assertEqual(scheduled["runs"][0]["status"], "queued")
+
+        self.store.begin_agent_event("planner", background["id"], claimed[0]["event"]["sequence"])
+        self.assertEqual(self.store.schedules(self.project["id"])[0]["runs"][0]["status"], "running")
 
         with self.store._connect() as db:
             db.execute("UPDATE missions SET status='completed' WHERE id=?", (background["id"],))
         self.store.reconcile_scheduled_runs()
         self.assertEqual(self.store.schedules(self.project["id"])[0]["status"], "completed")
         self.assertEqual(self.store.claim_due_schedules(), [])
+
+    def test_overdue_schedule_runs_once_after_restart_and_advances_from_current_time(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Hourly review", "Review repository health", "hourly", "UTC",
+        )
+        with self.store._connect() as db:
+            db.execute(
+                "UPDATE schedules SET next_run_at=? WHERE id=?",
+                ("2020-01-01T00:00:00+00:00", schedule["id"]),
+            )
+
+        restarted = MissionStore(self.store.path)
+        claimed = restarted.claim_due_schedules()
+
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(restarted.claim_due_schedules(), [])
+        updated = restarted.schedules(self.project["id"])[0]
+        self.assertEqual(len(updated["runs"]), 1)
+        self.assertGreater(datetime.fromisoformat(updated["next_run_at"]), datetime.now().astimezone())
 
     def test_schedule_history_pages_all_runs_in_stable_order(self) -> None:
         schedule = self.store.create_schedule(
@@ -8469,6 +9172,60 @@ asyncio.run(main())
                 http.shutdown()
                 http.server_close()
 
+    def test_schedule_management_routes_require_the_owning_project(self) -> None:
+        from tribe_runtime import server as runtime_server
+
+        schedule = self.store.create_schedule(
+            self.project["id"], "Daily review", "Inspect", "daily", "UTC",
+        )
+        other_workspace = self.root / "schedule-route-other-project"
+        other_workspace.mkdir()
+        other_project = self.store.register_project(str(other_workspace), "Other project")
+        with patch.object(runtime_server, "STORE", self.store):
+            http = runtime_server.LocalHTTPServer(("127.0.0.1", 0), runtime_server.Handler)
+            thread = threading.Thread(target=http.serve_forever, daemon=True)
+            thread.start()
+            try:
+                create = urllib.request.Request(
+                    f"http://127.0.0.1:{http.server_port}/api/schedules",
+                    data=json.dumps({
+                        "projectId": self.project["id"], "title": "Custom review",
+                        "prompt": "Inspect risks", "cadence": "cron", "timezone": "UTC",
+                        "cronExpression": "0 9 * * MON-FRI",
+                    }).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with urllib.request.urlopen(create, timeout=3) as response:
+                    created_schedule = json.loads(response.read())["schedule"]
+                self.assertEqual(created_schedule["cron_expression"], "0 9 * * MON-FRI")
+
+                base = f"http://127.0.0.1:{http.server_port}/api/schedules/{schedule['id']}"
+                edit = urllib.request.Request(
+                    base,
+                    data=json.dumps({
+                        "projectId": self.project["id"], "title": "Weekly review",
+                        "prompt": "Inspect risks", "cadence": "cron", "timezone": "UTC",
+                        "deliveryTime": "10:30", "cronExpression": "0 9 * * MON-FRI",
+                    }).encode(),
+                    headers={"Content-Type": "application/json"}, method="PUT",
+                )
+                with urllib.request.urlopen(edit, timeout=3) as response:
+                    edited_schedule = json.loads(response.read())["schedule"]
+                self.assertEqual(edited_schedule["title"], "Weekly review")
+                self.assertEqual(edited_schedule["cron_expression"], "0 9 * * MON-FRI")
+
+                pause_other = urllib.request.Request(
+                    f"{base}/pause", data=json.dumps({"projectId": other_project["id"]}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(pause_other, timeout=3)
+                self.assertEqual(failure.exception.code, 404)
+                self.assertEqual(self.store.schedules(self.project["id"])[0]["status"], "active")
+            finally:
+                http.shutdown()
+                http.server_close()
+
     def test_schedule_rejects_unknown_timezone(self) -> None:
         with self.assertRaisesRegex(ValueError, "IANA_timezone"):
             self.store.create_schedule(self.project["id"], "Review", "Inspect", "daily", "Mars/Olympus")
@@ -8491,6 +9248,76 @@ asyncio.run(main())
 
         self.assertEqual((due.weekday(), due.hour, due.minute), (0, 8, 15))
         self.assertGreater(due, datetime.now(UTC))
+
+    def test_weekday_schedule_skips_weekends(self) -> None:
+        after = datetime(2026, 10, 31, 8, 0, tzinfo=UTC)  # Saturday
+
+        due = self.store._schedule_due("weekdays", ZoneInfo("UTC"), "09:00", after)
+
+        self.assertEqual(due, datetime(2026, 11, 2, 9, 0, tzinfo=UTC))
+
+    def test_cron_schedule_supports_names_steps_and_timezone(self) -> None:
+        after = datetime(2026, 10, 31, 8, 0, tzinfo=UTC)
+
+        due = self.store._schedule_due(
+            "cron", ZoneInfo("Australia/Sydney"), "09:00", after, "0 9 * * MON-FRI",
+        )
+
+        self.assertEqual(due, datetime(2026, 11, 2, 9, 0, tzinfo=ZoneInfo("Australia/Sydney")).astimezone(UTC))
+
+    def test_cron_schedule_uses_standard_or_semantics_for_day_fields(self) -> None:
+        after = datetime(2026, 10, 31, 8, 0, tzinfo=UTC)
+
+        due = self.store._schedule_due(
+            "cron", ZoneInfo("UTC"), "09:00", after, "0 9 1 * MON",
+        )
+
+        self.assertEqual(due, datetime(2026, 11, 1, 9, 0, tzinfo=UTC))
+
+    def test_cron_schedule_skips_nonexistent_local_time_during_dst_jump(self) -> None:
+        after = datetime(2026, 10, 3, 16, 0, tzinfo=UTC)
+
+        due = self.store._schedule_due(
+            "cron", ZoneInfo("Australia/Sydney"), "09:00", after, "30 2 * * *",
+        )
+
+        self.assertEqual(due, datetime(2026, 10, 5, 2, 30, tzinfo=ZoneInfo("Australia/Sydney")).astimezone(UTC))
+
+    def test_cron_schedule_rejects_invalid_expressions(self) -> None:
+        for expression in ("0 9 * *", "60 9 * * *", "0 9 31 FEB *"):
+            with self.subTest(expression=expression), self.assertRaises(ValueError):
+                self.store.create_schedule(
+                    self.project["id"], "Custom review", "Inspect", "cron", "UTC",
+                    cron_expression=expression,
+                )
+
+    def test_cron_schedule_persists_expression_through_edit(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Custom review", "Inspect", "cron", "UTC",
+            cron_expression="0 9 * * MON-FRI",
+        )
+
+        updated = self.store.edit_schedule(
+            self.project["id"], schedule["id"], "Custom review", "Inspect again", "cron", "UTC",
+            cron_expression="30 8 * * MON-FRI",
+        )
+
+        self.assertEqual(updated["cron_expression"], "30 8 * * MON-FRI")
+        self.assertEqual(updated["cadence"], "cron")
+
+    def test_monthly_schedule_runs_on_the_first_of_the_next_month(self) -> None:
+        after = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+
+        due = self.store._schedule_due("monthly", ZoneInfo("UTC"), "09:00", after)
+
+        self.assertEqual(due, datetime(2026, 11, 1, 9, 0, tzinfo=UTC))
+
+    def test_monthly_schedule_advances_after_the_first_run_time(self) -> None:
+        after = datetime(2026, 11, 1, 10, 0, tzinfo=UTC)
+
+        due = self.store._schedule_due("monthly", ZoneInfo("UTC"), "09:00", after)
+
+        self.assertEqual(due, datetime(2026, 12, 1, 9, 0, tzinfo=UTC))
 
     def test_schedule_rejects_invalid_delivery_time(self) -> None:
         with self.assertRaisesRegex(ValueError, "delivery_time_must_be_HH_MM"):
@@ -8547,6 +9374,8 @@ asyncio.run(main())
         resumed = self.store.activate_mission(mission_id)
         self.assertEqual(resumed["status"], "active")
         self.assertEqual(self.store.mission(self.mission["id"])["status"], "active")
+        event_sequence = first["event"]["sequence"]
+        self.store.begin_agent_event("planner", mission_id, event_sequence)
         self.store.reconcile_scheduled_runs()
         self.assertEqual(self.store.schedules(self.project["id"])[0]["runs"][0]["status"], "running")
 
@@ -8566,7 +9395,8 @@ asyncio.run(main())
 
     def test_resuming_scheduled_mission_does_not_pause_foreground_work(self) -> None:
         schedule = self.store.create_schedule(
-            self.project["id"], "One-off review", "Review repository health", "once", "UTC"
+            self.project["id"], "One-off review", "Review repository health", "once", "UTC",
+            run_at="2099-01-01T09:00",
         )
         self.store.update_schedule(schedule["id"], "run-now")
         background_mission = self.store.claim_due_schedules()[0]["missionId"]

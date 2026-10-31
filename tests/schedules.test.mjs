@@ -17,6 +17,21 @@ test("one-time schedule stays attached to its live mission until completion", ()
   assert.equal(result.nextRun, "Nightly review · Running");
 });
 
+test("one-time schedule distinguishes queued delivery from an active agent run", () => {
+  const schedule = {
+    status: "active",
+    cadence: "once",
+    next_run_at: "2026-10-25T00:00:00+00:00",
+    runs: [{ status: "queued", mission_title: "Nightly review" }],
+  };
+
+  const result = schedulePresentation(schedule, true, Date.parse("2026-10-25T00:01:00Z"));
+
+  assert.equal(result.oneOffInProgress, true);
+  assert.equal(result.statusLabel, "Queued");
+  assert.equal(result.nextRun, "Nightly review · Queued");
+});
+
 test("one-time mission waiting on the user is not shown as a completed schedule", () => {
   const schedule = {
     status: "active",

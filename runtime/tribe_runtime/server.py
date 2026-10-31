@@ -42,12 +42,17 @@ from .credentials import (
     save_api_key,
     validate_openai_base_url,
 )
+from .general_chats import GeneralChatService
 from .instance_lock import RuntimeInstanceLock
 from .mcp_registry import MCPRegistry
 from .pdf_analysis import render_pdf_page
 from .project_memory import (
-    accept_project_memory,
+    audit_project_memory_migration,
     list_project_memory,
+    migrate_all_project_memory,
+    retire_verified_project_memory,
+    resolve_project_memory_migration,
+    review_project_memory_proposal,
     save_project_memory,
     set_project_memory_status,
 )
@@ -75,6 +80,7 @@ if __name__ == "__main__":
     if restore_error:
         print(restore_error, flush=True)
 STORE = MissionStore(RUNTIME_DATA_DIRECTORY / "tribe.sqlite3")
+GENERAL_CHATS = GeneralChatService(STORE)
 
 
 def _agent_payload(definition) -> dict:
@@ -274,6 +280,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self._local_origin():
             return self._json(403, {"error": "local_origin_required"})
         parsed = urlparse(self.path)
+        if parsed.path == "/api/general-chats":
+            return self._json(200, {"chats": STORE.general_chats()})
+        general_chat_match = re.fullmatch(r"/api/general-chats/([0-9a-f-]{36})", parsed.path)
+        if general_chat_match:
+            chat = STORE.general_chat(general_chat_match.group(1))
+            return self._json(200, {"chat": chat}) if chat else self._json(404, {"error": "general_chat_not_found"})
         if parsed.path == "/api/health":
             return self._json(200, {"status": "ok", "runtime": "local", "agents": SUPERVISOR.status})
         if parsed.path == "/api/browser/runtime":
@@ -352,6 +364,7 @@ class Handler(BaseHTTPRequestHandler):
                 "experimentalContextPruning": STORE.get_setting("experimental_context_pruning") == "true",
                 "contextPruningSummary": STORE.context_pruning_summary(),
                 "imageGenerationModel": STORE.get_setting("image_generation_model") or "",
+                "webSearchPreference": STORE.get_setting("web_search_preference") or "automatic",
             })
         if parsed.path == "/api/models":
             default_model = SUPERVISOR.status.get("model")
@@ -518,7 +531,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(422, {"error": "workflow_library_could_not_be_read"})
         if parsed.path == "/api/schedules":
             project_id = parse_qs(parsed.query).get("project", [""])[0]
-            return self._json(200, {"schedules": STORE.schedules(project_id)})
+            schedules = STORE.schedules(project_id) if project_id else STORE.workspace_schedules()
+            return self._json(200, {"schedules": schedules})
         schedule_runs_match = re.fullmatch(r"/api/schedules/([0-9a-f-]{36})/runs", parsed.path)
         if schedule_runs_match:
             query = parse_qs(parsed.query)
@@ -599,6 +613,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {
                 "knowledge": list_project_memory(STORE, project_id, include_archived=True),
                 "proposals": STORE.knowledge_proposals(project_id, pending_only=False),
+                "migration": audit_project_memory_migration(STORE, project_id),
             })
         mcp_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/mcp", parsed.path)
         if mcp_match:
@@ -637,9 +652,14 @@ class Handler(BaseHTTPRequestHandler):
                 data["knowledgeProposals"] = STORE.knowledge_proposals(
                     data["project"]["id"], pending_only=True,
                 )
+                data["knowledgeMigration"] = audit_project_memory_migration(
+                    STORE, data["project"]["id"],
+                )
             else:
                 data["knowledge"] = []
                 data["knowledgeProposals"] = []
+                data["knowledgeMigration"] = {"expected": 0, "verified": 0,
+                                               "missing": [], "conflicts": [], "reviewed": []}
             with AGENT_REGISTRY_LOCK:
                 available_agents = list(AGENT_DEFINITIONS)
                 data["agents"] = [_agent_payload(agent) for agent in available_agents]
@@ -661,6 +681,7 @@ class Handler(BaseHTTPRequestHandler):
                 project["agentIds"] = STORE.project_agent_ids(project["id"], available_agent_ids)
             data["agentDirectory"] = str(USER_AGENT_DIRECTORY)
             data["agentRuntime"] = SUPERVISOR.status
+            data["generalChats"] = STORE.general_chats()
             data["isolatedWorkspaces"] = STORE.isolated_workspaces_for_mission(data["mission"]["id"]) if data.get("mission") else []
             return self._json(200, data)
         if parsed.path == "/api/stream":
@@ -789,6 +810,20 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=self.server.shutdown, daemon=True,
                                  name="tribe-runtime-shutdown").start()
                 return
+            if self.path == "/api/general-chats":
+                chat = STORE.create_general_chat()
+                return self._json(201, {"chat": chat})
+            general_chat_message_match = re.fullmatch(
+                r"/api/general-chats/([0-9a-f-]{36})/messages", self.path,
+            )
+            if general_chat_message_match:
+                text = body.get("text")
+                try:
+                    result = GENERAL_CHATS.send(general_chat_message_match.group(1), text)
+                    return self._json(200, result)
+                except ValueError as error:
+                    status = 404 if str(error) == "general_chat_not_found" else 422
+                    return self._json(status, {"error": str(error)})
             if self.path == "/api/browser/install":
                 try:
                     BROWSER.install_browser()
@@ -1186,12 +1221,26 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(422, {"error": "title_and_content_required"})
                 entry = save_project_memory(STORE, project_id, mission_id, "user", title, content)
                 return self._json(201, {"entry": entry})
+            if self.path == "/api/knowledge/migration-review":
+                project_id = str(body.get("projectId", ""))
+                entry_id = str(body.get("entryId", ""))
+                decision = str(body.get("decision", ""))
+                if not project_id or not entry_id:
+                    return self._json(422, {"error": "project_and_entry_required"})
+                try:
+                    migration = resolve_project_memory_migration(
+                        STORE, project_id, entry_id, decision,
+                    )
+                    return self._json(200, {"migration": migration})
+                except ValueError as error:
+                    return self._json(404 if str(error) == "memory_migration_conflict_not_found"
+                                      else 422, {"error": str(error)})
             review_match = re.fullmatch(r"/api/knowledge/([0-9a-f-]{36})/review", self.path)
             if review_match:
                 decision = str(body.get("decision", "")).strip()
-                result = STORE.review_knowledge_proposal(review_match.group(1), "user", decision)
-                if decision == "accept":
-                    result = accept_project_memory(STORE, result)
+                result = review_project_memory_proposal(
+                    STORE, review_match.group(1), "user", decision,
+                )
                 return self._json(200, result)
             archive_match = re.fullmatch(r"/api/knowledge/([0-9a-f-]{36})/archive", self.path)
             if archive_match:
@@ -1295,11 +1344,16 @@ class Handler(BaseHTTPRequestHandler):
                 schedule = STORE.create_schedule(str(body.get("projectId", "")), title, prompt,
                                                  str(body.get("cadence", "daily")),
                                                  str(body.get("timezone", "UTC")),
-                                                 str(body.get("deliveryTime", "09:00")))
+                                                 str(body.get("deliveryTime", "09:00")),
+                                                 body.get("runAt"),
+                                                 str(body.get("cronExpression", "")),
+                                                 str(body.get("targetMissionId", "")))
                 return self._json(201, {"schedule": schedule})
             schedule_action = re.fullmatch(r"/api/schedules/([0-9a-f-]{36})/(pause|resume|run-now|cancel)", self.path)
             if schedule_action:
-                schedule = STORE.update_schedule(*schedule_action.groups())
+                schedule = STORE.update_project_schedule(
+                    str(body.get("projectId", "")), schedule_action.group(1), schedule_action.group(2),
+                )
                 return self._json(404, {"error": "schedule_not_found"}) if not schedule else self._json(200, {"schedule": schedule})
             command_stop_match = re.fullmatch(r"/api/commands/([0-9a-f-]{36})/stop", self.path)
             if command_stop_match:
@@ -1593,6 +1647,42 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "local_origin_required"})
         if RESTORE_PENDING.is_set():
             return self._json(503, {"error": "workspace_restore_shutting_down"})
+        general_chat_preferences_match = re.fullmatch(
+            r"/api/general-chats/([0-9a-f-]{36})/preferences", self.path,
+        )
+        if general_chat_preferences_match:
+            try:
+                body = self._body()
+                model = body.get("modelPreference")
+                if model is not None and not isinstance(model, str):
+                    return self._json(422, {"error": "model_preference_invalid"})
+                normalized_model = model.strip() if isinstance(model, str) and model.strip() else None
+                chat = STORE.set_general_chat_model_preference(
+                    general_chat_preferences_match.group(1), normalized_model,
+                )
+                return self._json(404, {"error": "general_chat_not_found"}) if not chat else self._json(200, {"chat": chat})
+            except ValueError as error:
+                return self._json(422, {"error": str(error)})
+        schedule_edit_match = re.fullmatch(r"/api/schedules/([0-9a-f-]{36})", self.path)
+        if schedule_edit_match:
+            try:
+                body = self._body()
+                title = body.get("title")
+                prompt = body.get("prompt")
+                project_id = body.get("projectId")
+                if not isinstance(title, str) or not isinstance(prompt, str) or not isinstance(project_id, str):
+                    return self._json(422, {"error": "schedule_title_and_prompt_required"})
+                schedule = STORE.edit_schedule(
+                    project_id, schedule_edit_match.group(1), title, prompt,
+                    str(body.get("cadence", "")), str(body.get("timezone", "")),
+                    str(body.get("deliveryTime", "09:00")), body.get("runAt"),
+                    str(body.get("cronExpression", "")),
+                    str(body.get("targetMissionId", "")),
+                )
+                return self._json(404, {"error": "schedule_not_found"}) if not schedule else self._json(200, {"schedule": schedule})
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                status = 409 if str(error) == "schedule_has_a_chat_in_progress" else 422
+                return self._json(status, {"error": str(error) or "schedule_update_failed"})
         if self.path == "/api/settings/image-generation":
             try:
                 body = self._body()
@@ -1627,6 +1717,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(422, {"error": "context_pruning_setting_invalid"})
                 STORE.set_setting("experimental_context_pruning", "true" if enabled else "false")
                 return self._json(200, {"enabled": enabled})
+            except json.JSONDecodeError:
+                return self._json(400, {"error": "invalid_request"})
+        if self.path == "/api/settings/web-search":
+            try:
+                body = self._body()
+                preference = body.get("preference")
+                if not isinstance(preference, str) or preference not in {"automatic", "duckduckgo", "off"}:
+                    return self._json(422, {"error": "web_search_preference_invalid"})
+                STORE.set_setting("web_search_preference", preference)
+                return self._json(200, {"preference": preference})
             except json.JSONDecodeError:
                 return self._json(400, {"error": "invalid_request"})
         if self.path == "/api/providers/enabled":
@@ -1892,6 +1992,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "local_origin_required"})
         if RESTORE_PENDING.is_set():
             return self._json(503, {"error": "workspace_restore_shutting_down"})
+        general_chat_match = re.fullmatch(r"/api/general-chats/([0-9a-f-]{36})", self.path)
+        if general_chat_match:
+            deleted = STORE.delete_general_chat(general_chat_match.group(1))
+            return self._json(200, {"deleted": True}) if deleted else self._json(404, {"error": "general_chat_not_found"})
         mcp_oauth_forget_match = re.fullmatch(
             r"/api/projects/([0-9a-f-]{36})/mcp/oauth/([a-zA-Z0-9_-]{1,64})", self.path,
         )
@@ -2032,6 +2136,8 @@ def main() -> None:
             try:
                 STORE.reconcile_scheduled_runs()
                 if SUPERVISOR.enabled and not RESTORE_PENDING.is_set():
+                    for mission_id in STORE.queued_scheduled_missions():
+                        SUPERVISOR.start_mission(mission_id)
                     for run in STORE.claim_due_schedules():
                         SUPERVISOR.start_mission(run["missionId"])
             except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
@@ -2042,6 +2148,19 @@ def main() -> None:
         server = LocalHTTPServer((host, port), Handler)
         STORE.recover_usage_reservations()
         STORE.reconcile_repository_file_deletions()
+        try:
+            migrate_all_project_memory(STORE)
+            retirement = retire_verified_project_memory(STORE)
+            migration = retirement["migration"]
+            if retirement["retired"]:
+                LOGGER.info("Retired %s verified legacy project memories", retirement["retired"])
+            if migration["missing"] or migration["conflicts"]:
+                LOGGER.warning(
+                    "Project memory migration needs review: %s missing, %s conflicts",
+                    len(migration["missing"]), len(migration["conflicts"]),
+                )
+        except Exception:  # Memory migration must not prevent local chats from starting.
+            LOGGER.exception("Legacy project memory migration will retry on access")
         SUPERVISOR.recover_interrupted_agent_runs()
         SUPERVISOR.start_active_missions()
         threading.Thread(target=run_scheduler, daemon=True, name="tribe-scheduler").start()

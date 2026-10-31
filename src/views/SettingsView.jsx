@@ -26,6 +26,7 @@ import { modelDisplayName, sortModelCatalog } from "../domain/model-catalog.js";
 const settingsSections = [
   { id: "workspace", label: "Workspace", icon: FolderSimple },
   { id: "models", label: "Models", icon: Sparkle },
+  { id: "web-search", label: "Web search", icon: MagnifyingGlass },
   { id: "connections", label: "Connections", icon: Plug },
   { id: "commands", label: "Command tools", icon: TerminalWindow },
   { id: "desktop", label: "Desktop access", icon: DesktopTower },
@@ -247,6 +248,10 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
   const [imageGenerationDraft, setImageGenerationDraft] = useState("");
   const [imageGenerationSaving, setImageGenerationSaving] = useState(false);
   const [imageGenerationError, setImageGenerationError] = useState("");
+  const [webSearchPreference, setWebSearchPreference] = useState("automatic");
+  const [webSearchDraft, setWebSearchDraft] = useState("automatic");
+  const [webSearchSaving, setWebSearchSaving] = useState(false);
+  const [webSearchError, setWebSearchError] = useState("");
   const providerCheckRequest = useRef(0);
   const [backupPending, setBackupPending] = useState(false);
   const [backupError, setBackupError] = useState("");
@@ -302,6 +307,35 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
     });
     return () => { current = false; };
   }, [activeSection]);
+  useEffect(() => {
+    if (activeSection !== "web-search") return undefined;
+    let current = true;
+    setWebSearchError("");
+    runtime.getSettings().then((settings) => {
+      if (!current) return;
+      const preference = settings.webSearchPreference ?? "automatic";
+      setWebSearchPreference(preference);
+      setWebSearchDraft(preference);
+    }).catch((error) => {
+      if (current) setWebSearchError(error.message || "Web search preferences could not be loaded.");
+    });
+    return () => { current = false; };
+  }, [activeSection]);
+  async function saveWebSearchPreference(event) {
+    event.preventDefault();
+    if (webSearchSaving || webSearchDraft === webSearchPreference) return;
+    setWebSearchSaving(true);
+    setWebSearchError("");
+    try {
+      const { preference } = await runtime.setWebSearchPreference(webSearchDraft);
+      setWebSearchPreference(preference);
+      setWebSearchDraft(preference);
+    } catch (error) {
+      setWebSearchError(error.message || "Web search preferences could not be saved.");
+    } finally {
+      setWebSearchSaving(false);
+    }
+  }
   async function toggleContextPruning() {
     if (contextPruningSaving) return;
     const next = !contextPruningEnabled;
@@ -724,6 +758,7 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
         <div aria-labelledby={`settings-tab-${activeSection}`} className={`settings-section-panel${activeSection === "models" && selectedModelId ? " settings-section-panel--model-detail" : ""}`} id="settings-section-panel" role="tabpanel">
           <div className={`settings-section-heading${activeSection === "models" ? " settings-section-heading--models" : ""}`}><h3>{selectedSection.label}</h3>{activeSection !== "models" && <p>{settingsDescription(activeSection, project.name)}</p>}</div>
           {activeSection === "workspace" && <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><DesktopTower size={18} /></span><div><h3>This device</h3><p>{workspaceDescription}</p></div></div><span className={`settings-device-status settings-device-status--${runtimeStatus}`}><i />{workspaceStatus}</span></section>}
+          {activeSection === "web-search" && <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><MagnifyingGlass size={18} /></span><div><h3>Web search for projectless chats</h3><p>Let agents find current public information and cite the pages they use. Search does not grant access to local files, repositories or shell tools.</p></div></div><form className="image-generation-form" onSubmit={saveWebSearchPreference}><label htmlFor="web-search-preference">Search provider</label><select id="web-search-preference" onChange={(event) => setWebSearchDraft(event.target.value)} value={webSearchDraft}><option value="automatic">Automatic · model provider, with DuckDuckGo fallback</option><option value="duckduckgo">DuckDuckGo only</option><option value="off">Off</option></select><p className="settings-note">Automatic uses the selected model provider’s built-in search when supported, then falls back to DuckDuckGo. The provider or search service receives the search query when an agent searches. Project web access remains controlled in Project settings.</p>{webSearchError && <p className="recipe-error" role="alert">{webSearchError}</p>}<button className="button button--quiet" disabled={webSearchSaving || webSearchDraft === webSearchPreference} type="submit">{webSearchSaving ? "Saving…" : "Save preference"}</button></form></section>}
           {activeSection === "experimental" && <>
             <section className="settings-card">
               <div className="settings-card-heading"><span className="settings-symbol"><Sparkle size={18} /></span><div><h3>Prune stale tool results</h3><p>Before each model request, hide older file reads superseded by edits or newer reads, plus repeated read-only command output. Saved chat and run history remain intact.</p></div>
@@ -843,6 +878,7 @@ function settingsDescription(section, projectName) {
   return ({
     workspace: "Local storage and app status for this device.",
     models: "Connect a provider, allow an agent-ready model, then set the workspace default.",
+    "web-search": "Choose how chats search the public web.",
     connections: projectName ? `Services and web access for ${projectName}.` : "Choose a project to configure its services.",
     commands: projectName ? `Choose background command tools for ${projectName}.` : "Choose a project to configure its command tools.",
     desktop: "Review the permissions needed for computer-use features.",

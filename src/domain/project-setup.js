@@ -25,7 +25,6 @@ export function projectSetupError(error) {
     clone_destination_must_be_a_directory: "Choose a folder where Tribe can save the repository.",
     project_name_invalid: "Use a project name without path separators.",
     project_for_repository_already_exists: "This repository is already in your projects.",
-    project_path_must_be_a_git_repository: "Choose a folder that contains a Git repository.",
     repository_path_must_be_a_directory: "Choose an existing folder.",
   };
   if (messages[error.message]) return messages[error.message];

@@ -1,7 +1,7 @@
 import { Children, Fragment, isValidElement, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Check, Copy, WarningCircle } from "@phosphor-icons/react";
+import { ArrowSquareOut, Check, Copy, WarningCircle } from "@phosphor-icons/react";
 import { languageLoaders } from "./ReadOnlyCodeEditor.jsx";
 import { DiagramPreview } from "./DiagramPreview.jsx";
 import { ChartPreview } from "./ChartPreview.jsx";
@@ -115,22 +115,26 @@ function repositoryPathForLink(href, basePath) {
   return segments.join("/") || null;
 }
 
-function MarkdownLink({ href, node: _node, onOpenRepositoryFile, repositoryBasePath, ...props }) {
+function MarkdownLink({ href, node: _node, onOpenRepositoryFile, repositoryBasePath, externalLinkTreatment, ...props }) {
   let opensInNewTab = false;
-  if (typeof window !== "undefined" && href) {
+  if (href) {
     try {
-      const url = new URL(href, window.location.href);
-      opensInNewTab = ["http:", "https:"].includes(url.protocol) && url.origin !== window.location.origin;
+      const localOrigin = typeof window === "undefined" ? "http://tribe.local" : window.location.origin;
+      const url = new URL(href, localOrigin);
+      opensInNewTab = ["http:", "https:"].includes(url.protocol) && url.origin !== localOrigin;
     } catch { /* Keep invalid or unsupported links in the renderer's default behaviour. */ }
   }
   const repositoryPath = onOpenRepositoryFile ? repositoryPathForLink(href, repositoryBasePath) : null;
+  const className = [props.className, opensInNewTab && externalLinkTreatment ? "message-markdown-external-citation" : ""]
+    .filter(Boolean).join(" ") || undefined;
   return <a
     {...props}
+    className={className}
     href={href}
     onClick={repositoryPath ? (event) => { event.preventDefault(); onOpenRepositoryFile(repositoryPath); } : props.onClick}
     rel={opensInNewTab ? "noopener noreferrer" : undefined}
     target={opensInNewTab ? "_blank" : undefined}
-  />;
+  >{props.children}{opensInNewTab && externalLinkTreatment && <ArrowSquareOut aria-hidden="true" size={12} />}</a>;
 }
 
 function MarkdownImage({ src, node: _node, onResolveRepositoryImage, repositoryBasePath, ...props }) {
@@ -180,7 +184,7 @@ function loadMarkdownMathPlugins() {
   return markdownMathPluginsPromise;
 }
 
-export function MarkdownContent({ children, onOpenRepositoryFile, onResolveRepositoryImage, repositoryBasePath }) {
+export function MarkdownContent({ children, onOpenRepositoryFile, onResolveRepositoryImage, repositoryBasePath, externalLinkTreatment = false }) {
   const source = typeof children === "string" ? escapeCurrencyDelimiters(children) : children;
   const hasMath = typeof source === "string" && containsMarkdownMath(source);
   const [mathPlugins, setMathPlugins] = useState(null);
@@ -198,7 +202,7 @@ export function MarkdownContent({ children, onOpenRepositoryFile, onResolveRepos
   const rehypePlugins = mathPlugins ? [[mathPlugins.rehypeKatex, { throwOnError: false, trust: false }]] : [];
   return <ReactMarkdown
     components={{
-      a: (props) => <MarkdownLink {...props} onOpenRepositoryFile={onOpenRepositoryFile} repositoryBasePath={repositoryBasePath} />,
+      a: (props) => <MarkdownLink {...props} externalLinkTreatment={externalLinkTreatment} onOpenRepositoryFile={onOpenRepositoryFile} repositoryBasePath={repositoryBasePath} />,
       img: (props) => <MarkdownImage {...props} onResolveRepositoryImage={onResolveRepositoryImage} repositoryBasePath={repositoryBasePath} />,
       pre: MarkdownCodeBlock,
     }}

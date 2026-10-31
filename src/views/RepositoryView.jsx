@@ -485,7 +485,7 @@ export function RepositoryView({ artifact, project, missionId, agents = [], onBr
   }
   return (
     <section className="tab-panel detail-view repository-view">
-      {!project.id ? <div className="column-empty">Add or select a Git project to browse its repository.</div> : <div className="repository-browser">
+      {!project.id ? <div className="column-empty">Add or select a project to browse its files.</div> : <div className="repository-browser">
         {error && <p className="settings-error" role="alert">{error}</p>}
         <div className="repository-workbench">
           <aside aria-label="Repository files" className="repository-explorer" title={project.repository}>

@@ -1630,6 +1630,96 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
         mission = ctx.deps.store.mission(ctx.deps.mission_id)
         return _search_project_memory(ctx.deps.store, mission["project_id"], query, limit)
 
+    def _schedule_project_id(ctx: RunContext[AgentDependencies]) -> str | None:
+        mission = ctx.deps.store.mission(ctx.deps.mission_id)
+        return mission["project_id"] if mission else None
+
+    @agent.tool(defer_loading=True)
+    def list_project_schedules(ctx: RunContext[AgentDependencies]) -> list[dict[str, Any]]:
+        """List schedules belonging to this chat's project."""
+        project_id = _schedule_project_id(ctx)
+        if not project_id:
+            return []
+        return [{key: schedule[key] for key in (
+            "id", "title", "prompt", "cadence", "cron_expression", "timezone", "delivery_time",
+            "target_mission_id", "target_mission_title", "next_run_at", "status",
+        )} for schedule in ctx.deps.store.schedules(project_id)]
+
+    @agent.tool(sequential=True, defer_loading=True)
+    def create_project_schedule(ctx: RunContext[AgentDependencies], title: str, prompt: str,
+                                cadence: Literal["once", "hourly", "daily", "weekdays", "weekly", "monthly", "cron"],
+                                timezone: str | None = None, delivery_time: str = "09:00",
+                                run_at: str | None = None, cron_expression: str | None = None,
+                                target_mission_id: str | None = None) -> dict[str, Any]:
+        """Create a local schedule in this project, continuing this chat unless another project chat is selected."""
+        project_id = _schedule_project_id(ctx)
+        if not project_id:
+            return {"ok": False, "error": "project_schedule_requires_project_context"}
+        try:
+            timezone = (timezone or "").strip() or ctx.deps.store.local_timezone_name()
+            schedule = ctx.deps.store.create_schedule(
+                project_id, title, prompt, cadence, timezone, delivery_time, run_at, cron_expression or "",
+                target_mission_id if target_mission_id is not None else ctx.deps.mission_id,
+            )
+        except ValueError as error:
+            return {"ok": False, "error": str(error)}
+        return {"ok": True, "schedule": {
+            key: schedule[key] for key in (
+                "id", "title", "cadence", "cron_expression", "timezone", "target_mission_id",
+                "next_run_at", "status",
+            )
+        }}
+
+    @agent.tool(sequential=True, defer_loading=True)
+    def edit_project_schedule(ctx: RunContext[AgentDependencies], schedule_id: str,
+                               title: str, prompt: str,
+                               cadence: Literal["once", "hourly", "daily", "weekdays", "weekly", "monthly", "cron"],
+                               timezone: str | None = None, delivery_time: str = "09:00",
+                               run_at: str | None = None, cron_expression: str | None = None,
+                               target_mission_id: str | None = None) -> dict[str, Any]:
+        """Edit an idle schedule in this project; keep its timezone unless the user changes it."""
+        project_id = _schedule_project_id(ctx)
+        if not project_id:
+            return {"ok": False, "error": "project_schedule_requires_project_context"}
+        try:
+            if not timezone:
+                current = next((item for item in ctx.deps.store.schedules(project_id)
+                                if item["id"] == schedule_id), None)
+                if not current:
+                    return {"ok": False, "error": "schedule_not_found_in_this_project"}
+                timezone = current["timezone"]
+            schedule = ctx.deps.store.edit_schedule(
+                project_id, schedule_id, title, prompt, cadence, timezone, delivery_time, run_at,
+                cron_expression or "", target_mission_id,
+            )
+        except ValueError as error:
+            return {"ok": False, "error": str(error)}
+        if not schedule:
+            return {"ok": False, "error": "schedule_not_found_in_this_project"}
+        return {"ok": True, "schedule": {
+            key: schedule[key] for key in (
+                "id", "title", "cadence", "cron_expression", "timezone", "target_mission_id",
+                "next_run_at", "status",
+            )
+        }}
+
+    @agent.tool(sequential=True, defer_loading=True)
+    def manage_project_schedule(ctx: RunContext[AgentDependencies], schedule_id: str,
+                                action: Literal["pause", "resume", "run-now", "cancel"]) -> dict[str, Any]:
+        """Pause, resume, run now or cancel a schedule in this project's scope."""
+        project_id = _schedule_project_id(ctx)
+        if not project_id:
+            return {"ok": False, "error": "project_schedule_requires_project_context"}
+        try:
+            schedule = ctx.deps.store.update_project_schedule(project_id, schedule_id, action)
+        except ValueError as error:
+            return {"ok": False, "error": str(error)}
+        if not schedule:
+            return {"ok": False, "error": "schedule_not_found_in_this_project"}
+        return {"ok": True, "schedule": {
+            key: schedule[key] for key in ("id", "title", "status", "next_run_at")
+        }}
+
     @agent.tool(defer_loading=True)
     def read_project_memory(ctx: RunContext[AgentDependencies], memory_id: str) -> dict[str, Any]:
         """Read one durable memory only when it belongs to this project."""

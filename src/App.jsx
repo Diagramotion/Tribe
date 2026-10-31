@@ -45,7 +45,14 @@ import {
   tabs,
 } from "./data/workspace.js";
 import { runtime } from "./api/runtime.js";
+import {
+  desktopNotificationsEnabled as getDesktopNotificationsEnabled,
+  enableDesktopNotifications,
+  sendDesktopNotification,
+  sendTestDesktopNotification,
+} from "./api/desktop-notifications.js";
 import { inlineImagePreview, playableMediaKind } from "./domain/artifact-preview.js";
+import { scheduleRunNotifications } from "./domain/schedules.js";
 import { chatTitleFromPrompt, compactChatTitle } from "./domain/chat-title.js";
 import { captureSelectedWindow } from "./domain/computerCapture.js";
 import {
@@ -61,6 +68,7 @@ import { AddRemoteServiceForm } from "./components/AddRemoteServiceForm.jsx";
 import { useDialogFocus } from "./hooks/useDialogFocus.js";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary.jsx";
 import { AgentActivityView, ArtifactList, MissionView } from "./views/MissionView.jsx";
+import { GeneralChatView } from "./views/GeneralChatView.jsx";
 import {
   filterConversationMessages, filterTimelineMessages, formatTime, mapArtifact, mapInteraction, mapTestRun, mapTestRuns, mapWorkItem,
   mergeTimelineMessages, restoreAgentActivity, timelineEntries, timelineEntry, updateWorkItems,
@@ -302,6 +310,7 @@ export function App() {
   const [skills, setSkills] = useState([]);
   const [knowledge, setKnowledge] = useState([]);
   const [knowledgeProposals, setKnowledgeProposals] = useState([]);
+  const [knowledgeMigration, setKnowledgeMigration] = useState({ missing: [], conflicts: [], reviewed: [] });
   const [interactions, setInteractions] = useState([]);
   const [globalInteractions, setGlobalInteractions] = useState([]);
   const [computerRequests, setComputerRequests] = useState([]);
@@ -548,6 +557,8 @@ export function App() {
   const [composerDraft, setComposerDraft] = useState(null);
   const [mission, setMissionState] = useState(null);
   const [showNewChat, setShowNewChat] = useState(false);
+  const [generalChats, setGeneralChats] = useState([]);
+  const [selectedGeneralChat, setSelectedGeneralChat] = useState(null);
   const setMission = useCallback((update) => setMissionState((current) => {
     const next = typeof update === "function" ? update(current) : update;
     return preserveMissionWorkflowContext(current, next);
@@ -620,6 +631,8 @@ export function App() {
   const [commandRuns, setCommandRuns] = useState([]);
   const [agentRequests, setAgentRequests] = useState([]);
   const [schedules, setSchedules] = useState([]);
+  const [workspaceSchedules, setWorkspaceSchedules] = useState([]);
+  const [desktopNotificationsOn, setDesktopNotificationsOn] = useState(false);
   const [webAccess, setWebAccess] = useState({ enabled: false, allowedDomains: [] });
   const [interactiveAccess, setInteractiveAccess] = useState({ enabled: false });
   const [computerAccess, setComputerAccess] = useState({ enabled: false });
@@ -632,12 +645,14 @@ export function App() {
   const headerSearchInputRef = useRef(null);
   const pendingAttachmentCallbackRef = useRef(null);
   const cursorRef = useRef(0);
+  const toastTimeoutRef = useRef(null);
   const oldestEventSequenceRef = useRef(null);
   const loadedMissionIdRef = useRef(null);
   const missionPausedRef = useRef(false);
   const missionCompletedRef = useRef(false);
   const agentDefinitionsRef = useRef(initialAgents);
   const pendingInteractionAgentsRef = useRef(new Map());
+  const scheduleRunStatusesRef = useRef(null);
   const confirmationResolverRef = useRef(null);
   const confirmationFocusRef = useRef(null);
   useLayoutEffect(() => {
@@ -677,7 +692,7 @@ export function App() {
   const isMissionTab = tabs.includes(activeTab);
   const splitBrowserTitlebarActive = Boolean(projectPaneOpen && mission && isMissionTab && selectedWorkspaceTab?.kind === "browser");
   const browserTitlebarActive = activeTab === "Browser" || splitBrowserTitlebarActive;
-  const isGlobalWorkspaceTab = ["Browser", "Skills", "Recipes", "Settings"].includes(activeTab);
+  const isGlobalWorkspaceTab = ["Browser", "WorkspaceSchedules", "Skills", "Recipes", "Settings"].includes(activeTab);
   const isProjectWorkspace = Boolean(project.id)
     && ["Code", "Git", "Artifacts", "Schedules", "Skills", "Agents", "Knowledge", "Recipes"].includes(activeTab);
   const unavailableAgentStatuses = new Set(["Not configured", "Provider setup failed"]);
@@ -686,13 +701,14 @@ export function App() {
     : agents;
   const readyAgentCount = projectAgents.filter((agent) => !unavailableAgentStatuses.has(agent.status)).length;
   const noAgentsReady = projectAgents.length > 0 && readyAgentCount === 0;
-  const requiresProject = isMissionTab || ["Code", "Git", "Artifacts", "Schedules", "Knowledge"].includes(activeTab);
+  const requiresProject = !selectedGeneralChat && (isMissionTab || ["Code", "Git", "Artifacts", "Schedules", "Knowledge"].includes(activeTab));
   const activeWorkspaceLabel = ({
     Browser: "Browser",
     Code: "Repository",
     Git: "Git changes",
     Artifacts: "Artifacts",
     Schedules: "Schedules",
+    WorkspaceSchedules: "Scheduled tasks",
     Knowledge: "Project memory",
     Skills: "Skills",
     Recipes: "Workflows",
@@ -1072,6 +1088,7 @@ export function App() {
   }
 
   useEffect(() => {
+    if (selectedGeneralChat) return undefined;
     let alive = true;
     let unsubscribe = () => {};
     const load = async () => {
@@ -1103,6 +1120,7 @@ export function App() {
         missionPausedRef.current = data.mission?.status === "paused";
         missionCompletedRef.current = data.mission?.status === "completed" || Boolean(data.mission?.archived_at);
         setProjects(data.projects);
+        setGeneralChats(data.generalChats ?? []);
         setAgentRuntime(data.agentRuntime);
         setAgentDirectory(data.agentDirectory ?? "");
         setCapabilityCatalog(data.capabilityCatalog ?? []);
@@ -1144,6 +1162,7 @@ export function App() {
         setArtifacts(data.artifacts.map(mapArtifact));
         setKnowledge(data.knowledge);
         setKnowledgeProposals(data.knowledgeProposals ?? []);
+        setKnowledgeMigration(data.knowledgeMigration ?? { missing: [], conflicts: [], reviewed: [] });
         if (!data.project) {
           setSkills([]);
           setRuntimeStatus("connected");
@@ -1161,7 +1180,7 @@ export function App() {
     };
     load();
     return () => { alive = false; unsubscribe(); };
-  }, [project.id, mission?.id, showNewChat]);
+  }, [project.id, mission?.id, showNewChat, selectedGeneralChat]);
 
   useEffect(() => {
     if (!mission?.id) { setCommandRuns([]); setAgentRequests([]); return undefined; }
@@ -1194,6 +1213,47 @@ export function App() {
     const timer = window.setInterval(refresh, 5000);
     return () => { alive = false; window.clearInterval(timer); };
   }, [project.id, activeTab, projectPaneOpen, projectPaneTab, projectSettingsOpen, projectSettingsSection]);
+
+  useEffect(() => {
+    let alive = true;
+    void getDesktopNotificationsEnabled().then((enabled) => {
+      if (alive) setDesktopNotificationsOn(enabled);
+    });
+    return () => { alive = false; };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    const refresh = async () => {
+      try {
+        const result = await runtime.listSchedules();
+        if (!alive) return;
+        const { nextStatuses, notifications } = scheduleRunNotifications(
+          scheduleRunStatusesRef.current, result.schedules,
+        );
+        scheduleRunStatusesRef.current = nextStatuses;
+        setWorkspaceSchedules(result.schedules);
+        for (const notification of notifications) {
+          const prefix = notification.projectName ? `${notification.projectName}: ` : "";
+          const title = notification.missionTitle || "Scheduled chat";
+          const needsInput = notification.status === "blocked";
+          const failed = notification.status === "failed";
+          notify(needsInput ? `${prefix}${title} needs your input.`
+            : failed ? `${prefix}${title} needs attention. Open the chat to continue.`
+              : `${prefix}${title} completed.`);
+          void sendDesktopNotification(
+            needsInput ? "Scheduled chat needs your input"
+              : failed ? "Scheduled chat needs attention" : "Scheduled chat completed",
+            needsInput ? "Open Tribe to continue the chat."
+              : failed ? "Open Tribe to review the failure and continue." : "Open Tribe to review the result.",
+          );
+        }
+      } catch { /* Keep the last workspace schedule list while reconnecting. */ }
+    };
+    void refresh();
+    const timer = window.setInterval(refresh, 15000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, []);
 
   useEffect(() => {
     if (!project.id) { setUsage(emptyUsage); return undefined; }
@@ -1274,10 +1334,23 @@ export function App() {
     return messages.map((message) => ({ ...message, workItemTitle: titles.get(message.workItemId) ?? message.workItemTitle }));
   }, [messages, workItemsState]);
 
-  function notify(text) {
+  const notify = useCallback((text) => {
     setToast(text);
-    window.clearTimeout(notify.timeout);
-    notify.timeout = window.setTimeout(() => setToast(""), 3200);
+    window.clearTimeout(toastTimeoutRef.current);
+    toastTimeoutRef.current = window.setTimeout(() => setToast(""), 3200);
+  }, []);
+
+  async function requestDesktopNotifications() {
+    const enabled = await enableDesktopNotifications();
+    setDesktopNotificationsOn(enabled);
+    notify(enabled ? "Desktop notifications are enabled." : "Desktop notifications were not enabled.");
+    return enabled;
+  }
+
+  async function testDesktopNotifications() {
+    const sent = await sendTestDesktopNotification();
+    notify(sent ? "Test notification sent." : "Could not send a test notification.");
+    return sent;
   }
 
   async function sendMessage(text, recipient = null, canvasContext = null, attachments = []) {
@@ -1363,6 +1436,54 @@ export function App() {
     }
   }
 
+  function activateGeneralChat(chat) {
+    setProjectPaneOpen(false);
+    setOpenProjectPaneTabs([]);
+    setProjectPaneTab("");
+    setCanvasDiscussionSplit(false);
+    setSelectedCanvasDocument(null);
+    setShowNewChat(false);
+    setProject({ id: undefined, name: "" });
+    setMissions([]);
+    setMission(null);
+    setSelectedGeneralChat(chat);
+    setActiveTab("Mission");
+  }
+
+  async function createGeneralChat() {
+    try {
+      const { chat } = await runtime.createGeneralChat();
+      setGeneralChats((current) => [chat, ...current]);
+      activateGeneralChat(chat);
+    } catch (error) {
+      notify(`Chat could not be created: ${error.message}`);
+    }
+  }
+
+  async function selectGeneralChat(chatId) {
+    try {
+      const { chat } = await runtime.getGeneralChat(chatId);
+      activateGeneralChat(chat);
+    } catch (error) {
+      notify(`Chat could not be opened: ${error.message}`);
+    }
+  }
+
+  async function sendGeneralChatMessage(text) {
+    if (!selectedGeneralChat) return "general_chat_not_found";
+    const { chat, responseError } = await runtime.sendGeneralChatMessage(selectedGeneralChat.id, text);
+    setSelectedGeneralChat(chat);
+    setGeneralChats((current) => [chat, ...current.filter((item) => item.id !== chat.id)]);
+    return responseError;
+  }
+
+  async function setGeneralChatModelPreference(modelPreference) {
+    if (!selectedGeneralChat) return;
+    const { chat } = await runtime.setGeneralChatModelPreference(selectedGeneralChat.id, modelPreference);
+    setSelectedGeneralChat(chat);
+    setGeneralChats((current) => current.map((item) => item.id === chat.id ? chat : item));
+  }
+
   async function createMission(initialPrompt, modelPreference = null, effortPreference = null) {
     const parsed = parseMissionPrompt(initialPrompt, recipes, skills);
     if (parsed.error) {
@@ -1371,6 +1492,7 @@ export function App() {
     }
     const goal = parsed.text.trim();
     if (!project.id || !goal) return false;
+    setSelectedGeneralChat(null);
     const title = chatTitleFromPrompt(goal);
     try {
       const { mission: created } = await runtime.createMission(
@@ -1484,6 +1606,7 @@ export function App() {
 
   async function selectMission(missionId, selectedProject) {
     if (!missionId) return;
+    setSelectedGeneralChat(null);
     const switchingProject = selectedProject && selectedProject.id !== project.id;
     if (switchingProject) {
       setProjectPaneOpen(false);
@@ -1809,6 +1932,7 @@ export function App() {
         ? await runtime.cloneProject(repositoryUrl.trim(), parentDirectory.trim(), projectName.trim())
         : await runtime.createProject(repositoryPath.trim(), projectName.trim());
       const addedProject = { ...result.project, missions: [] };
+      setSelectedGeneralChat(null);
       setProjects((current) => [addedProject, ...current]);
       setProject(addedProject);
       setMission(null);
@@ -2260,6 +2384,24 @@ export function App() {
     }
   }
 
+  async function resolveKnowledgeMigration(entryId, decision) {
+    try {
+      const { migration } = await runtime.resolveKnowledgeMigration(project.id, entryId, decision);
+      setKnowledgeMigration(migration);
+      if (decision !== "keep_smriti") {
+        const { knowledge: entries } = await runtime.listKnowledge(project.id);
+        setKnowledge(entries);
+      }
+      notify(decision === "keep_smriti"
+        ? "Kept the Smriti version; review recorded."
+        : decision === "copy_legacy_to_project"
+          ? "Copied the saved version into this project's memory."
+          : "Imported the Tribe version into project memory.");
+    } catch (error) {
+      notify(`Memory conflict could not be resolved: ${error.message}`);
+    }
+  }
+
   async function archiveKnowledge(entryId) {
     if (!mission) return;
     try {
@@ -2584,12 +2726,19 @@ export function App() {
     }
   }
 
-async function createSchedule(title, prompt, cadence, deliveryTime) {
+  async function refreshScheduleLists(projectId) {
+    const [current, all] = await Promise.all([
+      runtime.listSchedules(projectId), runtime.listSchedules(),
+    ]);
+    if (project.id === projectId) setSchedules(current.schedules);
+    setWorkspaceSchedules(all.schedules);
+  }
+
+  async function createSchedule(projectId, title, prompt, cadence, deliveryTime, runAt, cronExpression, targetMissionId) {
     try {
-      await runtime.createSchedule(project.id, title, prompt, cadence,
-        Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", deliveryTime);
-      const result = await runtime.listSchedules(project.id);
-      setSchedules(result.schedules);
+      await runtime.createSchedule(projectId, title, prompt, cadence,
+        Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", deliveryTime, runAt, cronExpression, targetMissionId);
+      await refreshScheduleLists(projectId);
       notify("Schedule created.");
       return true;
     } catch (error) {
@@ -2598,11 +2747,22 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
     }
   }
 
-  async function updateSchedule(id, action) {
+  async function editSchedule(projectId, id, title, prompt, cadence, timezone, deliveryTime, runAt, cronExpression, targetMissionId) {
     try {
-      await runtime.updateSchedule(id, action);
-      const result = await runtime.listSchedules(project.id);
-      setSchedules(result.schedules);
+      await runtime.editSchedule(projectId, id, title, prompt, cadence, timezone, deliveryTime, runAt, cronExpression, targetMissionId);
+      await refreshScheduleLists(projectId);
+      notify("Schedule updated.");
+      return true;
+    } catch (error) {
+      notify(`Schedule could not be updated: ${error.message}`);
+      return false;
+    }
+  }
+
+  async function updateSchedule(projectId, id, action) {
+    try {
+      await runtime.updateSchedule(projectId, id, action);
+      await refreshScheduleLists(projectId);
       notify(action === "run-now" ? "Chat started from schedule." : `Schedule ${action === "pause" ? "paused" : action === "resume" ? "resumed" : "cancelled"}.`);
     } catch (error) { notify(`Schedule could not be updated: ${error.message}`); }
   }
@@ -2646,6 +2806,7 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
   }
 
   function renderMissionView() {
+    if (selectedGeneralChat) return <GeneralChatView chat={selectedGeneralChat} getModelCatalog={runtime.getModelCatalog} onModelPreferenceChange={setGeneralChatModelPreference} onSend={sendGeneralChatMessage} onConnectModel={() => openWorkspaceSettings("models")} />;
     if (!mission) return <ProjectHomeView agentConfigured={agentRuntime.enabled} agents={projectAgents} workspaceModel={agentRuntime.model} onConnectModel={() => openWorkspaceSettings("models")} onCreateMission={createMission} onEditProjectGoal={openProjectGoalEditor} onManageModelMetadata={(modelId) => openWorkspaceSettings("models", modelId)} onManageTeam={() => openProjectSettings(project, "team")} onSelectMission={selectMission} project={project} missions={missions} recipes={recipes} skills={skills} />;
     return <MissionView
       mission={mission}
@@ -2714,8 +2875,8 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
     /></Suspense></ViewErrorBoundary>;
     if (tab === "Preview" && selectedArtifact) return <RepositoryView artifact={selectedArtifact} missionId={selectedArtifact?.missionId ?? mission?.id} agents={agents} project={project} reviewRevision={artifactReviewRevision} onArtifactSaved={onArtifactSaved} onUseSpreadsheetSelection={prepareSpreadsheetSelection} onBrowseRepository={() => { setSelectedArtifact(null); setProjectPaneTab("Code"); }} />;
     if (tab === "Preview") return <div className="project-preview-empty"><FileText size={22} /><strong>No preview selected</strong><span>Select a file in Project artifacts to view it beside the chat.</span></div>;
-    if (tab === "Schedules") return <SchedulesView agentsConfigured={agentRuntime.enabled} project={project} schedules={schedules} onCreate={createSchedule} onAction={updateSchedule} onLoadMoreRuns={loadScheduleRuns} />;
-    if (tab === "Knowledge") return <ProjectKnowledgeView entries={knowledge} proposals={knowledgeProposals} onSave={saveKnowledge} onReview={reviewKnowledgeProposal} onArchive={archiveKnowledge} onRestore={restoreKnowledge} />;
+    if (tab === "Schedules") return <SchedulesView agentsConfigured={agentRuntime.enabled} project={project} schedules={schedules} onCreate={createSchedule} onEdit={editSchedule} onAction={updateSchedule} onLoadMoreRuns={loadScheduleRuns} />;
+    if (tab === "Knowledge") return <ProjectKnowledgeView entries={knowledge} proposals={knowledgeProposals} migration={knowledgeMigration} onResolveMigration={resolveKnowledgeMigration} onSave={saveKnowledge} onReview={reviewKnowledgeProposal} onArchive={archiveKnowledge} onRestore={restoreKnowledge} />;
     if (tab === "Artifacts" && selectedCanvasDocument && !projectPaneOpen) return <ViewErrorBoundary backLabel="Back to artifacts" key={`artifacts:${selectedCanvasDocument.id}`} onBack={() => setSelectedCanvasDocument(null)} title="Document preview couldn't be opened"><Suspense fallback={<div className="tab-panel column-empty">Opening shared document…</div>}><CanvasView
       document={selectedCanvasDocument}
       refreshKey={canvasRefreshNonce}
@@ -2762,8 +2923,8 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
       {projectGoalError && <p className="settings-error" role="alert">{projectGoalError}</p>}
       <div className="dialog-actions"><button className="button button--primary" disabled={!projectGoalInput.trim()} type="submit">Save project guidance</button></div>
     </form>;
-    if (section === "knowledge") return <ProjectKnowledgeView entries={knowledge} proposals={knowledgeProposals} onSave={saveKnowledge} onReview={reviewKnowledgeProposal} onArchive={archiveKnowledge} onRestore={restoreKnowledge} />;
-    if (section === "schedules") return <SchedulesView agentsConfigured={agentRuntime.enabled} project={project} schedules={schedules} onCreate={createSchedule} onAction={updateSchedule} onLoadMoreRuns={loadScheduleRuns} />;
+    if (section === "knowledge") return <ProjectKnowledgeView entries={knowledge} proposals={knowledgeProposals} migration={knowledgeMigration} onResolveMigration={resolveKnowledgeMigration} onSave={saveKnowledge} onReview={reviewKnowledgeProposal} onArchive={archiveKnowledge} onRestore={restoreKnowledge} />;
+    if (section === "schedules") return <SchedulesView agentsConfigured={agentRuntime.enabled} project={project} schedules={schedules} onCreate={createSchedule} onEdit={editSchedule} onAction={updateSchedule} onLoadMoreRuns={loadScheduleRuns} />;
     if (section === "artifacts") return <ArtifactsView
       artifacts={projectArtifacts}
       canvasDocuments={canvasDocuments}
@@ -2790,6 +2951,19 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
 
   function renderTab() {
     if (activeTab === "Browser") return <BrowserView onStateChange={handleBrowserWorkspaceState} projects={projects} visible={!createProjectOpen && !projectSettingsOpen && !settingsOpen && !workspaceSettingsOpen && !confirmation} />;
+    if (activeTab === "WorkspaceSchedules") return <SchedulesView
+      agentsConfigured={agentRuntime.enabled}
+      desktopNotificationsOn={desktopNotificationsOn}
+      projects={projects}
+      schedules={workspaceSchedules}
+      workspace
+      onEnableDesktopNotifications={requestDesktopNotifications}
+      onTestDesktopNotifications={testDesktopNotifications}
+      onCreate={createSchedule}
+      onEdit={editSchedule}
+      onAction={updateSchedule}
+      onLoadMoreRuns={loadScheduleRuns}
+    />;
     if (isMissionTab && !mission) return renderMissionView();
     if (isMissionTab && mission) return renderMissionView();
     if (["Code", "Git", "Artifacts", "Schedules", "Knowledge"].includes(activeTab)) return renderProjectTool(activeTab);
@@ -2806,7 +2980,7 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
     </div>;
     if (activeTab === "Skills") return <SkillsView skills={skills} />;
     if (activeTab === "Agents") return <AgentRolesView agents={agents} capabilityCatalog={capabilityCatalog} agentConfigured={agentRuntime.enabled} onCreate={createAgentDefinition} onUpdate={updateAgentDefinition} onArchive={archiveAgentDefinition} onConnectModel={() => openAgentSettings("model")} onManageModels={() => openWorkspaceSettings("models")} />;
-    if (activeTab === "Knowledge") return <ProjectKnowledgeView entries={knowledge} proposals={knowledgeProposals} onSave={saveKnowledge} onReview={reviewKnowledgeProposal} onArchive={archiveKnowledge} onRestore={restoreKnowledge} />;
+    if (activeTab === "Knowledge") return <ProjectKnowledgeView entries={knowledge} proposals={knowledgeProposals} migration={knowledgeMigration} onResolveMigration={resolveKnowledgeMigration} onSave={saveKnowledge} onReview={reviewKnowledgeProposal} onArchive={archiveKnowledge} onRestore={restoreKnowledge} />;
     if (activeTab === "Recipes") return <WorkflowsView recipes={recipes} onSave={saveWorkflowRecipe} onListVersions={runtime.listRecipeVersions} onGetVersion={runtime.getRecipeVersion} />;
     return renderMissionView();
   }
@@ -2833,10 +3007,14 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
           setProjectPaneOpen(false);
           setActiveTab(tab);
         }}
-        onSelectProject={(selected) => { setProjectPaneOpen(false); setOpenProjectPaneTabs([]); setProjectPaneTab(""); setCanvasDiscussionSplit(false); setSelectedCanvasDocument(null); setComposerDraft(null); setShowNewChat(false); setProject(selected); setMissions(selected.missions ?? []); setMission(null); setActiveTab("Mission"); }}
-        onSelectMission={(missionId, selectedProject) => { setCanvasDiscussionSplit(false); setSelectedCanvasDocument(null); setActiveTab("Mission"); void selectMission(missionId, selectedProject); }}
+        onSelectProject={(selected) => { setSelectedGeneralChat(null); setProjectPaneOpen(false); setOpenProjectPaneTabs([]); setProjectPaneTab(""); setCanvasDiscussionSplit(false); setSelectedCanvasDocument(null); setComposerDraft(null); setShowNewChat(false); setProject(selected); setMissions(selected.missions ?? []); setMission(null); setActiveTab("Mission"); }}
+        onSelectMission={(missionId, selectedProject) => { setSelectedGeneralChat(null); setCanvasDiscussionSplit(false); setSelectedCanvasDocument(null); setActiveTab("Mission"); void selectMission(missionId, selectedProject); }}
+        onSelectGeneralChat={selectGeneralChat}
+        onCreateGeneralChat={createGeneralChat}
+        selectedGeneralChat={selectedGeneralChat}
+        generalChats={generalChats}
         onCreateProject={(event) => openProjectCreate(event.currentTarget)}
-        onCreateMission={(selected = project) => { setProjectPaneOpen(false); if (selected.id !== project.id) { setProject(selected); setMissions(selected.missions ?? []); } setShowNewChat(true); setMission(null); setActiveTab("Mission"); }}
+        onCreateMission={(selected = project) => { setSelectedGeneralChat(null); setProjectPaneOpen(false); if (selected.id !== project.id) { setProject(selected); setMissions(selected.missions ?? []); } setShowNewChat(true); setMission(null); setActiveTab("Mission"); }}
         onOpenProjectSettings={(target, returnFocusElement) => openProjectSettings(target, "team", returnFocusElement)}
         onArchiveMission={archiveCurrentMission}
         onRestoreMission={restoreCurrentMission}
@@ -2845,19 +3023,19 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
         project={{ ...project, missions }}
         projects={projects.map((item) => item.id === project.id ? { ...item, missions } : item)}
       />
-      <main className={`main-area ${isMissionTab && mission ? "main-area--mission-workspace" : ""} ${isProjectWorkspace ? "main-area--project-workspace" : ""} ${activeTab === "Browser" ? "main-area--browser-workspace" : ""} ${activeTab === "Code" ? "main-area--repository" : ""} ${isMissionTab && mission && activeTab === "Mission" ? "main-area--conversation" : ""} ${projectPaneOpen && mission && isMissionTab ? "main-area--project-pane-open" : ""} ${isMissionTab && mission && activeTab === "Mission" && canvasDiscussionSplit && selectedCanvasDocument ? "main-area--canvas-discussion" : ""} ${isMissionTab && !mission && activeTab === "Mission" ? "main-area--project-home" : ""}`} style={{ "--secondary-pane-width": `${visibleWorkspacePaneWidth}px` }}>
+      <main className={`main-area ${isMissionTab && mission ? "main-area--mission-workspace" : ""} ${isProjectWorkspace ? "main-area--project-workspace" : ""} ${activeTab === "Browser" ? "main-area--browser-workspace" : ""} ${activeTab === "Code" ? "main-area--repository" : ""} ${isMissionTab && mission && activeTab === "Mission" ? "main-area--conversation" : ""} ${selectedGeneralChat ? "main-area--general-chat" : ""} ${projectPaneOpen && mission && isMissionTab ? "main-area--project-pane-open" : ""} ${isMissionTab && mission && activeTab === "Mission" && canvasDiscussionSplit && selectedCanvasDocument ? "main-area--canvas-discussion" : ""} ${isMissionTab && !mission && !selectedGeneralChat && activeTab === "Mission" ? "main-area--project-home" : ""}`} style={{ "--secondary-pane-width": `${visibleWorkspacePaneWidth}px` }}>
         <header aria-label={browserTitlebarActive ? "Browser workspace" : undefined} className={`topbar${window.tribeDesktop?.platform === "darwin" ? " topbar--electron-mac" : ""}${browserTitlebarActive ? " topbar--browser" : ""}${projectPaneOpen && mission && isMissionTab ? " topbar--split-workspace" : ""}`}>
           <div className="topbar-main">
           <div className="topbar-leading">
             <IconButton aria-pressed={collapsed} className="topbar-sidebar-toggle" label={collapsed ? "Expand sidebar" : "Collapse sidebar"} onClick={() => setCollapsed((value) => !value)}><SidebarSimple size={18} /></IconButton>
           {activeTab !== "Browser" && <div className="breadcrumb">
-            <span className="breadcrumb-project" title={isGlobalWorkspaceTab ? "Workspace" : project.name || "Tribe"}>
+            <span className="breadcrumb-project" title={isGlobalWorkspaceTab ? "Workspace" : project.name || (selectedGeneralChat ? "Chats" : "Tribe")}>
               <FolderSimple aria-hidden="true" className="breadcrumb-project-icon" size={17} />
-              {(!project.id || isGlobalWorkspaceTab) && <strong>{isGlobalWorkspaceTab ? "Workspace" : project.name || "Tribe"}</strong>}
+              {(!project.id || isGlobalWorkspaceTab) && <strong>{isGlobalWorkspaceTab ? "Workspace" : project.name || (selectedGeneralChat ? "Chats" : "Tribe")}</strong>}
             </span>
-            <span className="breadcrumb-chat" title={isMissionTab ? mission?.title ?? "New chat" : activeWorkspaceLabel}>
+            <span className="breadcrumb-chat" title={isMissionTab ? selectedGeneralChat?.title ?? mission?.title ?? "New chat" : activeWorkspaceLabel}>
               {isMissionTab && <ChatCircleDots aria-hidden="true" className="breadcrumb-chat-icon" size={16} />}
-              <span className="breadcrumb-chat-label">{isMissionTab ? compactChatTitle(mission?.title ?? "New chat") : activeWorkspaceLabel}</span>
+              <span className="breadcrumb-chat-label">{isMissionTab ? compactChatTitle(selectedGeneralChat?.title ?? mission?.title ?? "New chat") : activeWorkspaceLabel}</span>
             </span>
             {isMissionTab && mission && <span aria-label={runtimeConnectionLabel(runtimeStatus)} className={`runtime-connection-indicator runtime-connection-indicator--${runtimeStatus}`} role="status" title={runtimeConnectionLabel(runtimeStatus)}>
               <i />{runtimeConnectionText(runtimeStatus) && <span>{runtimeConnectionText(runtimeStatus)}</span>}
@@ -2934,9 +3112,9 @@ async function createSchedule(title, prompt, cadence, deliveryTime) {
 
         <div className="tab-content">{requiresProject && !project.id ? <section className="empty-workspace">
           <span className="eyebrow">A local workspace for engineering work</span>
-          <h2>Start with a repository</h2>
-          <p>Bring a Git repository to plan work, collaborate with agents and keep project history together on this device.</p>
-          <button className="button button--primary" onClick={(event) => openProjectCreate(event.currentTarget)} type="button"><FolderSimple size={16} /> Add a Git project</button>
+          <h2>Start with a project folder</h2>
+          <p>Choose an existing folder, including an empty one, or clone a Git repository. Your project and chat history stay on this device.</p>
+          <button className="button button--primary" onClick={(event) => openProjectCreate(event.currentTarget)} type="button"><FolderSimple size={16} /> Add a project</button>
           <div className="empty-workspace-links">
             <button className="empty-workspace-link" onClick={() => openWorkspaceSettings("models")} type="button"><Gear size={16} /><span><strong>Connect a model</strong><small>Choose a hosted or local model before starting agents.</small></span><CaretRight size={15} /></button>
             <button className="empty-workspace-link" onClick={() => setActiveTab("Recipes")} type="button"><ListChecks size={16} /><span><strong>Explore workflows</strong><small>The default workflow plans, builds, verifies and reviews mission work.</small></span><CaretRight size={15} /></button>
