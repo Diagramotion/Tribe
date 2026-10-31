@@ -35,8 +35,9 @@ function userFacingAgentText(value) {
 }
 
 export function timelineMessage(event, agentDefinitions = initialAgents) {
-  const actorType = event.actorId === "user" ? "human" : "agent";
-  const actor = actorType === "human"
+  const isScheduled = event.type === "message.created" && event.payload.source === "schedule";
+  const actorType = event.actorId === "user" || isScheduled ? "human" : "agent";
+  const actor = isScheduled ? "Scheduled task" : actorType === "human"
     ? "You"
     : agentDefinitions.find((agent) => agent.id === event.actorId)?.name ?? event.actorId;
   if (event.type === "message.created" || event.type === "agent.message.created") {
@@ -44,7 +45,7 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
     const recipient = recipientId
       ? agentDefinitions.find((agent) => agent.id === recipientId || agent.role === recipientId)?.name ?? recipientId
       : null;
-    return { id: event.id, kind: "message", actor, actorId: event.actorId, actorType, recipient, recipientId,
+    return { id: event.id, kind: "message", actor, actorId: event.actorId, actorType, isScheduled, recipient, recipientId,
       channelAudience: event.payload.channelAudience,
       workItemId: event.payload.workItemId, triggerSequence: event.payload.triggerSequence,
       toolCallId: event.payload.toolCallId,

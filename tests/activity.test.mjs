@@ -56,6 +56,15 @@ test("shared chat keeps user posts and final agent replies out of the execution 
   })).triggerSequence, 1);
 });
 
+test("scheduled prompts appear as scheduled tasks in the shared chat", () => {
+  const message = timelineMessage(event(1, "message.created", {
+    text: "Review recent changes", source: "schedule", scheduleId: "schedule-1",
+  }, "scheduler"));
+  assert.equal(message.actor, "Scheduled task");
+  assert.equal(message.actorType, "human");
+  assert.equal(message.isScheduled, true);
+});
+
 test("mission completion appears as a final chat reply instead of a status card", () => {
   const checks = [{
     criterion: "The export is downloadable",

@@ -34,17 +34,18 @@ class Skill:
 
 
 class SkillCatalog:
-    def __init__(self, repository: Path):
+    def __init__(self, repository: Path | None, *, include_project_skills: bool = True):
         home = Path.home()
         codex_home = Path(os.environ.get("CODEX_HOME", home / ".codex")).expanduser()
         claude_home = Path(os.environ.get("CLAUDE_CONFIG_DIR", home / ".claude")).expanduser()
         xdg_config_home = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")).expanduser()
         roots = [(Path(__file__).resolve().parent / "builtin_skills", "Tribe · Built-in")]
-        roots.extend(
-            (repository / directory / "skills", f"Project · {host}")
-            for directory, host in _PROJECT_SKILL_HOSTS.items()
-        )
-        roots.extend((path, source) for path, source in self._nested_project_roots(repository))
+        if repository is not None and include_project_skills:
+            roots.extend(
+                (repository / directory / "skills", f"Project · {host}")
+                for directory, host in _PROJECT_SKILL_HOSTS.items()
+            )
+            roots.extend((path, source) for path, source in self._nested_project_roots(repository))
         roots.extend([
             (home / ".agents" / "skills", "User · Agent Skills"),
             (claude_home / "skills", "User · Claude"),

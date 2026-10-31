@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
 import {
-  ArrowDownRight, ArrowSquareOut, BellSimple, CaretDown, CaretRight, ChatCircleDots, Code,
+  ArrowDownRight, ArrowSquareOut, BellSimple, CaretDown, CaretRight, ChatCircleDots, Clock, Code,
   Check, CircleNotch, Copy, CornersIn, FileText, GitDiff, ListChecks,
   MagnifyingGlass, Paperclip, PaperPlaneRight, ShieldCheck, Sparkle, Stop, Trash, WarningCircle, Wrench, X,
   UsersThree,
@@ -277,6 +277,9 @@ export function AgentActivityView({ agents, messages, missionId,
 }
 
 function MessageAvatar({ actorId, actorType, agentDefinitions }) {
+  if (actorId === "scheduler") {
+    return <span aria-label="Scheduled task" className="message-avatar message-avatar--human"><Clock size={16} /></span>;
+  }
   if (actorType === "human") {
     return <span aria-label="You" className="message-avatar message-avatar--human">Y</span>;
   }
@@ -1103,7 +1106,7 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
   let latestAgentMessage = null;
   for (const message of messages) {
     if (message.kind !== "message") continue;
-    if (message.actorType === "human") latestHumanMessage = message;
+    if (message.actorType === "human" && !message.isScheduled) latestHumanMessage = message;
     else if (message.actorType === "agent") latestAgentMessage = message;
   }
   const requestedAgent = latestHumanMessage?.recipientId

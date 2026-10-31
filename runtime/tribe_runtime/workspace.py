@@ -296,6 +296,8 @@ class WorkspaceTools:
 
     def start_isolated_work(self) -> dict[str, str]:
         self._require_work_claim()
+        if not project_git_status(self.repository_root)["isGit"]:
+            raise RuntimeError("Isolated work requires a Git-enabled project")
         existing = self.store.isolated_workspace(self.agent_id, self.mission_id)
         if existing and existing["state"] in {"active", "pending_approval"}:
             self.root = Path(existing["path"]).resolve()

@@ -22,7 +22,7 @@ export function IconButton({ label, className = "", children, ...props }) {
   );
 }
 
-export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onSelectMission, onCreateProject, onCreateMission, onOpenProjectSettings, onArchiveMission, onRestoreMission, onDeleteMission, onDeleteProject, project, mission, projects }) {
+export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onSelectMission, onSelectGeneralChat, onCreateGeneralChat, selectedGeneralChat, generalChats = [], onCreateProject, onCreateMission, onOpenProjectSettings, onArchiveMission, onRestoreMission, onDeleteMission, onDeleteProject, project, mission, projects }) {
   const [expandedProjects, setExpandedProjects] = useState(() => new Set(project?.id ? [project.id] : []));
   const [expandedArchived, setExpandedArchived] = useState(new Set());
   const [projectQuery, setProjectQuery] = useState("");
@@ -59,10 +59,12 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
   }, []);
   const workspaceItems = [
     { label: "Browser", icon: Globe, tab: "Browser" },
+    { label: "Scheduled tasks", icon: ClockCounterClockwise, tab: "WorkspaceSchedules" },
     { label: "Skills", icon: Sparkle, tab: "Skills" },
     { label: "Workflows", icon: GitBranch, tab: "Recipes" },
   ];
   const visibleProjects = projects.filter((item) => `${item.name} ${item.repository} ${(item.missions ?? []).map((session) => session.title).join(" ")}`.toLowerCase().includes(projectQuery.trim().toLowerCase()));
+  const visibleGeneralChats = generalChats.filter((chat) => chat.title.toLowerCase().includes(projectQuery.trim().toLowerCase()));
 
   return (
     <aside className={`sidebar ${collapsed ? "sidebar--collapsed" : ""}`}>
@@ -74,8 +76,9 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
       {!collapsed && <section className="project-explorer" aria-label="Project explorer">
         <div className="project-explorer-heading"><span className="sidebar-section-label">Project explorer</span><button aria-label="Add project" className="explorer-add" onClick={onCreateProject} title="Add project" type="button"><Plus size={15} /></button></div>
         <input aria-label="Filter projects" className="project-explorer-search" onChange={(event) => setProjectQuery(event.target.value)} placeholder="Find a project" value={projectQuery} />
-        {project.id && <button className="explorer-new-mission project-new-mission" onClick={() => onCreateMission(project)} type="button"><ChatCircleDots size={15} /> New chat</button>}
+        <button className="explorer-new-mission project-new-mission" onClick={onCreateGeneralChat} type="button"><ChatCircleDots size={15} />New chat</button>
         <div className="project-explorer-list">
+          {visibleGeneralChats.length > 0 && <div className="explorer-general-chats"><span className="sidebar-section-label">General chats</span>{visibleGeneralChats.map((chat) => <button aria-current={selectedGeneralChat?.id === chat.id ? "page" : undefined} className={`explorer-mission ${selectedGeneralChat?.id === chat.id ? "explorer-mission--selected" : ""}`} key={chat.id} onClick={() => onSelectGeneralChat(chat.id)} title={chat.title} type="button"><ChatCircleDots aria-hidden="true" className="explorer-general-chat-icon" size={14} /><span>{chat.title}</span></button>)}</div>}
           {visibleProjects.map((item) => <div className="explorer-project" key={item.id}>
             <div className={`explorer-project-row ${project.id === item.id ? "explorer-project-row--selected" : ""}`} onClick={() => toggleProject(item.id)}>
               <button aria-label={`${expandedProjects.has(item.id) ? "Collapse" : "Expand"} ${item.name}`} aria-expanded={expandedProjects.has(item.id)} className="explorer-disclosure" type="button">{expandedProjects.has(item.id) ? <FolderOpen size={15} /> : <FolderSimple size={15} />}</button>
@@ -123,14 +126,14 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
               </>}
             </div>}
           </div>)}
-          {projects.length === 0 && <div className="explorer-empty"><strong>No projects yet</strong><span>Add a Git repository to create a project and start a chat.</span></div>}
+          {projects.length === 0 && <div className="explorer-empty"><strong>No projects yet</strong><span>Add a workspace folder or start a general chat.</span></div>}
           {projects.length > 0 && visibleProjects.length === 0 && <p className="explorer-empty">No projects match “{projectQuery}”.</p>}
         </div>
       </section>}
 
       <nav className="sidebar-nav" aria-label="Workspace navigation">
         {collapsed && <div aria-label="Quick actions" className="sidebar-nav-group sidebar-nav-group--quick" role="group">
-          <button aria-label={project.id ? "New chat" : "Choose a project to start a chat"} className="nav-item" disabled={!project.id} onClick={() => onCreateMission(project)} title={project.id ? "New chat" : "Choose a project to start a chat"} type="button"><ChatCircleDots size={19} /></button>
+          <button aria-label="New chat" className="nav-item" onClick={onCreateGeneralChat} title="New chat" type="button"><ChatCircleDots size={19} /></button>
         </div>}
         <div aria-label="Workspace" className="sidebar-nav-group sidebar-nav-group--workspace" role="group">
           {!collapsed && <span className="sidebar-section-label sidebar-nav-heading">Workspace</span>}

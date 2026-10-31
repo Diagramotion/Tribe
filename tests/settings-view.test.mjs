@@ -28,6 +28,7 @@ test("every Workspace Settings category renders without missing UI components", 
   const categories = [
     ["workspace", "Local storage and app status"],
     ["models", "Models"],
+    ["web-search", "public web"],
     ["connections", "Connected services"],
     ["commands", "Project command tools"],
     ["desktop", "Desktop access"],
@@ -52,6 +53,11 @@ test("every Workspace Settings category renders without missing UI components", 
       assert.match(html, /value="xai:grok-imagine-image-2\.0"/);
       assert.match(html, /value="xai:grok-imagine-image"/);
     }
+    if (initialSection === "web-search") {
+      assert.match(html, /Automatic · model provider, with DuckDuckGo fallback/);
+      assert.match(html, /DuckDuckGo only/);
+      assert.match(html, /value="off"/);
+    }
   }
 });
 
@@ -64,6 +70,7 @@ test("project creation stays limited to repository source and project name", () 
   assert.match(html, /Add a project/);
   assert.match(html, /Existing folder/);
   assert.match(html, /Clone repository/);
+  assert.match(html, /You can start with an empty folder/);
   assert.match(html, /Project name/);
   assert.match(html, /class="repository-picker-row"/);
   assert.doesNotMatch(html, /Project goal|First mission|Mission goal|Workflow/);

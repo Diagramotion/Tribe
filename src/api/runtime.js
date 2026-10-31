@@ -1,5 +1,6 @@
+const RUNTIME_PORT = import.meta.env?.VITE_RUNTIME_PORT || "4317";
 const API_BASE = window.__TAURI_INTERNALS__
-  ? "http://127.0.0.1:4317"
+  ? `http://127.0.0.1:${RUNTIME_PORT}`
   : window.tribeDesktop?.runtimeBaseUrl || "";
 
 async function request(path, options) {
@@ -128,6 +129,19 @@ export const runtime = {
   createMission: (projectId, title, goal, recipeId = null, initialMessage = null, selectedSkills = [], modelPreference = null, effortPreference = null, recipeVersion = null) => request("/api/missions", {
     method: "POST", body: JSON.stringify({ projectId, title, goal, recipeId, initialMessage, selectedSkills, modelPreference, effortPreference, recipeVersion }),
   }),
+  createGeneralChat: () => request("/api/general-chats", {
+    method: "POST", body: JSON.stringify({}),
+  }),
+  getGeneralChat: (chatId) => request(`/api/general-chats/${encodeURIComponent(chatId)}`),
+  setGeneralChatModelPreference: (chatId, modelPreference) => request(`/api/general-chats/${encodeURIComponent(chatId)}/preferences`, {
+    method: "PUT", body: JSON.stringify({ modelPreference }),
+  }),
+  sendGeneralChatMessage: (chatId, text) => request(`/api/general-chats/${encodeURIComponent(chatId)}/messages`, {
+    method: "POST", body: JSON.stringify({ text }),
+  }),
+  deleteGeneralChat: (chatId) => request(`/api/general-chats/${encodeURIComponent(chatId)}`, {
+    method: "DELETE",
+  }),
   listRecipes: () => request("/api/recipes"),
   listRecipeVersions: (id) => request(`/api/recipes/${encodeURIComponent(id)}/versions`),
   getRecipeVersion: (id, version) => request(`/api/recipes/${encodeURIComponent(id)}?version=${encodeURIComponent(version)}`),
@@ -174,6 +188,9 @@ export const runtime = {
     method: "POST", body: JSON.stringify({}),
   }),
   getSettings: () => request("/api/settings"),
+  setWebSearchPreference: (preference) => request("/api/settings/web-search", {
+    method: "PUT", body: JSON.stringify({ preference }),
+  }),
   setImageGenerationModel: (model) => request("/api/settings/image-generation", {
     method: "PUT", body: JSON.stringify({ model }),
   }),
@@ -325,8 +342,12 @@ export const runtime = {
     if (missionId) params.set("mission", missionId);
     return request(`/api/skills?${params}`);
   },
+  listKnowledge: (projectId) => request(`/api/knowledge?project=${encodeURIComponent(projectId)}`),
   saveKnowledge: (projectId, missionId, title, content) => request("/api/knowledge", {
     method: "POST", body: JSON.stringify({ projectId, missionId, title, content }),
+  }),
+  resolveKnowledgeMigration: (projectId, entryId, decision) => request("/api/knowledge/migration-review", {
+    method: "POST", body: JSON.stringify({ projectId, entryId, decision }),
   }),
   reviewKnowledgeProposal: (proposalId, decision) => request(`/api/knowledge/${encodeURIComponent(proposalId)}/review`, {
     method: "POST", body: JSON.stringify({ decision }),
@@ -410,7 +431,9 @@ export const runtime = {
   stopCommand: (runId) => request(`/api/commands/${encodeURIComponent(runId)}/stop`, {
     method: "POST", body: JSON.stringify({}),
   }),
-  listSchedules: (projectId) => request(`/api/schedules?project=${encodeURIComponent(projectId)}`),
+  listSchedules: (projectId) => request(projectId
+    ? `/api/schedules?project=${encodeURIComponent(projectId)}`
+    : "/api/schedules"),
   getScheduleRuns: (id, beforeStartedAt, beforeId, limit = 10) => {
     const query = new URLSearchParams({ limit: String(limit) });
     if (beforeStartedAt && beforeId) {
@@ -427,10 +450,13 @@ export const runtime = {
   setWebAccess: (projectId, enabled, allowedDomains) => request(`/api/projects/${encodeURIComponent(projectId)}/web-access`, {
     method: "PUT", body: JSON.stringify({ enabled, allowedDomains }),
   }),
-  createSchedule: (projectId, title, prompt, cadence, timezone, deliveryTime) => request("/api/schedules", {
-    method: "POST", body: JSON.stringify({ projectId, title, prompt, cadence, timezone, deliveryTime }),
+  createSchedule: (projectId, title, prompt, cadence, timezone, deliveryTime, runAt = null, cronExpression = "", targetMissionId = "") => request("/api/schedules", {
+    method: "POST", body: JSON.stringify({ projectId, title, prompt, cadence, timezone, deliveryTime, runAt, cronExpression, targetMissionId }),
   }),
-  updateSchedule: (id, action) => request(`/api/schedules/${encodeURIComponent(id)}/${action}`, {
-    method: "POST", body: JSON.stringify({}),
+  editSchedule: (projectId, id, title, prompt, cadence, timezone, deliveryTime, runAt = null, cronExpression = "", targetMissionId = "") => request(`/api/schedules/${encodeURIComponent(id)}`, {
+    method: "PUT", body: JSON.stringify({ projectId, title, prompt, cadence, timezone, deliveryTime, runAt, cronExpression, targetMissionId }),
+  }),
+  updateSchedule: (projectId, id, action) => request(`/api/schedules/${encodeURIComponent(id)}/${action}`, {
+    method: "POST", body: JSON.stringify({ projectId }),
   }),
 };

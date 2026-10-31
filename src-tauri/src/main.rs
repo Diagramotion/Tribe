@@ -23,6 +23,7 @@ struct RuntimeProcess {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             computer_use::probe_desktop_access,
@@ -45,7 +46,7 @@ fn main() {
             let (mut events, child) = sidecar
                 .env("TRIBE_DATA_DIR", data_dir.as_os_str())
                 .env("TRIBE_AGENT_DIR", agent_dir.as_os_str())
-                .env("TRIBE_PORT", RUNTIME_PORT.to_string())
+                .env("TRIBE_PORT", runtime_port().to_string())
                 .spawn()
                 .map_err(|error| {
                     eprintln!("Tribe runtime sidecar failed to start: {error}");
@@ -82,7 +83,8 @@ fn main() {
                         .lock()
                         .map(|child| child.is_some())
                         .unwrap_or(false);
-                    if has_child {
+                    let terminated = process.terminated.load(Ordering::Acquire);
+                    if should_shutdown_runtime(has_child, terminated) {
                         api.prevent_exit();
                         if !process.exit_requested.swap(true, Ordering::AcqRel) {
                             let app = app.clone();
@@ -113,7 +115,15 @@ fn main() {
             }
             RunEvent::Exit => {
                 if let Some(process) = app.try_state::<RuntimeProcess>() {
-                    if !process.exit_requested.swap(true, Ordering::AcqRel) {
+                    let has_child = process
+                        .child
+                        .lock()
+                        .map(|child| child.is_some())
+                        .unwrap_or(false);
+                    let terminated = process.terminated.load(Ordering::Acquire);
+                    if should_shutdown_runtime(has_child, terminated)
+                        && !process.exit_requested.swap(true, Ordering::AcqRel)
+                    {
                         request_runtime_shutdown(runtime_port());
                         let deadline = Instant::now() + Duration::from_secs(15);
                         while !process.terminated.load(Ordering::Acquire)
@@ -138,7 +148,15 @@ fn main() {
 }
 
 fn runtime_port() -> u16 {
-    RUNTIME_PORT
+    std::env::var("TRIBE_RUNTIME_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(RUNTIME_PORT)
+}
+
+fn should_shutdown_runtime(has_child: bool, terminated: bool) -> bool {
+    has_child && !terminated
 }
 
 fn request_runtime_shutdown(port: u16) {
@@ -174,7 +192,7 @@ fn shutdown_accepted(response: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::shutdown_accepted;
+    use super::{should_shutdown_runtime, shutdown_accepted};
 
     #[test]
     fn accepts_shutdown_status_independent_of_http_version() {
@@ -182,5 +200,12 @@ mod tests {
         assert!(shutdown_accepted(b"HTTP/1.1 202 Accepted\r\n"));
         assert!(!shutdown_accepted(b"HTTP/1.0 400 Bad Request\r\n"));
         assert!(!shutdown_accepted(b"not an HTTP status\r\n"));
+    }
+
+    #[test]
+    fn only_shuts_down_a_live_runtime_child_owned_by_this_app() {
+        assert!(should_shutdown_runtime(true, false));
+        assert!(!should_shutdown_runtime(false, false));
+        assert!(!should_shutdown_runtime(true, true));
     }
 }
