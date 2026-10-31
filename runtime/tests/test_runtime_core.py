@@ -436,6 +436,53 @@ class RuntimeCase(unittest.TestCase):
         self.assertEqual([item["role"] for item in result["chat"]["messages"]], ["user", "assistant"])
         self.assertGreaterEqual(result["chat"]["messages"][1]["duration_ms"], 0)
 
+    def test_general_chat_deep_research_persists_mode_and_citations(self) -> None:
+        chat = self.store.create_general_chat()
+        self.store.set_setting("model", "openai:test")
+        result = SimpleNamespace(
+            output="A sourced finding ([Official report](https://example.org/report)).",
+            usage=SimpleNamespace(input_tokens=3, output_tokens=7),
+            response=SimpleNamespace(parts=[SimpleNamespace(citations=[SimpleNamespace(sources=[
+                SimpleNamespace(url="https://example.org/report", title="Official report"),
+            ])])]),
+        )
+        service = GeneralChatService(self.store)
+        with patch.object(service, "_run", return_value=(result, 42)) as run:
+            reply = service.send(chat["id"], "Research this", mode="deep_research")
+
+        run.assert_called_once_with("openai:test", "Research this", [], deep_research=True)
+        self.assertIsNone(reply["responseError"])
+        user, assistant = reply["chat"]["messages"]
+        self.assertEqual(user["mode"], "deep_research")
+        self.assertEqual(assistant["mode"], "deep_research")
+        self.assertEqual(assistant["sources"][0]["domain"], "example.org")
+
+    def test_general_chat_deep_research_runs_in_the_workspace_safe_agent(self) -> None:
+        from pydantic_ai.models.test import TestModel
+
+        chat = self.store.create_general_chat()
+        self.store.set_setting("model", "openai:test")
+        self.store.set_setting("web_search_preference", "duckduckgo")
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel(
+                 call_tools=[],
+                 custom_output_text="## Findings\n\nA supported result ([Primary source](https://example.org/source)).",
+             )), patch("tribe_runtime.agent_runtime._resolved_provider_base_url", return_value=""), \
+             patch("tribe_runtime.general_chats.get_api_key", return_value=None):
+            result = GeneralChatService(self.store).send(chat["id"], "Research this", mode="deep_research")
+
+        self.assertIsNone(result["responseError"])
+        self.assertEqual(result["chat"]["messages"][-1]["mode"], "deep_research")
+        self.assertIn("Primary source", result["chat"]["messages"][-1]["body"])
+
+    def test_general_chat_deep_research_requires_workspace_search(self) -> None:
+        chat = self.store.create_general_chat()
+        self.store.set_setting("web_search_preference", "off")
+
+        result = GeneralChatService(self.store).send(chat["id"], "Research this", mode="deep_research")
+
+        self.assertEqual(result["responseError"], "web_search_disabled")
+        self.assertEqual(result["chat"]["messages"], [])
+
     @staticmethod
     def reveal_deferred_test_tools(agent: Any, capabilities: list[Any] | None = None) -> None:
         """Let TestModel call named tools directly without simulating ToolSearch."""
@@ -957,7 +1004,7 @@ for line in sys.stdin:
                     data=json.dumps({
                         "projectId": self.project["id"], "title": "Explain the project",
                         "goal": "Explain the project", "initialMessage": "Explain the project",
-                        "recipeId": None, "selectedSkills": [],
+                        "recipeId": None, "selectedSkills": [], "deepResearch": True,
                     }).encode("utf-8"),
                     headers={"Content-Type": "application/json"}, method="POST",
                 )
@@ -965,6 +1012,8 @@ for line in sys.stdin:
                     payload = json.loads(response.read())
                 self.assertEqual(response.status, 201)
                 self.assertIsNone(payload["mission"]["recipe_id"])
+                events = self.store.events_after(payload["mission"]["id"], 0)
+                self.assertEqual(events[1]["payload"]["researchMode"], "deep_research")
                 supervisor.start_mission.assert_called_once_with(
                     payload["mission"]["id"], initial_launch=True,
                 )
@@ -5655,6 +5704,434 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertEqual(captured["prompt"]["agent_claimed_work_item"], claimed["id"])
         self.assertEqual(captured["prompt"]["project"]["goal"], "Long-term project goal")
 
+    def test_deep_research_prompt_reuses_selected_team_and_workflow_context(self) -> None:
+        workflow = {
+            "id": "source-led-research", "title": "Source-led research", "version": 2,
+            "instructions": "Compare primary sources and record uncertainty.", "stages": [],
+        }
+        self.store.select_mission_workflow(self.mission["id"], "user", workflow)
+        team = [
+            {"id": "planner", "name": "Planner", "role": "Planner", "ready": True,
+             "capabilities": ["task_coordination", "web", "artifacts"], "canClaimWork": True},
+            {"id": "reviewer", "name": "Reviewer", "role": "Quality", "ready": True,
+             "capabilities": ["task_coordination"], "canClaimWork": True},
+        ]
+        trigger = self.store.append("message.created", "user", self.mission["id"], {
+            "text": "Compare two approaches", "recipient": None, "researchMode": "deep_research",
+        })
+        planner = AgentDefinition(
+            "planner", "Planner", "Planner", "Coordinate work", "planner.md",
+            tool_permissions=("task_coordination", "web", "workflows"),
+        )
+        worker = AgentWorker(self.store, self.mission["id"], planner, object(), threading.Event(), project_team=team)
+        enriched_trigger = worker._provider_event(trigger)
+        captured = {}
+
+        class AgentStub:
+            async def run(self, prompt, **kwargs):
+                captured["prompt"] = json.loads(prompt)
+                return type("Result", (), {"output": "Report ([Primary source](https://example.org/source))."})()
+
+        with patch("tribe_runtime.agent_runtime._build_agent", return_value=AgentStub()):
+            provider = PydanticAIProvider(planner, "openai:test-model")
+            response = asyncio.run(provider.run(self.store, self.mission["id"], enriched_trigger))
+
+        prompt = captured["prompt"]
+        self.assertTrue(prompt["deep_research"])
+        self.assertEqual(prompt["research_protocol"]["role"], "lead")
+        self.assertEqual(prompt["project_team"], team)
+        self.assertEqual(prompt["workflow"], workflow)
+        self.assertIn("inline Markdown links", prompt["instructions"])
+        self.assertIn("refine the question map and search terms", prompt["instructions"])
+        self.assertIn("dependent Planner analysis task with `Intended role: Planner`", prompt["instructions"])
+        self.assertIn("it is not the final report task", prompt["instructions"])
+        self.assertIn("shared Research brief", prompt["instructions"])
+        self.assertIn("Intended role: <exact selected role id or name>", prompt["instructions"])
+        self.assertIn("optional guidance", prompt["instructions"])
+        self.assertIn("https://example.org/source", response.text)
+
+    def test_deep_research_context_is_carried_into_durable_plan_tasks(self) -> None:
+        from tribe_runtime.agent_runtime import (
+            _is_research_task_detail, _research_task_detail,
+        )
+
+        ordinary_detail = (
+            "Intended role: researcher\nInvestigate the pricing question and compare primary sources."
+        )
+        research_detail = _research_task_detail(ordinary_detail, True)
+        self.assertIn("Research context: Deep Research investigation.", research_detail)
+        self.assertTrue(_is_research_task_detail(research_detail))
+        self.assertEqual(_research_task_detail(research_detail, True), research_detail)
+        self.assertEqual(_research_task_detail(ordinary_detail, False), ordinary_detail)
+
+        planner = AgentDefinition(
+            "planner", "Planner", "Planner", "Lead research", "planner.md",
+            capabilities=("planning", "task_coordination"),
+        )
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], planner,
+            WorkspaceTools(self.store, self.mission["id"], planner.id),
+            SkillCatalog(self.repository), deep_research=True,
+        )
+        tool = _build_agent(planner, "openai:test-model")._function_toolset.tools["create_plan_items"]
+        tool.function(SimpleNamespace(deps=dependencies), [{
+            "key": "pricing-research", "title": "Investigate pricing", "detail": ordinary_detail,
+        }])
+        work_item = self.store.work_items(self.mission["id"])[0]
+        self.assertTrue(_is_research_task_detail(work_item["detail"]))
+
+        researcher = AgentDefinition(
+            "researcher", "Researcher", "Research", "Investigate the assigned question", "researcher.md",
+            capabilities=("conversation", "task_coordination", "artifacts", "web"),
+        )
+        self.store.claim_work(self.mission["id"], researcher.id, work_item_id=work_item["id"])
+        created_event = next(
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "plan.item.created" and event["payload"]["workItem"]["id"] == work_item["id"]
+        )
+        team = _project_team_context([planner, researcher], {planner.id, researcher.id})
+        worker = AgentWorker(
+            self.store, self.mission["id"], researcher, object(), threading.Event(), project_team=team,
+        )
+        captured = {}
+
+        class AgentStub:
+            async def run(self, prompt, **kwargs):
+                captured["prompt"] = json.loads(prompt)
+                return type("Result", (), {"output": "Two primary sources support the conclusion."})()
+
+        with patch("tribe_runtime.agent_runtime._build_agent", return_value=AgentStub()):
+            provider = PydanticAIProvider(researcher, "openai:test-model")
+            asyncio.run(provider.run(
+                self.store, self.mission["id"], worker._provider_event(created_event),
+            ))
+        self.assertTrue(captured["prompt"]["deep_research"])
+        self.assertEqual(captured["prompt"]["research_protocol"]["role"], "team_member")
+        self.assertIn("refine search terms", captured["prompt"]["instructions"].lower())
+
+    def test_deep_research_lead_context_includes_durable_handoffs_and_document_comments(self) -> None:
+        from tribe_runtime.agent_runtime import _deep_research_documents, _deep_research_handoffs
+
+        planner = AgentDefinition(
+            "planner", "Planner", "Planner", "Lead research", "planner.md",
+            capabilities=("planning", "task_coordination", "artifacts"),
+        )
+        self.store.append("message.created", "user", self.mission["id"], {
+            "text": "Compare the official guidance", "researchMode": "deep_research",
+        })
+        for index in range(15):
+            self.store.append("agent.activity", "reviewer", self.mission["id"], {
+                "status": f"Research step {index}",
+            })
+        handoff_text = "Verified NCSC finding and exact official source URL."
+        self.store.append("agent.message.created", "reviewer", self.mission["id"], {
+            "text": handoff_text, "recipient": "planner",
+        })
+        handoffs = _deep_research_handoffs(
+            self.store, self.mission["id"], planner, self.store.latest_sequence(self.mission["id"]),
+        )
+        self.assertTrue(any(item["text"] == handoff_text for item in handoffs))
+
+        document, _ = self.store.create_canvas_document(
+            self.mission["id"], "Research brief", "markdown", "",
+            "# Evidence ledger\\n\\nInitial notes.", "planner",
+        )
+        comment_text = "CISA source note: the SMB page prioritises admins and sensitive data."
+        self.store.create_canvas_comment(
+            self.mission["id"], document["id"], comment_text, "builder", base_revision=1,
+        )
+        resources = _deep_research_documents(self.store, self.mission["id"])
+        brief = next(item for item in resources if item["id"] == document["id"])
+        self.assertIn("Initial notes", brief["body"])
+        self.assertTrue(any(comment["body"] == comment_text for comment in brief["comments"]))
+
+    def test_deep_research_plan_reactivates_planner_after_shared_research_work(self) -> None:
+        planner = AgentDefinition(
+            "planner", "Planner", "Planner", "Lead the investigation", "planner.md",
+            capabilities=("conversation", "planning", "task_coordination", "chat_lifecycle", "artifacts", "web"),
+        )
+        researcher = AgentDefinition(
+            "researcher", "Researcher", "Research", "Investigate an assigned question", "researcher.md",
+            capabilities=("conversation", "task_coordination", "artifacts", "web"),
+        )
+        reviewer = AgentDefinition(
+            "evidence-checker", "Evidence checker", "Verify cited claims", "Check source support", "reviewer.md",
+            capabilities=("conversation", "task_coordination", "artifacts", "web"),
+        )
+        team = _project_team_context(
+            [planner, researcher, reviewer], {planner.id, researcher.id, reviewer.id},
+        )
+        planner_deps = AgentDependencies(
+            self.store, self.mission["id"], planner,
+            WorkspaceTools(self.store, self.mission["id"], planner.id),
+            SkillCatalog(self.repository), project_team=team, deep_research=True,
+        )
+        planner_agent = _build_agent(planner, "openai:test-model")
+        tools = planner_agent._function_toolset.tools
+        brief = tools["create_artifact"].function(
+            SimpleNamespace(deps=planner_deps), "document", "Research brief",
+            "# Question\n\nCompare the evidence and identify unresolved questions.", "markdown",
+        )
+        created_items = tools["create_plan_items"].function(SimpleNamespace(deps=planner_deps), [
+            {
+                "key": "independent-research", "title": "Investigate the first angle",
+                "detail": "Intended role: researcher\nFind primary sources and report evidence, gaps, and disagreements.",
+            },
+            {
+                "key": "synthesis-round-one", "title": "Review findings and refine questions",
+                "detail": "Intended role: Planner\nRead the research notes, identify unanswered questions, and plan focused follow-up work.",
+                "depends_on": ["independent-research"],
+            },
+        ])
+        researcher_item, synthesis_item = created_items
+        self.assertIn("Research context: Deep Research investigation.", researcher_item["detail"])
+        self.assertIn("Research context: Deep Research investigation.", synthesis_item["detail"])
+        self.assertEqual(brief["artifactType"], "document")
+
+        research_event = next(
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "plan.item.created"
+            and event["payload"]["workItem"]["id"] == researcher_item["id"]
+        )
+        researcher_worker = AgentWorker(
+            self.store, self.mission["id"], researcher, object(), threading.Event(), project_team=team,
+        )
+        planner_worker = AgentWorker(
+            self.store, self.mission["id"], planner, object(), threading.Event(), project_team=team,
+        )
+        self.assertTrue(researcher_worker._should_run(research_event))
+        self.assertFalse(planner_worker._should_run(research_event))
+
+        claimed = self.store.claim_work(
+            self.mission["id"], researcher.id, work_item_id=researcher_item["id"],
+        )
+        self.assertIsNotNone(claimed)
+        self.store.complete_work(researcher_item["id"], researcher.id, "Sources reviewed and gaps recorded.")
+        completion_event = next(
+            event for event in reversed(self.store.events_after(self.mission["id"], 0))
+            if event["type"] == "plan.item.completed"
+            and event["payload"]["workItem"]["id"] == researcher_item["id"]
+        )
+        self.assertEqual(next(
+            item for item in self.store.work_items(self.mission["id"])
+            if item["id"] == synthesis_item["id"]
+        )["status"], "ready")
+        self.assertTrue(planner_worker._should_run(completion_event))
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], planner.id, work_item_id=synthesis_item["id"],
+        ))
+
+        captured = {}
+
+        class AgentStub:
+            async def run(self, prompt, **kwargs):
+                captured["prompt"] = json.loads(prompt)
+                return type("Result", (), {"output": "The evidence leaves one follow-up question."})()
+
+        with patch("tribe_runtime.agent_runtime._build_agent", return_value=AgentStub()):
+            provider = PydanticAIProvider(planner, "openai:test-model")
+            asyncio.run(provider.run(
+                self.store, self.mission["id"], planner_worker._provider_event(completion_event),
+            ))
+
+        prompt = captured["prompt"]
+        self.assertTrue(prompt["deep_research"])
+        self.assertEqual(prompt["research_protocol"]["role"], "lead")
+        self.assertEqual(
+            prompt["research_protocol"]["iteration"],
+            "review findings, verify consequential claims, refine questions, and assign focused follow-up work",
+        )
+        self.assertIn("Research brief", [item["title"] for item in prompt["research_protocol"]["working_documents"]])
+        self.assertIn("Sources reviewed and gaps recorded.", json.dumps(prompt))
+        self.assertIn("dependent Planner analysis task", prompt["instructions"])
+        self.assertIn("final-report task must depend on every research and source-audit task", prompt["instructions"])
+        self.assertIn("verify its consequential claims", prompt["instructions"])
+        self.assertIn("ready selected role whose profile grants task coordination, web, and artifact capabilities", prompt["instructions"])
+        self.assertIn("Only write the final report artifact after the final-report task is ready", prompt["instructions"])
+        self.assertIn("versioned document proposal", prompt["instructions"])
+        self.assertIn("Agent activity update", prompt["instructions"])
+
+        followup_item, followup_analysis = tools["create_plan_items"].function(
+            SimpleNamespace(deps=planner_deps), [
+                {
+                    "key": "follow-up-research", "title": "Check the missing comparison",
+                    "detail": "Intended role: researcher\nSearch for the missing primary-source comparison.",
+                },
+                {
+                    "key": "analysis-round-two", "title": "Review the follow-up evidence",
+                    "detail": "Intended role: Planner\nRead the follow-up result and decide whether source checks are needed.",
+                    "depends_on": ["follow-up-research"],
+                },
+            ],
+        )
+        followup_created_event = next(
+            event for event in reversed(self.store.events_after(self.mission["id"], 0))
+            if event["type"] == "plan.item.created"
+            and event["payload"]["workItem"]["id"] == followup_item["id"]
+        )
+        self.assertTrue(researcher_worker._should_run(followup_created_event))
+        self.store.complete_work(
+            synthesis_item["id"], planner.id, "One comparison remains open; a focused follow-up is assigned.",
+        )
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], researcher.id, work_item_id=followup_item["id"],
+        ))
+        researcher_deps = AgentDependencies(
+            self.store, self.mission["id"], researcher,
+            WorkspaceTools(self.store, self.mission["id"], researcher.id),
+            SkillCatalog(self.repository), project_team=team, deep_research=True,
+        )
+        researcher_tools = _build_agent(researcher, "openai:test-model")._function_toolset.tools
+        shared_brief = researcher_tools["get_artifact"].function(
+            SimpleNamespace(deps=researcher_deps), brief["id"],
+        )
+        self.assertEqual(shared_brief["current"]["body"],
+                         "# Question\n\nCompare the evidence and identify unresolved questions.")
+        source_note = researcher_tools["create_artifact"].function(
+            SimpleNamespace(deps=researcher_deps), "document", "Follow-up source note",
+            "## Finding\n\nThe primary source fills the comparison gap. [Study](https://example.org/study)",
+            "markdown",
+        )
+        self.assertEqual(source_note["artifactType"], "document")
+        self.store.complete_work(
+            followup_item["id"], researcher.id,
+            "The primary source fills the comparison gap; source and publication date recorded.",
+        )
+        followup_completion = next(
+            event for event in reversed(self.store.events_after(self.mission["id"], 0))
+            if event["type"] == "plan.item.completed"
+            and event["payload"]["workItem"]["id"] == followup_item["id"]
+        )
+        self.assertTrue(planner_worker._should_run(followup_completion))
+        self.assertEqual(next(
+            item for item in self.store.work_items(self.mission["id"])
+            if item["id"] == followup_analysis["id"]
+        )["status"], "ready")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], planner.id, work_item_id=followup_analysis["id"],
+        ))
+
+        with patch("tribe_runtime.agent_runtime._build_agent", return_value=AgentStub()):
+            asyncio.run(provider.run(
+                self.store, self.mission["id"], planner_worker._provider_event(followup_completion),
+            ))
+        followup_prompt = captured["prompt"]
+        self.assertTrue(followup_prompt["deep_research"])
+        self.assertIn("The primary source fills the comparison gap", json.dumps(followup_prompt))
+        self.assertIn("Follow-up source note", [
+            item["title"] for item in followup_prompt["research_protocol"]["working_documents"]
+        ])
+
+        proposal_body = {
+            "artifact_id": brief["id"], "base_revision": 1, "title": "Research brief",
+            "kind": "markdown",
+            "body": "# Question\n\nCompare the evidence, including the newly found primary source.",
+        }
+        proposal_sequence = self.store.latest_sequence(self.mission["id"])
+        tools["post_update"].function(
+            SimpleNamespace(deps=planner_deps),
+            f"I refined the comparison question after the follow-up source ({brief['id']}).\n"
+            f"```canvas:v1\n{json.dumps(proposal_body)}\n```",
+        )
+        proposal_events = self.store.events_after(self.mission["id"], proposal_sequence)
+        self.assertTrue(any(event["type"] == "canvas.proposal.created" for event in proposal_events))
+        proposal_source_event = next(
+            event for event in proposal_events if event["type"] == "agent.message.created"
+        )
+        self.assertEqual(
+            proposal_source_event["payload"]["text"],
+            "I refined the comparison question after the follow-up source.",
+        )
+        saved_brief = self.store.canvas_document(self.mission["id"], brief["id"])
+        self.assertEqual(saved_brief["proposals"][0]["base_revision"], 1)
+        self.assertIn("newly found primary source", saved_brief["proposals"][0]["body"])
+        self.assertEqual(
+            saved_brief["proposals"][0]["source_event_sequence"], proposal_source_event["sequence"],
+        )
+
+        audit_item, final_report_item = tools["create_plan_items"].function(
+            SimpleNamespace(deps=planner_deps), [
+                {
+                    "key": "source-audit", "title": "Verify the cited comparison",
+                    "detail": "Intended role: evidence-checker\nCheck the exact claim against https://example.org/study.",
+                    "depends_on": [researcher_item["id"], followup_item["id"]],
+                },
+                {
+                    "key": "final-report", "title": "Write the final research report",
+                    "detail": "Intended role: Planner\nSynthesize verified evidence, limitations and citations.",
+                    "depends_on": [researcher_item["id"], followup_item["id"], "source-audit"],
+                },
+            ],
+        )
+        self.assertEqual(next(
+            item for item in self.store.work_items(self.mission["id"])
+            if item["id"] == final_report_item["id"]
+        )["status"], "blocked")
+        self.store.complete_work(
+            followup_analysis["id"], planner.id, "Research question settled; verify the cited claim before reporting.",
+        )
+        reviewer_worker = AgentWorker(
+            self.store, self.mission["id"], reviewer, object(), threading.Event(), project_team=team,
+        )
+        audit_created_event = next(
+            event for event in reversed(self.store.events_after(self.mission["id"], 0))
+            if event["type"] == "plan.item.created"
+            and event["payload"]["workItem"]["id"] == audit_item["id"]
+        )
+        self.assertTrue(reviewer_worker._should_run(audit_created_event))
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], reviewer.id, work_item_id=audit_item["id"],
+        ))
+        reviewer_deps = AgentDependencies(
+            self.store, self.mission["id"], reviewer,
+            WorkspaceTools(self.store, self.mission["id"], reviewer.id),
+            SkillCatalog(self.repository), project_team=team, deep_research=True,
+        )
+        reviewer_tools = _build_agent(reviewer, "openai:test-model")._function_toolset.tools
+        reviewed_note = reviewer_tools["get_artifact"].function(
+            SimpleNamespace(deps=reviewer_deps), source_note["id"],
+        )
+        self.assertIn("The primary source fills the comparison gap", reviewed_note["current"]["body"])
+        self.store.complete_work(
+            audit_item["id"], reviewer.id,
+            "The linked primary source supports the comparison claim; publication date checked.",
+        )
+        audit_completion = next(
+            event for event in reversed(self.store.events_after(self.mission["id"], 0))
+            if event["type"] == "plan.item.completed"
+            and event["payload"]["workItem"]["id"] == audit_item["id"]
+        )
+        self.assertTrue(planner_worker._should_run(audit_completion))
+        self.assertEqual(next(
+            item for item in self.store.work_items(self.mission["id"])
+            if item["id"] == final_report_item["id"]
+        )["status"], "ready")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], planner.id, work_item_id=final_report_item["id"],
+        ))
+        with patch("tribe_runtime.agent_runtime._build_agent", return_value=AgentStub()):
+            asyncio.run(provider.run(
+                self.store, self.mission["id"], planner_worker._provider_event(audit_completion),
+            ))
+        final_prompt = captured["prompt"]
+        self.assertIn("The linked primary source supports the comparison claim", json.dumps(final_prompt))
+        final_report = tools["create_artifact"].function(
+            SimpleNamespace(deps=planner_deps), "document", "Research report",
+            "# Summary\n\nThe comparison is supported by the primary source. [Study](https://example.org/study)\n\n## Limitations\n\nOne source was available for the follow-up claim.",
+            "markdown",
+        )
+        self.assertEqual(final_report["artifactType"], "document")
+        self.store.complete_work(
+            final_report_item["id"], planner.id, "The source-checked report is ready.",
+        )
+        stored_report = tools["get_artifact"].function(
+            SimpleNamespace(deps=planner_deps), final_report["id"],
+        )
+        self.assertIn("[Study](https://example.org/study)", stored_report["current"]["body"])
+        self.assertTrue(all(
+            item["status"] == "done" for item in self.store.work_items(self.mission["id"])
+        ))
+
     def test_provider_prompt_includes_recent_repository_test_evidence(self) -> None:
         tool_call_id = "call_harness_test_evidence"
         source_tool_event = self.store.append("agent.tool.completed", "builder", self.mission["id"], {
@@ -6152,9 +6629,69 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                                "Run independent tests", "Intended role: Assistant. Run the tests.")
 
         self.assertFalse(result["ok"])
-        self.assertEqual(result["error"], "intended_role_not_in_selected_team_or_cannot_claim_work")
+        self.assertEqual(result["error"], "intended_role_not_ready_or_cannot_claim_work")
         self.assertIn("Planner", {item["name"] for item in result["availableRoles"]})
         self.assertFalse(self.store.work_items(self.mission["id"]))
+
+    def test_deep_research_assignments_require_ready_roles_with_profile_grants(self) -> None:
+        planner = AgentDefinition(
+            "planner", "Planner", "Planning", "Lead research", "planner.md",
+            capabilities=("conversation", "task_coordination", "web", "artifacts"),
+        )
+        limited = AgentDefinition(
+            "limited", "Limited researcher", "Research", "Investigate", "limited.md",
+            capabilities=("conversation", "task_coordination", "web"),
+        )
+        researcher = AgentDefinition(
+            "researcher", "Researcher", "Research", "Investigate", "researcher.md",
+            capabilities=("conversation", "task_coordination", "web", "artifacts"),
+        )
+        unavailable = AgentDefinition(
+            "unavailable", "Unavailable researcher", "Research", "Investigate", "unavailable.md",
+            capabilities=("conversation", "task_coordination", "web", "artifacts"),
+        )
+        team = _project_team_context(
+            [planner, limited, researcher, unavailable], {planner.id, limited.id, researcher.id},
+        )
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], planner,
+            WorkspaceTools(self.store, self.mission["id"], planner.id),
+            SkillCatalog(self.repository), project_team=team, deep_research=True,
+        )
+        tools = _build_agent(planner, "openai:test-model")._function_toolset.tools
+
+        unassigned = tools["create_plan_items"].function(SimpleNamespace(deps=dependencies), [{
+            "key": "unassigned", "title": "Investigate the market", "detail": "Compare primary sources.",
+        }])
+        self.assertEqual(unassigned["error"], "deep_research_task_requires_an_intended_role")
+        self.assertEqual({item["name"] for item in unassigned["availableRoles"]}, {"Planner", "Researcher"})
+
+        missing_artifact = tools["create_plan_items"].function(SimpleNamespace(deps=dependencies), [{
+            "key": "limited", "title": "Investigate the market",
+            "detail": "Intended role: limited\nCompare primary sources.",
+        }])
+        self.assertEqual(missing_artifact["error"], "intended_role_missing_research_capabilities")
+        self.assertEqual(missing_artifact["missingCapabilities"], ["artifacts"])
+
+        not_ready = tools["create_plan_item"].function(
+            SimpleNamespace(deps=dependencies), "Verify the second angle",
+            "Intended role: unavailable\nCheck the linked sources.",
+        )
+        self.assertEqual(not_ready["error"], "intended_role_not_ready_or_cannot_claim_work")
+        self.assertNotIn("Unavailable researcher", {item["name"] for item in not_ready["availableRoles"]})
+
+        created = tools["create_plan_items"].function(SimpleNamespace(deps=dependencies), [{
+            "key": "research", "title": "Investigate the market",
+            "detail": "Intended role: researcher\nCompare primary sources.",
+        }])
+        self.assertEqual(len(created), 1)
+        self.assertIn("Research context: Deep Research investigation.", created[0]["detail"])
+
+        revision_error = tools["revise_plan_item"].function(
+            SimpleNamespace(deps=dependencies), created[0]["id"], "Investigate the market",
+            "Intended role: limited\nCompare primary sources.",
+        )
+        self.assertEqual(revision_error["error"], "intended_role_missing_research_capabilities")
 
     def test_work_items_wake_delivery_roles_before_optional_plan_finalization(self) -> None:
         mission = self.store.create_mission(
@@ -7171,6 +7708,20 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                 with urllib.request.urlopen(message_request, timeout=3) as response:
                     message = json.loads(response.read())["event"]
                 self.assertEqual(message["payload"]["recipient"], "security_auditor")
+
+                research_request = urllib.request.Request(
+                    f"http://127.0.0.1:{http.server_port}/api/messages",
+                    data=json.dumps({
+                        "missionId": self.mission["id"], "text": "Compare these options",
+                        "recipient": "security_auditor", "deepResearch": True,
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Origin": "http://localhost:5173"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(research_request, timeout=3) as response:
+                    research_message = json.loads(response.read())["event"]
+                self.assertEqual(research_message["payload"]["researchMode"], "deep_research")
+                self.assertIsNone(research_message["payload"]["recipient"])
 
                 document, _ = self.store.create_canvas_document(
                     self.mission["id"], "Architecture notes", "markdown", "user", "# Current design",

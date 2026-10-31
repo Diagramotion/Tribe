@@ -1,10 +1,11 @@
-import { Children, Fragment, isValidElement, useEffect, useRef, useState } from "react";
+import { Children, Fragment, createContext, isValidElement, useContext, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ArrowSquareOut, Check, Copy, WarningCircle } from "@phosphor-icons/react";
+import { ArrowSquareOut, Check, Copy, GlobeSimple, WarningCircle } from "@phosphor-icons/react";
 import { languageLoaders } from "./ReadOnlyCodeEditor.jsx";
 import { DiagramPreview } from "./DiagramPreview.jsx";
 import { ChartPreview } from "./ChartPreview.jsx";
+import { LinkPreviewPopover } from "./LinkPreviewPopover.jsx";
 import { parseChartSpec } from "../domain/chart-spec.js";
 
 const codeFenceLanguageAliases = {
@@ -23,6 +24,8 @@ const codeFenceLanguageLabels = {
   diff: "Diff", sql: "SQL", ts: "TypeScript", typescript: "TypeScript", typescriptreact: "TSX", tsx: "TSX",
   xml: "XML", yaml: "YAML", yml: "YML", zsh: "Zsh", mermaid: "Mermaid", chart: "Chart",
 };
+
+const MarkdownRenderContext = createContext(null);
 
 function HighlightedCode({ source, language }) {
   const [highlighted, setHighlighted] = useState(null);
@@ -115,7 +118,8 @@ function repositoryPathForLink(href, basePath) {
   return segments.join("/") || null;
 }
 
-function MarkdownLink({ href, node: _node, onOpenRepositoryFile, repositoryBasePath, externalLinkTreatment, ...props }) {
+function MarkdownLink({ href, node: _node, ...props }) {
+  const { onOpenRepositoryFile, repositoryBasePath, externalLinkTreatment, linkPreviewOnHover } = useContext(MarkdownRenderContext) ?? {};
   let opensInNewTab = false;
   if (href) {
     try {
@@ -127,17 +131,21 @@ function MarkdownLink({ href, node: _node, onOpenRepositoryFile, repositoryBaseP
   const repositoryPath = onOpenRepositoryFile ? repositoryPathForLink(href, repositoryBasePath) : null;
   const className = [props.className, opensInNewTab && externalLinkTreatment ? "message-markdown-external-citation" : ""]
     .filter(Boolean).join(" ") || undefined;
-  return <a
+  const renderLink = (faviconDataUrl = null) => <a
     {...props}
     className={className}
     href={href}
     onClick={repositoryPath ? (event) => { event.preventDefault(); onOpenRepositoryFile(repositoryPath); } : props.onClick}
     rel={opensInNewTab ? "noopener noreferrer" : undefined}
     target={opensInNewTab ? "_blank" : undefined}
-  >{props.children}{opensInNewTab && externalLinkTreatment && <ArrowSquareOut aria-hidden="true" size={12} />}</a>;
+  >{opensInNewTab && linkPreviewOnHover && <span aria-hidden="true" className="message-markdown-favicon-slot">{faviconDataUrl ? <img alt="" src={faviconDataUrl} /> : <GlobeSimple size={14} />}</span>}{props.children}{opensInNewTab && externalLinkTreatment && <ArrowSquareOut aria-hidden="true" size={12} />}</a>;
+  return opensInNewTab && linkPreviewOnHover && !repositoryPath
+    ? <LinkPreviewPopover href={href}>{({ faviconDataUrl }) => renderLink(faviconDataUrl)}</LinkPreviewPopover>
+    : renderLink();
 }
 
-function MarkdownImage({ src, node: _node, onResolveRepositoryImage, repositoryBasePath, ...props }) {
+function MarkdownImage({ src, node: _node, ...props }) {
+  const { onResolveRepositoryImage, repositoryBasePath } = useContext(MarkdownRenderContext) ?? {};
   const repositoryPath = onResolveRepositoryImage ? repositoryPathForLink(src, repositoryBasePath) : null;
   const [resolvedSrc, setResolvedSrc] = useState(null);
 
@@ -155,6 +163,12 @@ function MarkdownImage({ src, node: _node, onResolveRepositoryImage, repositoryB
 }
 
 let markdownMathPluginsPromise;
+
+const markdownComponents = {
+  a: MarkdownLink,
+  img: MarkdownImage,
+  pre: MarkdownCodeBlock,
+};
 
 function containsMarkdownMath(source) {
   return /\$\$[\s\S]+?\$\$|(?<!\\)\$(?!\$|\s)(?:\\.|[^$\n])+?(?<!\s)\$(?!\d)/.test(source);
@@ -184,7 +198,7 @@ function loadMarkdownMathPlugins() {
   return markdownMathPluginsPromise;
 }
 
-export function MarkdownContent({ children, onOpenRepositoryFile, onResolveRepositoryImage, repositoryBasePath, externalLinkTreatment = false }) {
+export function MarkdownContent({ children, onOpenRepositoryFile, onResolveRepositoryImage, repositoryBasePath, externalLinkTreatment = false, linkPreviewOnHover = false }) {
   const source = typeof children === "string" ? escapeCurrencyDelimiters(children) : children;
   const hasMath = typeof source === "string" && containsMarkdownMath(source);
   const [mathPlugins, setMathPlugins] = useState(null);
@@ -200,15 +214,20 @@ export function MarkdownContent({ children, onOpenRepositoryFile, onResolveRepos
     ? [remarkGfm, mathPlugins.remarkMath]
     : [remarkGfm];
   const rehypePlugins = mathPlugins ? [[mathPlugins.rehypeKatex, { throwOnError: false, trust: false }]] : [];
-  return <ReactMarkdown
-    components={{
-      a: (props) => <MarkdownLink {...props} externalLinkTreatment={externalLinkTreatment} onOpenRepositoryFile={onOpenRepositoryFile} repositoryBasePath={repositoryBasePath} />,
-      img: (props) => <MarkdownImage {...props} onResolveRepositoryImage={onResolveRepositoryImage} repositoryBasePath={repositoryBasePath} />,
-      pre: MarkdownCodeBlock,
-    }}
-    rehypePlugins={rehypePlugins}
-    remarkPlugins={remarkPlugins}
-  >{source}</ReactMarkdown>;
+  const renderContext = useMemo(() => ({
+    externalLinkTreatment,
+    linkPreviewOnHover,
+    onOpenRepositoryFile,
+    onResolveRepositoryImage,
+    repositoryBasePath,
+  }), [externalLinkTreatment, linkPreviewOnHover, onOpenRepositoryFile, onResolveRepositoryImage, repositoryBasePath]);
+  return <MarkdownRenderContext.Provider value={renderContext}>
+    <ReactMarkdown
+      components={markdownComponents}
+      rehypePlugins={rehypePlugins}
+      remarkPlugins={remarkPlugins}
+    >{source}</ReactMarkdown>
+  </MarkdownRenderContext.Provider>;
 }
 
 export const MessageMarkdown = MarkdownContent;

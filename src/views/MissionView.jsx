@@ -3,18 +3,22 @@ import { Virtuoso } from "react-virtuoso";
 import {
   ArrowDownRight, ArrowSquareOut, BellSimple, CaretDown, CaretRight, ChatCircleDots, Clock, Code,
   Check, CircleNotch, Copy, CornersIn, FileText, GitDiff, ListChecks,
-  MagnifyingGlass, Paperclip, PaperPlaneRight, ShieldCheck, Sparkle, Stop, Trash, WarningCircle, Wrench, X,
+  MagnifyingGlass, Paperclip, PaperPlaneRight, ShieldCheck, Sparkle, Stop, Trash, WarningCircle, Wrench, X, GlobeSimple,
   UsersThree,
 } from "@phosphor-icons/react";
 import { initialAgents } from "../data/workspace.js";
 import { IconButton } from "../components/WorkspaceSidebar.jsx";
+import { SelectControl } from "../components/SelectControl.jsx";
 import { MediaArtifactPreview } from "../components/MediaArtifactPreview.jsx";
 import { shareableArtifacts } from "../domain/artifacts.js";
 import { MessageMarkdown } from "../components/MarkdownContent.jsx";
+import { LinkPreviews } from "../components/LinkPreviews.jsx";
+import { CitationSources } from "../components/CitationSources.jsx";
 import { deduplicateAgentActivityMessages, filterTimelineMessages, groupActivityMessages, mergeTimelineMessages } from "../domain/activity.js";
 import { secureInteractiveDocument } from "../domain/interactive-artifact.js";
 import { inlineImagePreview, playableMediaKind } from "../domain/artifact-preview.js";
 import { agentStatusLabel } from "../domain/labels.js";
+import { citationsFromMarkdown } from "../domain/citations.js";
 import { channelFollowOutput, channelIsAtBottom, nextChannelPinnedState } from "../domain/channel-scroll.js";
 import { modelDisplayName, sortModelCatalog } from "../domain/model-catalog.js";
 import { runtime } from "../api/runtime.js";
@@ -169,7 +173,12 @@ export function AgentActivityView({ agents, messages, missionId,
       const actor = agents.find((agent) => agent.id === group.actorId);
       const title = events.find((entry) => entry.workItemTitle)?.workItemTitle
         || (prompt ? turnLabel(prompt, actor?.name ?? "Agent") : `Turn · ${events[0]?.time ?? ""}`);
-      return { ...group, title, events: compactExecutionSteps(events), timestamp: events[0]?.timestamp ?? 0 };
+      return {
+        ...group, title,
+        researchMode: prompt?.researchMode === "deep_research"
+          || events.some((entry) => entry.researchMode === "deep_research"),
+        events: compactExecutionSteps(events), timestamp: events[0]?.timestamp ?? 0,
+      };
     }).sort((left, right) => left.timestamp - right.timestamp);
   }, [agents, messages]);
   const timelineEvents = useMemo(() => turnGroups.flatMap((group) => group.events), [turnGroups]);
@@ -235,7 +244,7 @@ export function AgentActivityView({ agents, messages, missionId,
       }}>
         <summary className="agent-activity-turn-heading">
           <span className="agent-activity-turn-marker" aria-hidden="true" />
-          <span className="agent-activity-turn-copy"><strong>{agents.find((agent) => agent.id === turn.actorId)?.name ?? turn.events[0]?.actor ?? "Agent"} · {turn.title}</strong><small>{turn.events.length} {turn.events.length === 1 ? "update" : "updates"}</small></span>
+          <span className="agent-activity-turn-copy"><strong>{agents.find((agent) => agent.id === turn.actorId)?.name ?? turn.events[0]?.actor ?? "Agent"} · {turn.title}</strong><small className="agent-activity-turn-meta">{turn.researchMode && <span className="agent-activity-research-tag"><GlobeSimple aria-hidden="true" size={11} />Deep Research</span>}<span>{turn.events.length} {turn.events.length === 1 ? "update" : "updates"}</span></small></span>
           <time>{turn.events[0]?.time}</time>
         </summary>
         <div className="agent-activity-turn-events">
@@ -522,14 +531,17 @@ function ChannelMessage({ message, agents, artifacts, onOpenArtifact, onOpenCanv
           )}
           <time>{message.time}</time>
           {message.actorType === "agent" && <span className="agent-tag">Agent</span>}
+          {message.actorType === "human" && message.researchMode === "deep_research" && <span className="research-message-tag"><GlobeSimple size={13} />Deep Research</span>}
           {message.actorType === "agent" && message.showRunMetrics !== false && (runDuration || hasPartialTokenUsage) && <span aria-label={usageLabel} className={`message-run-usage${hasTokenUsage ? "" : " message-run-usage--incomplete"}`} title={usageLabel}>
             {[runDuration, visibleTokenUsage].filter(Boolean).join(" · ")}
           </span>}
           <button aria-live="polite" aria-label={copied ? "Message copied" : "Copy message"} className="message-copy-button" onClick={copyMessage} type="button">{copied ? <Check size={14} /> : <Copy size={14} />}</button>
         </div>
         <div className="message-markdown">
-        <MessageMarkdown>{message.text}</MessageMarkdown>
+        <MessageMarkdown externalLinkTreatment linkPreviewOnHover>{message.text}</MessageMarkdown>
         </div>
+        {message.actorType === "human" && <LinkPreviews source={message.text} />}
+        {message.actorType === "agent" && <CitationSources sources={citationsFromMarkdown(message.text)} />}
         {message.imageArtifactIds?.length > 0 && <div aria-label="Images created by this agent" className="message-generated-images">{message.imageArtifactIds.map((artifactId) => <GeneratedImage actor={message.actor} artifactId={artifactId} key={artifactId} onOpenArtifact={onOpenArtifact} />)}</div>}
         {message.interactiveArtifactIds?.map((artifactId) => <InteractiveArtifact
           artifactId={artifactId}
@@ -636,8 +648,15 @@ function InteractionCard({ interaction, onResolve }) {
     try { await onResolve(answer.trim()); }
     finally { setSubmitting(false); }
   }
+  async function resolveDecision(decision, accessScope = null) {
+    if (submitting) return;
+    setSubmitting(true);
+    try { await onResolve(decision, accessScope); }
+    finally { setSubmitting(false); }
+  }
 
   if (interaction.type === "approval") {
+    const isPublicWebRead = ["duckduckgo_search", "web_fetch"].includes(interaction.toolName);
     return (
       <section className="interaction-card interaction-card--approval" aria-label="Tool approval request">
         <div className="interaction-symbol"><WarningCircle size={23} weight="duotone" /></div>
@@ -649,8 +668,9 @@ function InteractionCard({ interaction, onResolve }) {
           <span className="interaction-resume">Only {interaction.agent} will continue after your decision.</span>
         </div>
         <div className="interaction-actions">
-          <button className="button button--quiet" onClick={() => onResolve("Denied")} type="button">Deny</button>
-          <button className="button button--primary" onClick={() => onResolve("Approved once")} type="button">Approve once</button>
+          <button className="button button--quiet" disabled={submitting} onClick={() => void resolveDecision("Denied")} type="button">Deny</button>
+          <button className="button button--primary" disabled={submitting} onClick={() => void resolveDecision("Approved once")} type="button">Approve once</button>
+          {isPublicWebRead && <details className="approval-scope-menu"><summary className="button button--quiet">More approval options</summary><div className="approval-scope-options"><p>Allow read-only public web access until you revoke it.</p><button className="button button--quiet" disabled={submitting} onClick={() => void resolveDecision("Approved once", "chat")} type="button">Allow for this chat</button><button className="button button--quiet" disabled={submitting} onClick={() => void resolveDecision("Approved once", "project")} type="button">Allow for this project</button><button className="button button--quiet" disabled={submitting} onClick={() => void resolveDecision("Approved once", "workspace")} type="button">Allow across workspace</button></div></details>}
         </div>
       </section>
     );
@@ -697,6 +717,7 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
   const [canvasContext, setCanvasContext] = useState(null);
   const [attachments, setAttachments] = useState([]);
   const [sending, setSending] = useState(false);
+  const [deepResearch, setDeepResearch] = useState(false);
   const [modelCatalog, setModelCatalog] = useState([]);
   const [defaultModel, setDefaultModel] = useState(null);
   const [modelPreference, setModelPreference] = useState("");
@@ -794,12 +815,13 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
     if ((!value.trim() && attachments.length === 0) || sending) return;
     setSending(true);
     try {
-      const saved = await onSend(value.trim() || "Please review the attached files.", recipient?.id ?? null, canvasContext, attachments);
+      const saved = await onSend(value.trim() || "Please review the attached files.", recipient?.id ?? null, canvasContext, attachments, { deepResearch });
       if (saved === false) return;
       setValue("");
       setRecipient(null);
       setCanvasContext(null);
       setAttachments([]);
+      setDeepResearch(false);
     } finally {
       setSending(false);
     }
@@ -918,12 +940,14 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
       />
       <div className="composer-tools">
         <IconButton label="Attach a file" onClick={() => onAttach((attachment) => setAttachments((current) => current.some((item) => item.id === attachment.id) ? current : [...current, attachment]))}><Paperclip size={19} /></IconButton>
+        <button aria-pressed={deepResearch} className={`research-mode-toggle research-mode-toggle--project${deepResearch ? " research-mode-toggle--active" : ""}`} disabled={sending} onClick={() => { if (!deepResearch) setRecipient(null); setDeepResearch((value) => !value); }} title="The Planner leads the investigation and assigns focused work to selected project roles with web access." type="button"><GlobeSimple aria-hidden="true" size={15} /><span>Deep Research</span></button>
         {agents.length > 0 && <div className="composer-recipient-menu-wrap" ref={recipientMenuRef}>
           <IconButton
             aria-expanded={recipientMenuOpen}
             aria-haspopup="dialog"
             className={`composer-recipient-trigger${recipient || recipientMenuOpen ? " composer-recipient-trigger--active" : ""}`}
-            label={recipient ? `Message ${recipient.name}` : "Choose message recipient · Team"}
+            disabled={deepResearch}
+            label={deepResearch ? "Deep Research is routed to the project team" : recipient ? `Message ${recipient.name}` : "Choose message recipient · Team"}
             onClick={() => setRecipientMenuOpen((open) => !open)}
           >
             <UsersThree size={18} weight={recipient ? "fill" : "regular"} />
@@ -1021,11 +1045,7 @@ function MissionOutcomeReview({ messages, onReview }) {
         <span>{latest ? latest.text : "Record whether this result met the goal."}</span>
       </div>
       <form onSubmit={submit}>
-        <select aria-label="Chat outcome" onChange={(event) => setOutcome(event.target.value)} value={outcome}>
-          <option value="accepted">Accepted</option>
-          <option value="follow_up">Needs follow-up</option>
-          <option value="rejected">Rejected</option>
-        </select>
+        <SelectControl aria-label="Chat outcome" onChange={setOutcome} options={[{ value: "accepted", label: "Accepted" }, { value: "follow_up", label: "Needs follow-up" }, { value: "rejected", label: "Rejected" }]} size="regular" value={outcome} />
         <input aria-label="Outcome notes" maxLength={5000} onChange={(event) => setNotes(event.target.value)} placeholder="Optional note" value={notes} />
         <button className="button button--subtle" disabled={saving} type="submit">{saving ? "Saving…" : latest ? "Update review" : "Save review"}</button>
       </form>

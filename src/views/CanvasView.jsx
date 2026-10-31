@@ -7,6 +7,7 @@ import { findTextQuoteRange, rangeAtTextOffsets, textSelectionOffsets } from "..
 import { runtime } from "../api/runtime.js";
 import { DiagramPreview } from "../components/DiagramPreview.jsx";
 import { IconButton } from "../components/WorkspaceSidebar.jsx";
+import { SelectControl } from "../components/SelectControl.jsx";
 import { MarkdownContent } from "../components/MarkdownContent.jsx";
 import { ReadOnlyCodeEditor } from "../components/ReadOnlyCodeEditor.jsx";
 
@@ -78,7 +79,7 @@ export function CanvasView({ document: summary, refreshKey = 0, onBack, backLabe
   const [recoveredDraft, setRecoveredDraft] = useState(null);
   const [viewRevision, setViewRevision] = useState(null);
   const [historyContent, setHistoryContent] = useState(null);
-  const [mode, setMode] = useState("edit");
+  const [mode, setMode] = useState("preview");
   const [selection, setSelection] = useState({ quote: "", startOffset: null, endOffset: null });
   const [commentBody, setCommentBody] = useState("");
   const [assignee, setAssignee] = useState("");
@@ -505,15 +506,22 @@ export function CanvasView({ document: summary, refreshKey = 0, onBack, backLabe
     draft: !historical && dirtyRef.current,
   });
   return <section className="tab-panel detail-view canvas-view">
-    <div className="canvas-topbar"><IconButton label={backLabel} onClick={onBack}><ArrowLeft size={16} /></IconButton><span>{detail.kind} · Revision {viewRevision ?? detail.revision}</span>
-      <IconButton disabled={!onDiscuss} label="Discuss in chat" onClick={discussDocument}><ChatCircleDots size={16} /></IconButton>
-      <IconButton label={`Download ${dirtyRef.current && !historical ? "draft" : "document"}`} onClick={() => downloadCanvasDocument(exportDocument, exportFilename)}><DownloadSimple size={16} /></IconButton>
-      {exportDocument.kind === "diagram" && <IconButton disabled={svgExporting} label={svgExporting ? "Preparing SVG" : "Download SVG"} onClick={() => void exportDiagramSvg(exportDocument, canvasFilename(exportDocument, { revision: historical ? viewRevision : detail.revision, draft: !historical && dirtyRef.current, format: "svg" }))}><DownloadSimple size={16} /></IconButton>}
-      <label>History <select aria-label="Document revision history" onChange={(event) => void loadVersion(Number(event.target.value))} value={viewRevision ?? detail.revision}>{detail.versions.map((version) => <option key={version.revision} value={version.revision}>Revision {version.revision} · {version.author}</option>)}</select></label>
-      {historical ? <button className="button button--primary" disabled={saving} onClick={() => { setDraft(historyContent); dirtyRef.current = true; setViewRevision(null); setHistoryContent(null); }} type="button">Restore as new revision</button>
-        : <button className="button button--primary" disabled={saving || !dirtyRef.current} onClick={() => void save()} type="button">{saving ? "Saving…" : "Save changes"}</button>}
+    <div className="canvas-topbar"><IconButton label={backLabel} onClick={onBack}><ArrowLeft size={16} /></IconButton>
+      <div className="canvas-document-meta"><span>Shared document</span><small>{detail.kind} · Revision {viewRevision ?? detail.revision}</small></div>
+      <div className="canvas-toolbar-actions">
+        <label>History <SelectControl aria-label="Document revision history" onChange={(value) => void loadVersion(Number(value))} options={detail.versions.map((version) => ({ value: version.revision, label: `Revision ${version.revision} · ${version.author}` }))} size="regular" value={viewRevision ?? detail.revision} /></label>
+        <button aria-expanded={commentNavigatorOpen} className="canvas-comments-toggle" disabled={mode === "edit" && !historical} onClick={() => commentNavigatorOpen ? setCommentNavigatorOpen(false) : openCommentNavigator()} ref={commentToggleRef} type="button"><ChatCircleDots size={15} /> Comments <span>{detail.threads.length + commentDrafts.length}</span></button>
+        <IconButton disabled={!onDiscuss} label="Discuss in chat" onClick={discussDocument}><ChatCircleDots size={16} /></IconButton>
+        {exportDocument.kind === "diagram" && <IconButton disabled={svgExporting} label={svgExporting ? "Preparing SVG" : "Download SVG"} onClick={() => void exportDiagramSvg(exportDocument, canvasFilename(exportDocument, { revision: historical ? viewRevision : detail.revision, draft: !historical && dirtyRef.current, format: "svg" }))}><DownloadSimple size={16} /></IconButton>}
+        <IconButton label={`Download ${dirtyRef.current && !historical ? "draft" : "document"}`} onClick={() => downloadCanvasDocument(exportDocument, exportFilename)}><DownloadSimple size={16} /></IconButton>
+        {historical ? <button className="button button--primary" disabled={saving} onClick={() => { setDraft(historyContent); dirtyRef.current = true; setViewRevision(null); setHistoryContent(null); setMode("edit"); }} type="button">Restore as new revision</button>
+          : mode === "edit" ? <><button className="button button--quiet" onClick={() => setMode("preview")} type="button">Preview</button><button className="button button--primary" disabled={saving || !dirtyRef.current} onClick={() => void save()} type="button">{saving ? "Saving…" : "Save changes"}</button></>
+            : <button className="button button--quiet" onClick={() => setMode("edit")} type="button">Edit</button>}
+      </div>
     </div>
-    <div className="canvas-title-row"><div><span className="eyebrow">Shared document · {summary.mission_title}</span><input aria-label="Document title" disabled={historical} maxLength={240} onChange={(event) => { setDraft({ ...draft, title: event.target.value }); dirtyRef.current = true; }} value={historical ? shown.title : draft.title} /></div><div className="canvas-title-actions"><button aria-expanded={commentNavigatorOpen} className="canvas-comments-toggle" disabled={mode === "edit" && !historical} onClick={() => commentNavigatorOpen ? setCommentNavigatorOpen(false) : openCommentNavigator()} ref={commentToggleRef} type="button"><ChatCircleDots size={15} /> Comments <span>{detail.threads.length + commentDrafts.length}</span></button><div className="canvas-mode-switch"><button aria-pressed={mode === "edit"} className={mode === "edit" ? "active" : ""} onClick={() => setMode("edit")} type="button">Edit</button><button aria-pressed={mode === "preview"} className={mode === "preview" ? "active" : ""} onClick={() => setMode("preview")} type="button">Preview</button></div></div></div>
+    <div className="canvas-title-row"><div>{mode === "edit" && !historical
+      ? <input aria-label="Document title" maxLength={240} onChange={(event) => { setDraft({ ...draft, title: event.target.value }); dirtyRef.current = true; }} value={draft.title} />
+      : <h1>{shown.title}</h1>}</div></div>
     {recoveredDraft && <div className={`canvas-draft-recovery ${recoveredDraft.baseRevision !== recoveredDraft.currentRevision ? "canvas-draft-recovery--stale" : ""}`} role="status">
       <div><strong>Unsaved changes recovered</strong><span>{recoveredDraft.baseRevision === recoveredDraft.currentRevision
         ? `Restored from revision ${recoveredDraft.baseRevision}.`

@@ -45,6 +45,9 @@ async function requestBlob(path) {
 }
 
 export const runtime = {
+  getLinkPreviews: (urls) => request("/api/link-previews", {
+    method: "POST", body: JSON.stringify({ urls }),
+  }),
   bootstrap: (projectId, missionId, keepMissionEmpty = false) => {
     const params = new URLSearchParams();
     if (projectId) params.set("project", projectId);
@@ -126,8 +129,8 @@ export const runtime = {
       source.close();
     };
   },
-  createMission: (projectId, title, goal, recipeId = null, initialMessage = null, selectedSkills = [], modelPreference = null, effortPreference = null, recipeVersion = null) => request("/api/missions", {
-    method: "POST", body: JSON.stringify({ projectId, title, goal, recipeId, initialMessage, selectedSkills, modelPreference, effortPreference, recipeVersion }),
+  createMission: (projectId, title, goal, recipeId = null, initialMessage = null, selectedSkills = [], modelPreference = null, effortPreference = null, recipeVersion = null, options = {}) => request("/api/missions", {
+    method: "POST", body: JSON.stringify({ projectId, title, goal, recipeId, initialMessage, selectedSkills, modelPreference, effortPreference, recipeVersion, deepResearch: Boolean(options.deepResearch) }),
   }),
   createGeneralChat: () => request("/api/general-chats", {
     method: "POST", body: JSON.stringify({}),
@@ -136,8 +139,8 @@ export const runtime = {
   setGeneralChatModelPreference: (chatId, modelPreference) => request(`/api/general-chats/${encodeURIComponent(chatId)}/preferences`, {
     method: "PUT", body: JSON.stringify({ modelPreference }),
   }),
-  sendGeneralChatMessage: (chatId, text) => request(`/api/general-chats/${encodeURIComponent(chatId)}/messages`, {
-    method: "POST", body: JSON.stringify({ text }),
+  sendGeneralChatMessage: (chatId, text, options = {}) => request(`/api/general-chats/${encodeURIComponent(chatId)}/messages`, {
+    method: "POST", body: JSON.stringify({ text, mode: options.deepResearch ? "deep_research" : "chat" }),
   }),
   deleteGeneralChat: (chatId) => request(`/api/general-chats/${encodeURIComponent(chatId)}`, {
     method: "DELETE",
@@ -358,8 +361,8 @@ export const runtime = {
   restoreKnowledge: (knowledgeId, missionId) => request(`/api/knowledge/${encodeURIComponent(knowledgeId)}/restore`, {
     method: "POST", body: JSON.stringify({ missionId }),
   }),
-  sendMessage: (missionId, text, recipient = null, canvasDocument = null, attachments = []) => request("/api/messages", {
-    method: "POST", body: JSON.stringify({ missionId, text, recipient, canvasDocument, attachments }),
+  sendMessage: (missionId, text, recipient = null, canvasDocument = null, attachments = [], options = {}) => request("/api/messages", {
+    method: "POST", body: JSON.stringify({ missionId, text, recipient, canvasDocument, attachments, deepResearch: Boolean(options.deepResearch) }),
   }),
   uploadArtifact: (missionId, name, mediaType, contentBase64) => request("/api/artifacts", {
     method: "POST", body: JSON.stringify({ missionId, name, mediaType, contentBase64, createdBy: "user" }),
@@ -415,10 +418,12 @@ export const runtime = {
   reopenArtifactReviewThread: (threadId) => request(`/api/artifact-review-threads/${encodeURIComponent(threadId)}/reopen`, {
     method: "POST", body: JSON.stringify({ actorId: "user" }),
   }),
-  resolveInteraction: (id, resolution) => request(`/api/interactions/${encodeURIComponent(id)}/resolve`, {
-    method: "POST", body: JSON.stringify({ resolution }),
+  resolveInteraction: (id, resolution, accessScope = null) => request(`/api/interactions/${encodeURIComponent(id)}/resolve`, {
+    method: "POST", body: JSON.stringify({ resolution, accessScope }),
   }),
   listPendingInteractions: () => request("/api/interactions/pending"),
+  listAccessGrants: () => request("/api/access-grants"),
+  revokeAccessGrant: (id) => request(`/api/access-grants/${encodeURIComponent(id)}`, { method: "DELETE" }),
   getProjectCommandTools: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/command-tools`),
   saveProjectCommandTools: (projectId, executables) => request(`/api/projects/${encodeURIComponent(projectId)}/command-tools`, {
     method: "PUT", body: JSON.stringify({ executables }),

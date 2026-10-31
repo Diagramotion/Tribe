@@ -24,15 +24,19 @@ class GeneralChatService:
         with self._locks_guard:
             return self._chat_locks.setdefault(chat_id, threading.Lock())
 
-    def send(self, chat_id: str, text: str) -> dict[str, Any]:
+    def send(self, chat_id: str, text: str, mode: str = "chat") -> dict[str, Any]:
         if not isinstance(text, str) or not text.strip() or len(text) > 100_000:
             raise ValueError("general_chat_message_invalid")
+        if not isinstance(mode, str) or mode not in {"chat", "deep_research"}:
+            raise ValueError("general_chat_mode_invalid")
         with self._lock_for(chat_id):
             chat = self.store.general_chat(chat_id)
             if not chat:
                 raise ValueError("general_chat_not_found")
+            if mode == "deep_research" and (self.store.get_setting("web_search_preference") or "automatic") == "off":
+                return {"chat": chat, "responseError": "web_search_disabled"}
             previous = chat["messages"]
-            self.store.append_general_chat_message(chat_id, "user", text)
+            self.store.append_general_chat_message(chat_id, "user", text, mode=mode)
             model = (chat.get("model_preference") or self.store.get_setting("model")
                      or os.environ.get("TRIBE_MODEL") or "").strip()
             if not model:
@@ -42,7 +46,10 @@ class GeneralChatService:
                 }
 
             try:
-                result, duration_ms = self._run(model, text, previous)
+                result, duration_ms = (
+                    self._run(model, text, previous, deep_research=True)
+                    if mode == "deep_research" else self._run(model, text, previous)
+                )
                 usage = result.usage
                 usage = usage() if callable(usage) else usage
                 self.store.append_general_chat_message(
@@ -50,6 +57,7 @@ class GeneralChatService:
                     self._usage_value(usage, "input_tokens"),
                     self._usage_value(usage, "output_tokens"),
                     sources=self._sources_from_result(result),
+                    mode=mode,
                 )
             except Exception as error:  # noqa: BLE001 - preserve the user message and return safe provider errors
                 try:
@@ -98,7 +106,7 @@ class GeneralChatService:
                 break
         return sources
 
-    def _build_agent(self, model: str):
+    def _build_agent(self, model: str, deep_research: bool = False):
         from pydantic_ai import Agent
         from pydantic_ai.capabilities import Citations, WebSearch
         from .agent_runtime import _model_for_identifier, _resolved_provider_base_url
@@ -145,14 +153,24 @@ class GeneralChatService:
                 "unless needed for the request. Never present recalled "
                 "figures as sourced. If no "
                 "suitable data is available, say so and ask for the dataset or sourced values before charting."
+                + (
+                    " Deep Research is selected for this turn: investigate the question using available web search, "
+                    "compare relevant and credible sources, and produce a structured report with a short summary, "
+                    "key findings, limitations or disagreements, and a conclusion. Add inline Markdown citations "
+                    "to the source pages for material factual claims; never fabricate URLs or claim a search that "
+                    "did not happen. Include a chart JSON block when sourced data makes a chart useful. "
+                    "This remains a projectless chat: use only the explicitly available workspace web search, "
+                    "with no local files, skills, repositories, shell, computer controls, team or workflow access."
+                    if deep_research else ""
+                )
             ),
         )
         return agent
 
-    def _run(self, model: str, prompt: str, previous: list[dict[str, Any]]):
+    def _run(self, model: str, prompt: str, previous: list[dict[str, Any]], deep_research: bool = False):
         from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
-        agent = self._build_agent(model)
+        agent = self._build_agent(model, deep_research=deep_research)
         history = []
         retained = 0
         for message in reversed(previous):

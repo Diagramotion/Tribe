@@ -32,7 +32,7 @@ from .canvas import comment_publications, document_publications, validate_conten
 from .credentials import provider_for_model
 from .tool_activity import node_test_run_evidence
 
-SCHEMA_VERSION = 42
+SCHEMA_VERSION = 43
 MAX_AGENT_RETRY_WINDOW_SECONDS = 24 * 60 * 60
 DEFAULT_AGENT_RUN_TOKEN_LIMIT: int | None = None
 TERMINAL_AGENT_RUN_STATUSES = {"completed", "failed", "interrupted"}
@@ -528,6 +528,7 @@ class MissionStore:
                     role TEXT NOT NULL CHECK(role IN ('user','assistant')),
                     body TEXT NOT NULL, model TEXT, duration_ms INTEGER,
                     sources TEXT NOT NULL DEFAULT '[]',
+                    mode TEXT NOT NULL DEFAULT 'chat',
                     input_tokens INTEGER, output_tokens INTEGER, created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS general_chat_messages_order
@@ -554,6 +555,20 @@ class MissionStore:
                     status TEXT NOT NULL DEFAULT 'pending', requested_by TEXT NOT NULL,
                     created_at TEXT NOT NULL, resolved_at TEXT, resolution TEXT
                 );
+                CREATE TABLE IF NOT EXISTS access_grants (
+                    id TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL CHECK(scope IN ('chat','project','workspace')),
+                    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+                    mission_id TEXT REFERENCES missions(id) ON DELETE CASCADE,
+                    capability TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    revoked_at TEXT,
+                    CHECK((scope = 'chat' AND mission_id IS NOT NULL AND project_id IS NOT NULL)
+                       OR (scope = 'project' AND project_id IS NOT NULL AND mission_id IS NULL)
+                       OR (scope = 'workspace' AND project_id IS NULL AND mission_id IS NULL))
+                );
+                CREATE INDEX IF NOT EXISTS access_grants_lookup
+                    ON access_grants(capability, scope, project_id, mission_id, revoked_at);
                 CREATE TABLE IF NOT EXISTS artifacts (
                     id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, name TEXT NOT NULL,
                     media_type TEXT NOT NULL, path TEXT NOT NULL, created_by TEXT NOT NULL,
@@ -927,6 +942,8 @@ class MissionStore:
                 }
                 if "sources" not in general_chat_message_columns:
                     db.execute("ALTER TABLE general_chat_messages ADD COLUMN sources TEXT NOT NULL DEFAULT '[]'")
+                if "mode" not in general_chat_message_columns:
+                    db.execute("ALTER TABLE general_chat_messages ADD COLUMN mode TEXT NOT NULL DEFAULT 'chat'")
                 db.execute(
                     "UPDATE scheduled_runs SET invocation_started_at=started_at "
                     "WHERE status IN ('running','paused','blocked') AND invocation_started_at IS NULL"
@@ -1374,7 +1391,8 @@ class MissionStore:
                        initial_message: str | None = None,
                        selected_skills: list[str] | None = None,
                        model_preference: str | None = None,
-                       effort_preference: str | None = None) -> dict[str, Any]:
+                       effort_preference: str | None = None,
+                       deep_research: bool = False) -> dict[str, Any]:
         self._validate_mission_model_preferences(model_preference, effort_preference)
         mission = {"id": str(uuid.uuid4()), "project_id": project_id, "title": title,
                    "goal": goal, "status": "active", "created_at": now(),
@@ -1412,9 +1430,10 @@ class MissionStore:
             event_payload["hasInitialMessage"] = bool(initial_message)
             self._append(db, "mission.created", "user", mission["id"], event_payload)
             if initial_message:
-                self._append(db, "message.created", "user", mission["id"], {
-                    "text": initial_message, "recipient": None,
-                })
+                message_payload = {"text": initial_message, "recipient": None}
+                if deep_research:
+                    message_payload["researchMode"] = "deep_research"
+                self._append(db, "message.created", "user", mission["id"], message_payload)
             db.commit()
         return mission
 
@@ -1844,12 +1863,12 @@ class MissionStore:
     def _schedule_due(cadence: str, zone: ZoneInfo, delivery_time: str, after: datetime,
                       cron_expression: str = "") -> datetime:
         local = after.astimezone(zone)
-        if cadence == "cron":
+        if cadence == "once":
+            return after.astimezone(UTC)
+        if cadence == "cron" or cron_expression.strip():
             return _next_cron_occurrence(cron_expression, zone, after)
         if cadence == "hourly":
             return after.astimezone(UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        if cadence == "once":
-            return after.astimezone(UTC)
         target_time = time.fromisoformat(delivery_time)
         if cadence == "monthly":
             day = local.date().replace(day=1)
@@ -1928,7 +1947,9 @@ class MissionStore:
                 raise ValueError
         except (TypeError, ValueError) as error:
             raise ValueError("delivery_time_must_be_HH_MM") from error
-        if cadence == "cron":
+        if cadence == "once" and cron_expression.strip():
+            raise ValueError("one_time_schedule_cannot_have_cron_expression")
+        if cadence == "cron" or cron_expression.strip():
             _parse_cron_expression(cron_expression)
             return zone, MissionStore._schedule_due(cadence, zone, delivery_time, current, cron_expression)
         if cadence != "once":
@@ -1958,7 +1979,7 @@ class MissionStore:
         stamp = now()
         schedule = {"id": str(uuid.uuid4()), "project_id": project_id, "title": title.strip(), "prompt": prompt.strip(),
                     "cadence": cadence, "timezone": timezone, "delivery_time": delivery_time,
-                    "cron_expression": cron_expression.strip() if cadence == "cron" else "",
+                    "cron_expression": cron_expression.strip(),
                     "target_mission_id": target_mission_id or "",
                     "next_run_at": due.isoformat(),
                     "status": "active", "created_at": stamp, "updated_at": stamp}
@@ -2052,7 +2073,7 @@ class MissionStore:
                    next_run_at=?,updated_at=? WHERE id=?""",
                 ("active" if row["status"] == "failed" else row["status"],
                  title.strip(), prompt.strip(), cadence, timezone, delivery_time,
-                 cron_expression.strip() if cadence == "cron" else "",
+                 cron_expression.strip(),
                  effective_target or "",
                  due.isoformat(), now(), schedule_id),
             )
@@ -2561,7 +2582,7 @@ class MissionStore:
             chat = dict(row)
             chat["messages"] = []
             for message_row in db.execute(
-                "SELECT id,role,body,model,duration_ms,sources,input_tokens,output_tokens,created_at "
+                "SELECT id,role,body,model,duration_ms,sources,mode,input_tokens,output_tokens,created_at "
                 "FROM general_chat_messages WHERE chat_id=? ORDER BY created_at,id", (chat_id,),
             ):
                 message = dict(message_row)
@@ -2590,6 +2611,7 @@ class MissionStore:
         self, chat_id: str, role: str, body: str, model: str | None = None,
         duration_ms: int | None = None, input_tokens: int | None = None,
         output_tokens: int | None = None, sources: list[dict[str, str]] | None = None,
+        mode: str = "chat",
     ) -> dict[str, Any]:
         if role not in {"user", "assistant"}:
             raise ValueError("general_chat_role_invalid")
@@ -2597,6 +2619,8 @@ class MissionStore:
             raise ValueError("general_chat_message_invalid")
         if duration_ms is not None and (not isinstance(duration_ms, int) or duration_ms < 0):
             raise ValueError("general_chat_duration_invalid")
+        if not isinstance(mode, str) or mode not in {"chat", "deep_research"}:
+            raise ValueError("general_chat_mode_invalid")
         for value in (input_tokens, output_tokens):
             if value is not None and (not isinstance(value, int) or value < 0):
                 raise ValueError("general_chat_usage_invalid")
@@ -2619,7 +2643,8 @@ class MissionStore:
         message = {
             "id": str(uuid.uuid4()), "chat_id": chat_id, "role": role, "body": body,
             "model": model, "duration_ms": duration_ms, "input_tokens": input_tokens,
-            "output_tokens": output_tokens, "sources": normalized_sources, "created_at": now(),
+            "output_tokens": output_tokens, "sources": normalized_sources,
+            "mode": mode, "created_at": now(),
         }
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -2629,11 +2654,11 @@ class MissionStore:
                 raise ValueError("general_chat_not_found")
             db.execute(
                 "INSERT INTO general_chat_messages "
-                "(id,chat_id,role,body,model,duration_ms,sources,input_tokens,output_tokens,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "(id,chat_id,role,body,model,duration_ms,sources,mode,input_tokens,output_tokens,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (message["id"], message["chat_id"], message["role"], message["body"],
                  message["model"], message["duration_ms"], json.dumps(normalized_sources),
-                 message["input_tokens"], message["output_tokens"], message["created_at"]),
+                 message["mode"], message["input_tokens"], message["output_tokens"], message["created_at"]),
             )
             if role == "user" and chat["title"] == "New chat":
                 title = " ".join(body.split())[:80]
@@ -6391,7 +6416,7 @@ class MissionStore:
             )
             self._append(
                 db, "interaction.approval.requested", requested_by, mission_id,
-                {"interaction": interaction},
+                {"interaction": {**interaction, "tool_name": tool_name}},
             )
             self._append(db, "agent.tool.waiting_for_user", requested_by, mission_id, {
                 "toolName": tool_name, "toolCallId": tool_call_id,
@@ -6411,10 +6436,12 @@ class MissionStore:
                 SELECT interactions.*, missions.title AS mission_title,
                        missions.goal AS mission_goal, missions.status AS mission_status,
                        projects.id AS project_id, projects.name AS project_name,
-                       projects.goal AS project_goal, projects.repository AS repository
+                       projects.goal AS project_goal, projects.repository AS repository,
+                       deferred_tool_approvals.tool_name AS tool_name
                 FROM interactions
                 JOIN missions ON missions.id = interactions.mission_id
                 JOIN projects ON projects.id = missions.project_id
+                LEFT JOIN deferred_tool_approvals ON deferred_tool_approvals.interaction_id = interactions.id
                 WHERE interactions.status = 'pending'
                 ORDER BY interactions.created_at ASC, interactions.id ASC
             """).fetchall()
@@ -7055,11 +7082,13 @@ class MissionStore:
             return updated, event
 
     def append_agent_update(self, mission_id: str, agent_id: str, text: str,
-                            recipient: str | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+                            recipient: str | None = None, metadata: dict[str, Any] | None = None,
+                            visible_text: str | None = None) -> dict[str, Any]:
         """Append an agent post and its Canvas publications in one transaction."""
         documents = document_publications(text)
         comments = comment_publications(text)
-        visible = visible_message(text) or (
+        visible = visible_text if visible_text is not None else visible_message(text)
+        visible = visible or (
             "Shared a document." if documents else "Added a document comment."
         )
         payload = {"text": visible, "recipient": recipient,
@@ -7158,7 +7187,9 @@ class MissionStore:
             db.commit()
             return event
 
-    def resolve_interaction(self, interaction_id: str, resolution: str) -> dict[str, Any] | None:
+    def resolve_interaction(
+        self, interaction_id: str, resolution: str, access_scope: str | None = None,
+    ) -> dict[str, Any] | None:
         if not resolution.strip() or len(resolution) > 5000:
             raise ValueError("resolution must be 1 to 5000 characters")
         with self._lock, self._connect() as db:
@@ -7168,9 +7199,62 @@ class MissionStore:
                 db.rollback()
                 return None
             interaction = dict(row)
+            grant = None
+            if access_scope is not None:
+                if not isinstance(access_scope, str) or access_scope not in {"chat", "project", "workspace"}:
+                    db.rollback()
+                    raise ValueError("invalid_access_scope")
+                if resolution != "approved_once":
+                    db.rollback()
+                    raise ValueError("persistent_access_requires_approval")
+                deferred = db.execute(
+                    "SELECT tool_name FROM deferred_tool_approvals WHERE interaction_id = ?",
+                    (interaction_id,),
+                ).fetchone()
+                if interaction["interaction_type"] != "approval" or not deferred or deferred["tool_name"] not in {
+                    "duckduckgo_search", "web_fetch",
+                }:
+                    db.rollback()
+                    raise ValueError("persistent_access_only_available_for_public_web_reads")
+                mission = db.execute(
+                    "SELECT project_id FROM missions WHERE id = ?", (interaction["mission_id"],),
+                ).fetchone()
+                if not mission:
+                    db.rollback()
+                    raise ValueError("mission_not_found")
+                project_id = mission["project_id"]
+                grant_project_id = project_id if access_scope in {"chat", "project"} else None
+                grant_mission_id = interaction["mission_id"] if access_scope == "chat" else None
+                existing = db.execute(
+                    """SELECT id FROM access_grants WHERE scope = ? AND capability = 'public_web_read'
+                       AND project_id IS ? AND mission_id IS ?""",
+                    (access_scope, grant_project_id, grant_mission_id),
+                ).fetchone()
+                timestamp = now()
+                if existing:
+                    grant_id = existing["id"]
+                    db.execute(
+                        "UPDATE access_grants SET revoked_at = NULL, created_at = ? WHERE id = ?",
+                        (timestamp, grant_id),
+                    )
+                else:
+                    grant_id = str(uuid.uuid4())
+                    db.execute(
+                        """INSERT INTO access_grants
+                           (id, scope, project_id, mission_id, capability, created_at, revoked_at)
+                           VALUES (?, ?, ?, ?, 'public_web_read', ?, NULL)""",
+                        (grant_id, access_scope, grant_project_id, grant_mission_id, timestamp),
+                    )
+                grant = {
+                    "id": grant_id, "scope": access_scope,
+                    "project_id": grant_project_id, "mission_id": grant_mission_id,
+                    "capability": "public_web_read", "created_at": timestamp,
+                }
             timestamp = now()
             db.execute("UPDATE interactions SET status = 'resolved', resolved_at = ?, resolution = ? WHERE id = ?", (timestamp, resolution, interaction_id))
             interaction.update(status="resolved", resolved_at=timestamp, resolution=resolution)
+            if grant:
+                interaction["access_grant"] = grant
             interaction["event"] = self._append(
                 db,
                 f"interaction.{interaction['interaction_type']}.resolved",
@@ -7193,6 +7277,47 @@ class MissionStore:
                 )
             db.commit()
             return interaction
+
+    def has_access_grant(self, mission_id: str, project_id: str, capability: str) -> bool:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT 1 FROM access_grants
+                   WHERE capability = ? AND revoked_at IS NULL AND (
+                     scope = 'workspace' OR (scope = 'project' AND project_id = ?)
+                     OR (scope = 'chat' AND mission_id = ? AND project_id = ?)
+                   ) LIMIT 1""",
+                (capability, project_id, mission_id, project_id),
+            ).fetchone()
+            return row is not None
+
+    def list_access_grants(self) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT g.*, p.name AS project_name, m.title AS mission_title
+                   FROM access_grants g
+                   LEFT JOIN projects p ON p.id = g.project_id
+                   LEFT JOIN missions m ON m.id = g.mission_id
+                   WHERE g.revoked_at IS NULL
+                   ORDER BY CASE g.scope WHEN 'workspace' THEN 0 WHEN 'project' THEN 1 ELSE 2 END,
+                            g.created_at DESC"""
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def revoke_access_grant(self, grant_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM access_grants WHERE id = ? AND revoked_at IS NULL", (grant_id,),
+            ).fetchone()
+            if not row:
+                db.rollback()
+                return None
+            revoked_at = now()
+            db.execute("UPDATE access_grants SET revoked_at = ? WHERE id = ?", (revoked_at, grant_id))
+            grant = dict(row)
+            grant["revoked_at"] = revoked_at
+            db.commit()
+            return grant
 
 
 def default_data_directory() -> Path:

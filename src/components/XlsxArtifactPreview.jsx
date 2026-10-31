@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ArrowLineDown, MagnifyingGlass, PaperPlaneRight } from "@phosphor-icons/react";
 import { runtime } from "../api/runtime.js";
+import { SelectControl } from "./SelectControl.jsx";
 
 function columnName(index) {
   let number = index + 1;
@@ -169,15 +170,10 @@ export function XlsxArtifactPreview({ artifact, canSendSelection, onUseSelection
   return <section aria-label={`${artifact.name} workbook`} className="xlsx-artifact-view">
     <div className="xlsx-artifact-toolbar">
       <label><span>Header rows</span>
-        <select aria-label="Choose header row count" onChange={(event) => { setHeaderRows(Number(event.target.value)); setOffset(0); }} value={headerRows}>
-          {[1, 2, 3, 4, 5].map((count) => <option key={count} value={count}>{count}</option>)}
-        </select>
+        <SelectControl aria-label="Choose header row count" onChange={(value) => { setHeaderRows(Number(value)); setOffset(0); }} options={[1, 2, 3, 4, 5].map((count) => ({ value: count, label: String(count) }))} size="compact" value={headerRows} />
       </label>
       <label><span>Worksheet</span>
-        <select aria-label="Choose worksheet" onChange={(event) => { setSheet(event.target.value); setOffset(0); }} value={sheet || preview?.sheet || ""}>
-          {sheet && !(preview?.sheets ?? []).includes(sheet) && <option value={sheet}>{sheet}</option>}
-          {(preview?.sheets ?? []).map((name) => <option key={name} value={name}>{name}</option>)}
-        </select>
+        <SelectControl aria-label="Choose worksheet" onChange={(value) => { setSheet(value); setOffset(0); }} options={[...(sheet && !(preview?.sheets ?? []).includes(sheet) ? [{ value: sheet, label: sheet }] : []), ...(preview?.sheets ?? []).map((name) => ({ value: name, label: name }))]} size="regular" value={sheet || preview?.sheet || ""} />
       </label>
       <span className="xlsx-artifact-note">Click a cell, then Shift-click another to select a range.</span>
       {preview?.sheetsTruncated && <form className="xlsx-sheet-name-form" onSubmit={(event) => { event.preventDefault(); const value = sheetQuery.trim(); if (value) { setSheet(value); setOffset(0); } }}>

@@ -3,6 +3,7 @@ import test, { after, before } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
+import { citationsFromMarkdown } from "../src/domain/citations.js";
 
 let vite;
 const hmrPort = 40_000 + (process.pid % 5_000) * 3 + 4;
@@ -64,4 +65,33 @@ test("a new projectless chat uses the centred landing composer and shows its wor
   assert.match(html, /No project/);
   assert.match(html, /No local machine access/);
   assert.match(html, /Model: Auto/);
+  assert.match(html, /aria-pressed="false" class="research-mode-toggle"/);
+  assert.match(html, /Deep Research/);
+  assert.match(html, /workspace web search only, no team or local access/);
+  assert.match(html, /Uses workspace web search only\. This chat has no project team, workflow or local machine access\./);
+});
+
+test("projectless research turns retain their mode label and source links", () => {
+  const html = renderToStaticMarkup(React.createElement(GeneralChatView, {
+    chat: {
+      id: "general-chat-research", title: "Research question", model_preference: null,
+      messages: [
+        { id: "user-1", role: "user", mode: "deep_research", body: "Compare two approaches." },
+        { id: "assistant-1", role: "assistant", mode: "deep_research", body: "Evidence supports the first approach.", sources: [{ title: "Study", domain: "example.org", url: "https://example.org/study" }] },
+      ],
+    },
+    getModelCatalog: async () => ({ models: [], defaultModel: null }),
+    onModelPreferenceChange: async () => {}, onSend: async () => null, onConnectModel() {},
+  }));
+
+  assert.match(html, /Deep Research/);
+  assert.match(html, /class="general-chat-sources"/);
+  assert.match(html, /Study/);
+  assert.match(html, /example\.org/);
+});
+
+test("research citations expose verified web domains and ignore non-web links", () => {
+  assert.deepEqual(citationsFromMarkdown(
+    "[Official source](https://www.example.org/report) [Local](file:///private/data) [Official source](https://www.example.org/report)",
+  ), [{ title: "Official source", url: "https://www.example.org/report", domain: "example.org" }]);
 });

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowClockwise, ArrowLeft, ArrowRight, Bug, DownloadSimple, DotsThree, Eraser, Globe, SlidersHorizontal, Stop, Trash, WarningCircle, X } from "@phosphor-icons/react";
 import { IconButton } from "../components/WorkspaceSidebar.jsx";
+import { SelectControl } from "../components/SelectControl.jsx";
 
 function normaliseAddress(value) {
   const address = String(value ?? "").trim();
@@ -479,14 +480,7 @@ export function BrowserView({ visible = true, projects = [], onStateChange }) {
         <IconButton aria-expanded={toolsMenuOpen} aria-haspopup="menu" label="Browser tools" onClick={() => setToolsMenuOpen((open) => !open)} type="button"><DotsThree size={20} weight="bold" /></IconButton>
         {toolsMenuOpen && <div aria-label="Browser tools" className="tribe-browser-tools-menu" role="menu">
           <label className="tribe-browser-tools-field">Viewport
-            <select aria-label="Browser viewport" onChange={(event) => void setViewport(event.target.value)} value={state.viewport ?? "responsive"}>
-              <option value="responsive">Responsive</option>
-              <option value="iphone-15">iPhone 15</option>
-              <option value="pixel-7">Pixel 7</option>
-              <option value="ipad-mini">iPad mini</option>
-              <option value="laptop-1280">1280 × 800</option>
-              <option value="custom">{state.customViewport ? `Custom ${state.customViewport.width} × ${state.customViewport.height}` : "Custom size…"}</option>
-            </select>
+            <SelectControl aria-label="Browser viewport" onChange={(value) => void setViewport(value)} options={[{ value: "responsive", label: "Responsive" }, { value: "iphone-15", label: "iPhone 15" }, { value: "pixel-7", label: "Pixel 7" }, { value: "ipad-mini", label: "iPad mini" }, { value: "laptop-1280", label: "1280 × 800" }, { value: "custom", label: state.customViewport ? `Custom ${state.customViewport.width} × ${state.customViewport.height}` : "Custom size…" }]} size="full" value={state.viewport ?? "responsive"} />
           </label>
           {(state.agentControlActive || state.agentControlPaused) && <button onClick={() => { setToolsMenuOpen(false); void setAgentControlPaused(!state.agentControlPaused); }} role="menuitem" type="button">
             {state.agentControlPaused ? <ArrowClockwise size={15} /> : <Stop size={15} />}
@@ -519,9 +513,9 @@ export function BrowserView({ visible = true, projects = [], onStateChange }) {
       <form aria-labelledby="tribe-browser-emulation-title" aria-modal="true" className="tribe-browser-profile-dialog tribe-browser-custom-viewport" onSubmit={(event) => void applyEmulationSettings(event)} role="dialog">
         <header><div><h2 id="tribe-browser-emulation-title">Page emulation</h2><p>Set this tab’s language, motion preference and network connection.</p></div><IconButton label="Close page emulation" onClick={() => setEmulationDialog(false)} type="button"><X size={16} /></IconButton></header>
         <div className="tribe-browser-custom-fields tribe-browser-emulation-fields">
-          <label>Locale<select onChange={(event) => setEmulationSettings((value) => ({ ...value, locale: event.target.value }))} value={emulationSettings.locale}><option value="">System default</option><option value="en-AU">English · Australia</option><option value="en-US">English · United States</option><option value="en-GB">English · United Kingdom</option><option value="fr-FR">French · France</option><option value="de-DE">German · Germany</option><option value="ja-JP">Japanese · Japan</option></select></label>
-          <label>Network<select onChange={(event) => setEmulationSettings((value) => ({ ...value, network: event.target.value }))} value={emulationSettings.network}><option value="unthrottled">No throttling</option><option value="fast-3g">Fast 3G</option><option value="slow-3g">Slow 3G</option><option value="4g">4G</option><option value="offline">Offline</option></select></label>
-          <label>Reduced motion<select onChange={(event) => setEmulationSettings((value) => ({ ...value, reducedMotion: event.target.value }))} value={emulationSettings.reducedMotion}><option value="system">System default</option><option value="reduce">Reduce motion</option><option value="no-preference">No preference</option></select></label>
+          <label>Locale<SelectControl onChange={(locale) => setEmulationSettings((value) => ({ ...value, locale }))} options={[{ value: "", label: "System default" }, { value: "en-AU", label: "English · Australia" }, { value: "en-US", label: "English · United States" }, { value: "en-GB", label: "English · United Kingdom" }, { value: "fr-FR", label: "French · France" }, { value: "de-DE", label: "German · Germany" }, { value: "ja-JP", label: "Japanese · Japan" }]} size="full" value={emulationSettings.locale} /></label>
+          <label>Network<SelectControl onChange={(network) => setEmulationSettings((value) => ({ ...value, network }))} options={[{ value: "unthrottled", label: "No throttling" }, { value: "fast-3g", label: "Fast 3G" }, { value: "slow-3g", label: "Slow 3G" }, { value: "4g", label: "4G" }, { value: "offline", label: "Offline" }]} size="full" value={emulationSettings.network} /></label>
+          <label>Reduced motion<SelectControl onChange={(reducedMotion) => setEmulationSettings((value) => ({ ...value, reducedMotion }))} options={[{ value: "system", label: "System default" }, { value: "reduce", label: "Reduce motion" }, { value: "no-preference", label: "No preference" }]} size="full" value={emulationSettings.reducedMotion} /></label>
         </div>
         <p className="settings-note">Device presets emulate viewport, touch and browser identity; they do not run a mobile operating system. Reload a page after changing its locale or motion preference.</p>
         <footer><button onClick={() => setEmulationDialog(false)} type="button">Cancel</button><button type="submit">Apply to this tab</button></footer>

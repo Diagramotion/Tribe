@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowDownRight, ArrowSquareOut, ArrowUp, CaretDown, Check, CircleNotch, FolderSimple, GlobeSimple, Sparkle, WarningCircle } from "@phosphor-icons/react";
+import { ArrowDownRight, ArrowUp, CaretDown, Check, CircleNotch, FolderSimple, GlobeSimple, Sparkle, WarningCircle } from "@phosphor-icons/react";
 import { MessageMarkdown } from "../components/MarkdownContent.jsx";
+import { CitationSources } from "../components/CitationSources.jsx";
+import { LinkPreviews } from "../components/LinkPreviews.jsx";
 import { modelDisplayName, sortModelCatalog } from "../domain/model-catalog.js";
 
 function readMessageSources(message) {
@@ -22,25 +24,12 @@ function readMessageSources(message) {
   return sources.length ? { body: message.body.slice(0, legacy.index), sources } : { body: message.body, sources: [] };
 }
 
-function MessageSources({ sources }) {
-  if (!sources.length) return null;
-  return <aside aria-label={`Sources, ${sources.length} ${sources.length === 1 ? "page" : "pages"}`} className="general-chat-sources">
-    <div className="general-chat-sources-heading"><span>Sources</span><small>{sources.length} {sources.length === 1 ? "page" : "pages"}</small></div>
-    <div className="general-chat-source-list">
-      {sources.map((source, index) => <a className="general-chat-source" href={source.url} key={`${source.url}-${index}`} rel="noreferrer" target="_blank">
-        <span aria-hidden="true" className="general-chat-source-icon"><GlobeSimple size={15} /></span>
-        <span className="general-chat-source-copy"><strong>{source.title}</strong><small>{source.domain}</small></span>
-        <ArrowSquareOut aria-hidden="true" className="general-chat-source-open" size={14} />
-      </a>)}
-    </div>
-  </aside>;
-}
-
-export function GeneralChatView({ chat, getModelCatalog, onModelPreferenceChange, onSend, onConnectModel }) {
+export function GeneralChatView({ chat, getModelCatalog, onModelPreferenceChange, onSend, onConnectModel, onOpenWebSearch }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [savingModelPreference, setSavingModelPreference] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [deepResearch, setDeepResearch] = useState(false);
   const [modelCatalog, setModelCatalog] = useState([]);
   const [workspaceDefaultModel, setWorkspaceDefaultModel] = useState(null);
   const [modelPreferenceError, setModelPreferenceError] = useState("");
@@ -54,6 +43,8 @@ export function GeneralChatView({ chat, getModelCatalog, onModelPreferenceChange
   const lastMessageCountRef = useRef(0);
   const friendlyError = responseError === "model_not_configured"
     ? "Connect a model to get replies. Your message is saved."
+    : responseError === "web_search_disabled"
+      ? "Deep Research needs web search. Enable it in Settings → Web search."
     : responseError;
 
   useEffect(() => {
@@ -106,6 +97,10 @@ export function GeneralChatView({ chat, getModelCatalog, onModelPreferenceChange
     lastMessageCountRef.current = messageCount;
   }, [chat.id, chat.messages?.length, optimisticMessage]);
 
+  useEffect(() => {
+    setDeepResearch(false);
+  }, [chat.id]);
+
   function handleScroll() {
     const element = scrollRef.current;
     if (!element) return;
@@ -131,9 +126,10 @@ export function GeneralChatView({ chat, getModelCatalog, onModelPreferenceChange
     setResponseError("");
     setOptimisticMessage({ id: `pending-${Date.now()}`, role: "user", body: text });
     try {
-      const error = await onSend(text);
+      const error = await onSend(text, { deepResearch });
       setOptimisticMessage(null);
       if (error) setResponseError(error);
+      else if (deepResearch) setDeepResearch(false);
     } catch (error) {
       setOptimisticMessage(null);
       setDraft(text);
@@ -175,8 +171,9 @@ export function GeneralChatView({ chat, getModelCatalog, onModelPreferenceChange
     <div className="project-home-composer-footer">
       <div className="project-home-composer-context">
         <span className="project-context-chip"><FolderSimple aria-hidden="true" size={14} />No project</span>
-        <span className="project-home-composer-hint">No local machine access</span>
+        <span className="project-home-composer-hint">{deepResearch ? "Web search only · no team or local access" : "No local machine access"}</span>
       </div>
+      <button aria-label="Deep Research, workspace web search only, no team or local access" aria-pressed={deepResearch} className={`research-mode-toggle${deepResearch ? " research-mode-toggle--active" : ""}`} disabled={sending} onClick={() => setDeepResearch((value) => !value)} title="Uses workspace web search only. This chat has no project team, workflow or local machine access." type="button"><GlobeSimple aria-hidden="true" size={15} /><span>Deep Research</span></button>
       <div className="composer-model-menu-wrap general-chat-model-menu" ref={modelMenuRef}>
         <button aria-expanded={modelMenuOpen} aria-haspopup="dialog" aria-label={`Model: ${modelLabel}`} className={"composer-model-trigger" + (modelMenuOpen ? " composer-model-trigger--open" : "")} disabled={savingModelPreference} onClick={() => setModelMenuOpen((open) => !open)} type="button">
           <Sparkle aria-hidden="true" className="composer-model-trigger-icon" size={15} weight="fill" />
@@ -199,7 +196,7 @@ export function GeneralChatView({ chat, getModelCatalog, onModelPreferenceChange
     </div>
     {modelPreferenceError && <p className="general-chat-error" role="alert">{modelPreferenceError}</p>}
   </form>;
-  const errorNotice = friendlyError && <p className="general-chat-error" role="alert"><WarningCircle size={15} /><span>{friendlyError}</span>{responseError === "model_not_configured" && <button onClick={onConnectModel} type="button">Connect a model</button>}</p>;
+  const errorNotice = friendlyError && <p className="general-chat-error" role="alert"><WarningCircle size={15} /><span>{friendlyError}</span>{responseError === "model_not_configured" && <button onClick={onConnectModel} type="button">Connect a model</button>}{responseError === "web_search_disabled" && <button onClick={onOpenWebSearch} type="button">Open web search settings</button>}</p>;
 
   return <section className="general-chat-view" aria-label="General chat">
     {!hasMessages && <div aria-live="polite" className="general-chat-messages general-chat-messages--empty" onScroll={handleScroll} ref={scrollRef}>
@@ -214,11 +211,13 @@ export function GeneralChatView({ chat, getModelCatalog, onModelPreferenceChange
           const { body, sources } = readMessageSources(message);
           return <article aria-label={message.role === "user" ? "Your message" : "Tribe response"} className={`general-chat-message general-chat-message--${message.role}`} key={message.id}>
             {message.role === "assistant" && <div className="general-chat-message-heading"><span aria-hidden="true" className="general-chat-agent-mark"><Sparkle size={14} weight="fill" /></span><strong>Tribe</strong><small>{message.duration_ms == null ? "Response" : `${Math.max(1, Math.round(message.duration_ms / 1000))}s`} · {message.input_tokens != null && message.output_tokens != null ? `${(message.input_tokens + message.output_tokens).toLocaleString()} tokens` : "usage not recorded"}</small></div>}
-            <MessageMarkdown externalLinkTreatment>{body}</MessageMarkdown>
-            {message.role === "assistant" && <MessageSources sources={sources} />}
+            {message.role === "user" && message.mode === "deep_research" && <span className="research-message-tag"><GlobeSimple size={13} />Deep Research</span>}
+            <div className="message-markdown"><MessageMarkdown externalLinkTreatment linkPreviewOnHover>{body}</MessageMarkdown></div>
+            {message.role === "user" && <LinkPreviews source={body} />}
+            {message.role === "assistant" && <CitationSources sources={sources} />}
           </article>;
         })}
-        {sending && <div className="general-chat-working" role="status"><CircleNotch className="spin" size={15} />Thinking…</div>}
+        {sending && <div className={`general-chat-working${deepResearch ? " general-chat-working--research" : ""}`} role="status"><CircleNotch className="spin" size={15} />{deepResearch ? "Searching and checking sources…" : "Thinking…"}</div>}
       </div>
       {!atBottomRef.current && newMessageCount > 0 && <button aria-label={`Jump to ${newMessageCount} new messages`} className="general-chat-latest-button" onClick={jumpToLatest} type="button"><ArrowDownRight size={15} />{newMessageCount} new messages</button>}
       <div className="general-chat-compose-area">{errorNotice}{composer}</div>

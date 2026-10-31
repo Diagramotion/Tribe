@@ -288,6 +288,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"chat": chat}) if chat else self._json(404, {"error": "general_chat_not_found"})
         if parsed.path == "/api/health":
             return self._json(200, {"status": "ok", "runtime": "local", "agents": SUPERVISOR.status})
+        if parsed.path == "/api/access-grants":
+            return self._json(200, {"grants": STORE.list_access_grants()})
         if parsed.path == "/api/browser/runtime":
             return self._json(200, {"installed": BROWSER.browser_installed(), "headless": True})
         browser_view_match = re.fullmatch(r"/api/missions/([0-9a-f-]{36})/browser", parsed.path)
@@ -803,6 +805,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(503, {"error": "workspace_restore_shutting_down"})
         try:
             body = self._body()
+            if self.path == "/api/link-previews":
+                from .link_previews import link_preview
+                raw_urls = body.get("urls", [])
+                if not isinstance(raw_urls, list):
+                    return self._json(422, {"error": "urls_must_be_a_list"})
+                previews = []
+                for raw_url in raw_urls[:2]:
+                    try:
+                        preview = link_preview(raw_url)
+                    except ValueError:
+                        preview = None
+                    if preview:
+                        previews.append(preview)
+                return self._json(200, {"previews": previews})
             if self.path == "/api/shutdown":
                 COMPUTER.close()
                 BROWSER.close_all()
@@ -818,8 +834,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             if general_chat_message_match:
                 text = body.get("text")
+                mode = body.get("mode", "chat")
                 try:
-                    result = GENERAL_CHATS.send(general_chat_message_match.group(1), text)
+                    result = GENERAL_CHATS.send(general_chat_message_match.group(1), text, mode=mode)
                     return self._json(200, result)
                 except ValueError as error:
                     status = 404 if str(error) == "general_chat_not_found" else 422
@@ -1275,6 +1292,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(422, {"error": "message_recipient_invalid"})
                 recipient = recipient_value.strip() if recipient_value is not None else None
                 recipient = recipient or None
+                if body.get("deepResearch") is True:
+                    recipient = None
                 if recipient:
                     project_agent_ids = STORE.project_agent_ids(
                         mission["project_id"], _workspace_agent_ids(),
@@ -1285,6 +1304,8 @@ class Handler(BaseHTTPRequestHandler):
                     "text": text,
                     "recipient": recipient,
                 }
+                if body.get("deepResearch") is True:
+                    payload["researchMode"] = "deep_research"
                 attachment_ids = body.get("attachments", [])
                 if (not isinstance(attachment_ids, list) or len(attachment_ids) > 10
                         or any(not isinstance(item, str) for item in attachment_ids)
@@ -1393,7 +1414,8 @@ class Handler(BaseHTTPRequestHandler):
                                                initial_message=initial_message or None,
                                                selected_skills=selected_skills,
                                                model_preference=model_preference,
-                                               effort_preference=effort_preference)
+                                               effort_preference=effort_preference,
+                                               deep_research=body.get("deepResearch") is True)
                 SUPERVISOR.pause_other_missions(mission["id"])
                 SUPERVISOR.start_mission(mission["id"], initial_launch=True)
                 return self._json(201, {"mission": mission})
@@ -1628,7 +1650,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/interactions/") and self.path.endswith("/resolve"):
                 interaction_id = self.path.removeprefix("/api/interactions/").removesuffix("/resolve").strip("/")
                 resolution = str(body.get("resolution", "")).strip()
-                item = STORE.resolve_interaction(interaction_id, resolution)
+                item = STORE.resolve_interaction(interaction_id, resolution, body.get("accessScope"))
                 if not item:
                     return self._json(409, {"error": "interaction_missing_or_already_resolved"})
                 return self._json(200, {"interaction": item})
@@ -1992,6 +2014,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "local_origin_required"})
         if RESTORE_PENDING.is_set():
             return self._json(503, {"error": "workspace_restore_shutting_down"})
+        access_grant_match = re.fullmatch(r"/api/access-grants/([0-9a-f-]{36})", self.path)
+        if access_grant_match:
+            grant = STORE.revoke_access_grant(access_grant_match.group(1))
+            return self._json(200, {"grant": grant}) if grant else self._json(404, {"error": "access_grant_not_found"})
         general_chat_match = re.fullmatch(r"/api/general-chats/([0-9a-f-]{36})", self.path)
         if general_chat_match:
             deleted = STORE.delete_general_chat(general_chat_match.group(1))

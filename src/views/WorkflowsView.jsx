@@ -1,9 +1,10 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Background, Controls, Handle, MarkerType, Position, ReactFlow } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { ArrowDown, ArrowLeft, ArrowUp, ClockCounterClockwise, PencilSimple, Plus, Trash } from "@phosphor-icons/react";
+import { ArrowDown, ArrowUp, ClockCounterClockwise, PencilSimple, Plus, Trash, X } from "@phosphor-icons/react";
 import { IconButton } from "../components/WorkspaceSidebar.jsx";
 import { MarkdownContent } from "../components/MarkdownContent.jsx";
+import { useDialogFocus } from "../hooks/useDialogFocus.js";
 import { flowTextFromWorkflow, isSequentialWorkflow, parseWorkflowFlowText, sequentialWorkflow, validateWorkflowDraft, workflowToDraft } from "../domain/workflow-designer.js";
 
 function WorkflowNode({ data, selected }) {
@@ -116,8 +117,7 @@ function stageName(stages, id) {
 }
 
 export function WorkflowsView({ recipes, onSave, onListVersions, onGetVersion }) {
-  const returnFocusRef = useRef(null);
-  const nameFieldRef = useRef(null);
+  const dialogRef = useRef(null);
   const [selected, setSelected] = useState(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [recipeId, setRecipeId] = useState("");
@@ -159,16 +159,10 @@ export function WorkflowsView({ recipes, onSave, onListVersions, onGetVersion })
     if (validationErrors.length) setValidationErrors(validateWorkflowDraft(draft));
   }, [recipeId, title, description, objective, instructions, rules, tags, initialStage, terminalStages, stages]);
 
-  useLayoutEffect(() => {
-    if (editorOpen) { nameFieldRef.current?.focus(); return; }
-    const returnFocus = returnFocusRef.current;
-    if (returnFocus?.isConnected) returnFocus.focus();
-    else document.querySelector(".recipes-view .recipe-detail-heading [aria-label='Edit workflow']")?.focus();
-    returnFocusRef.current = null;
-  }, [editorOpen, selected]);
+  useDialogFocus(dialogRef, editorOpen);
 
   function edit(recipe = null, event) {
-    returnFocusRef.current = event?.currentTarget ?? document.activeElement;
+    event?.preventDefault();
     setSelected(recipe?.id ?? null);
     const value = workflowToDraft(recipe);
     setRecipeId(value.id); setTitle(value.title); setDescription(value.description); setObjective(value.objective);
@@ -300,14 +294,36 @@ export function WorkflowsView({ recipes, onSave, onListVersions, onGetVersion })
     setStages((current) => current.map((stage) => stage.id === stageId ? { ...stage, ...patch } : stage));
   }
 
+  function closeEditor() {
+    if (!saving) setEditorOpen(false);
+  }
+
   return <section className="detail-view recipes-view">
-    {!editorOpen && <div className="section-heading"><div><span className="eyebrow">Reusable workflows</span><h2 className="visually-hidden">Workflows</h2><p>Choose a workflow when you start a chat. Running chats keep the version they started with.</p></div><IconButton className="button--primary" label="New workflow" onClick={(event) => edit(null, event)}><Plus size={16} /></IconButton></div>}
-    <div className={`recipes-layout ${editorOpen ? "recipes-layout--editing" : ""}`}>
-      {!editorOpen && <nav className="recipe-list" aria-label="Workflows">{recipes.map((recipe) => <button aria-current={selected === recipe.id ? "page" : undefined} className={`recipe-list-item ${selected === recipe.id ? "recipe-list-item--active" : ""}`} key={recipe.id} onClick={(event) => showRecipe(recipe, event)} type="button"><span><strong>{recipe.title}</strong><small>{recipe.description}</small></span><em>v{recipe.version}</em></button>)}{recipes.length === 0 && <div className="recipe-list-empty"><strong>No workflows yet</strong><span>Create reusable instructions for chats that follow a repeatable process.</span></div>}</nav>}
-      {editorOpen ? <form className="recipe-editor recipe-editor--expanded" onSubmit={submit}>
-        <div className="recipe-editor-heading"><div><span className="eyebrow">{selected ? "Edit workflow" : "Create workflow"}</span><h3>{selected ? title || "Untitled workflow" : "New workflow"}</h3>{selected && <span className="recipe-source">{recipes.find((item) => item.id === selected)?.source === "builtin" ? "Built in · your changes create a copy" : "Your workflow"}</span>}</div><IconButton label="Back to workflows" onClick={() => setEditorOpen(false)}><ArrowLeft size={16} /></IconButton></div>
+    <div className="section-heading"><div><span className="eyebrow">Reusable workflows</span><h2 className="visually-hidden">Workflows</h2><p>Choose a workflow when you start a chat. Running chats keep the version they started with.</p></div><IconButton className="button--primary" label="New workflow" onClick={(event) => edit(null, event)}><Plus size={16} /></IconButton></div>
+    <div className="recipes-layout">
+      <nav className="recipe-list" aria-label="Workflows">{recipes.map((recipe) => <button aria-current={selected === recipe.id ? "page" : undefined} className={`recipe-list-item ${selected === recipe.id ? "recipe-list-item--active" : ""}`} key={recipe.id} onClick={(event) => showRecipe(recipe, event)} type="button"><span><strong>{recipe.title}</strong><small>{recipe.description}</small></span><em>v{recipe.version}</em></button>)}{recipes.length === 0 && <div className="recipe-list-empty"><strong>No workflows yet</strong><span>Create reusable instructions for chats that follow a repeatable process.</span></div>}</nav>
+      {selected ? (() => {
+        const latestRecipe = recipes.find((item) => item.id === selected);
+        const recipe = viewVersion ?? latestRecipe;
+        if (!recipe) return null;
+        return <article className="recipe-detail">
+          <header className="recipe-detail-heading"><div><span className="eyebrow">{recipe.source === "builtin" ? "Built-in workflow" : "Your workflow"} · v{recipe.version}{recipe.version === latestRecipe?.version ? " · Current" : " · Saved version"}</span><h3>{recipe.title}</h3><p>{recipe.description}</p></div><IconButton disabled={recipe.version !== latestRecipe?.version && recipe.source !== "builtin"} label="Edit workflow" onClick={(event) => edit(latestRecipe, event)}><PencilSimple size={16} /></IconButton></header>
+          <div className="workflow-history"><span><ClockCounterClockwise size={14} />Version history</span>{(versions.length ? versions : [latestRecipe?.version ?? recipe.version]).map((version) => <button aria-pressed={recipe.version === version} className={recipe.version === version ? "workflow-version--active" : ""} disabled={loadingVersion} key={version} onClick={() => showVersion(version)} type="button">v{version}</button>)}{loadingVersion && <small>Loading…</small>}</div>
+          {error && <p className="recipe-error" role="alert">{error}</p>}
+          <p className="workflow-activation-hint">Start a new chat with <code>/workflow {recipe.id}{recipe.version === latestRecipe?.version ? "" : `@v${recipe.version}`}</code>. This chat will keep version {recipe.version}.</p>
+          <p className="recipe-objective"><strong>Objective</strong> {recipe.objective ?? recipe.description}</p>
+          {recipe.rules?.length > 0 && <ul className="recipe-rules">{recipe.rules.map((rule) => <li key={rule}>{rule}</li>)}</ul>}
+          {recipe.stages?.length > 0 && <ol aria-label="Workflow stages" className="recipe-detail-stages">{recipe.stages.map((stage) => <li key={stage.id}><strong>{stage.title}</strong>{stage.objective && <span>{stage.objective}</span>}{stage.guide && <div><MarkdownContent>{stage.guide}</MarkdownContent></div>}{stage.transitions?.length > 0 && <small>Next: {stage.transitions.map((edge) => typeof edge === "string" ? edge : `${edge.to}${edge.when ? ` · ${edge.when}` : ""}`).join(", ")}</small>}</li>)}</ol>}
+          <div className="recipe-detail-body"><MarkdownContent>{recipe.instructions}</MarkdownContent></div>
+        </article>;
+      })() : <div className="recipe-detail recipe-detail--empty"><strong>Choose a workflow</strong><span>Review its guidance for repeatable chats.</span></div>}
+    </div>
+    {editorOpen && <div className="dialog-backdrop workflow-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeEditor(); }} role="presentation">
+      <form aria-labelledby="workflow-dialog-title" aria-modal="true" className={`mission-dialog recipe-editor recipe-editor--dialog ${authoringMode === "designer" ? "recipe-editor--dialog-designer" : ""}`} onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); closeEditor(); } }} onSubmit={submit} ref={dialogRef} role="dialog" tabIndex={-1}>
+        <div className="recipe-editor-heading"><div><span className="eyebrow">Reusable workflow</span><h2 id="workflow-dialog-title">{selected ? "Edit workflow" : "Create workflow"}</h2><p>{selected ? title || "Untitled workflow" : "Define the stages and guidance agents can reuse."}</p>{selected && <span className="recipe-source">{recipes.find((item) => item.id === selected)?.source === "builtin" ? "Built in · saving creates your copy" : "Your workflow"}</span>}</div><IconButton disabled={saving} label="Close workflow editor" onClick={closeEditor}><X size={17} /></IconButton></div>
+        <div className="workflow-dialog-content">
         <div className="workflow-metadata">
-          <label>Name<input maxLength={120} onChange={(event) => updateTitle(event.target.value)} placeholder="Release readiness" ref={nameFieldRef} value={title} /></label>
+          <label>Name<input data-dialog-initial-focus maxLength={120} onChange={(event) => updateTitle(event.target.value)} placeholder="Release readiness" value={title} /></label>
           <label>Description<input maxLength={500} onChange={(event) => setDescription(event.target.value)} placeholder="Describe what this workflow helps agents do." value={description} /></label>
         </div>
         <details className="workflow-global-details">
@@ -384,22 +400,9 @@ export function WorkflowsView({ recipes, onSave, onListVersions, onGetVersion })
           </div>}
         </fieldset>
         {(error || validationErrors.length > 0) && <div className="recipe-error" role="alert">{error && <p>{error}</p>}{validationErrors.length > 0 && <ul>{validationErrors.map((item) => <li key={item}>{item}</li>)}</ul>}</div>}
-        <div className="recipe-editor-actions"><small>Saving creates a new version. Chats keep the exact version they started with.</small><div><button className="button button--primary" disabled={saving} type="submit">{saving ? "Saving…" : selected ? "Save new version" : "Create workflow"}</button></div></div>
-      </form> : selected ? (() => {
-        const latestRecipe = recipes.find((item) => item.id === selected);
-        const recipe = viewVersion ?? latestRecipe;
-        if (!recipe) return null;
-        return <article className="recipe-detail">
-          <header className="recipe-detail-heading"><div><span className="eyebrow">{recipe.source === "builtin" ? "Built-in workflow" : "Your workflow"} · v{recipe.version}{recipe.version === latestRecipe?.version ? " · Current" : " · Saved version"}</span><h3>{recipe.title}</h3><p>{recipe.description}</p></div><IconButton disabled={recipe.version !== latestRecipe?.version && recipe.source !== "builtin"} label="Edit workflow" onClick={(event) => edit(latestRecipe, event)}><PencilSimple size={16} /></IconButton></header>
-          <div className="workflow-history"><span><ClockCounterClockwise size={14} />Version history</span>{(versions.length ? versions : [latestRecipe?.version ?? recipe.version]).map((version) => <button aria-pressed={recipe.version === version} className={recipe.version === version ? "workflow-version--active" : ""} disabled={loadingVersion} key={version} onClick={() => showVersion(version)} type="button">v{version}</button>)}{loadingVersion && <small>Loading…</small>}</div>
-          {error && <p className="recipe-error" role="alert">{error}</p>}
-          <p className="workflow-activation-hint">Start a new chat with <code>/workflow {recipe.id}{recipe.version === latestRecipe?.version ? "" : `@v${recipe.version}`}</code>. This chat will keep version {recipe.version}.</p>
-          <p className="recipe-objective"><strong>Objective</strong> {recipe.objective ?? recipe.description}</p>
-          {recipe.rules?.length > 0 && <ul className="recipe-rules">{recipe.rules.map((rule) => <li key={rule}>{rule}</li>)}</ul>}
-          {recipe.stages?.length > 0 && <ol aria-label="Workflow stages" className="recipe-detail-stages">{recipe.stages.map((stage) => <li key={stage.id}><strong>{stage.title}</strong>{stage.objective && <span>{stage.objective}</span>}{stage.guide && <div><MarkdownContent>{stage.guide}</MarkdownContent></div>}{stage.transitions?.length > 0 && <small>Next: {stage.transitions.map((edge) => typeof edge === "string" ? edge : `${edge.to}${edge.when ? ` · ${edge.when}` : ""}`).join(", ")}</small>}</li>)}</ol>}
-          <div className="recipe-detail-body"><MarkdownContent>{recipe.instructions}</MarkdownContent></div>
-        </article>;
-      })() : <div className="recipe-detail recipe-detail--empty"><strong>Choose a workflow</strong><span>Review its guidance for repeatable chats.</span></div>}
-    </div>
+        </div>
+        <div className="recipe-editor-actions"><small>Saving creates a new version. Chats keep the exact version they started with.</small><div><button className="button button--quiet" disabled={saving} onClick={closeEditor} type="button">Cancel</button><button className="button button--primary" disabled={saving} type="submit">{saving ? "Saving…" : selected ? "Save new version" : "Create workflow"}</button></div></div>
+      </form>
+    </div>}
   </section>;
 }
