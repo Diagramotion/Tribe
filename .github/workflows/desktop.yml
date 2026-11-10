@@ -171,9 +171,9 @@ jobs:
           TRIBE_BROWSER_E2E_AUTO_UPLOAD: "1"
           TRIBE_BROWSER_E2E_SKIP_APPROVAL: "1"
       - name: Build unpacked Electron app
-        run: npm run build && npm run runtime:package && npx electron-builder --${{ matrix.package-platform }} --dir
+        run: npm run build && npm run runtime:package && npx electron-builder --${{ matrix.package-platform }} --dir --publish never
       - name: Build Electron installer
-        run: npx electron-builder --${{ matrix.package-platform }} ${{ matrix.package-target }}
+        run: npx electron-builder --${{ matrix.package-platform }} ${{ matrix.package-target }} --publish never
       - name: Live packaged browser and agent test
         run: npm run test:browser:e2e
         env:

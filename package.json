@@ -16,9 +16,9 @@
     "test:sites": "node --test tests/sites-worker.test.mjs",
     "test:ui": "node --test tests/activity.test.mjs tests/agent-role-templates.test.mjs tests/channel-scroll.test.mjs tests/plan.test.mjs tests/runtime-events.test.mjs tests/canvas-diff.test.mjs tests/canvas-export.test.mjs tests/canvas-selection.test.mjs tests/artifact-preview.test.mjs tests/artifact-anchor.test.mjs tests/tabular-preview.test.mjs tests/computer-capture.test.mjs tests/interactive-artifact.test.mjs tests/settings-view.test.mjs tests/remote-service-form.test.mjs tests/schedules.test.mjs tests/schedule-view.test.mjs tests/project-knowledge-view.test.mjs tests/slash-commands.test.mjs tests/workflow-designer.test.mjs tests/chart-preview.test.mjs tests/notebook-preview.test.mjs tests/design-systems.test.mjs tests/general-chat-view.test.mjs",
     "desktop:electron": "node scripts/electron-dev.mjs",
-    "desktop:electron:build": "npm run build && npm run runtime:package && electron-builder",
-    "desktop:electron:mac": "npm run build && npm run runtime:package && electron-builder --mac",
-    "desktop:electron:windows": "npm run build && npm run runtime:package && electron-builder --win",
+    "desktop:electron:build": "npm run build && npm run runtime:package && electron-builder --publish never",
+    "desktop:electron:mac": "npm run build && npm run runtime:package && electron-builder --mac --publish never",
+    "desktop:electron:windows": "npm run build && npm run runtime:package && electron-builder --win --publish never",
     "test:browser": "node --test electron/browser-*.test.cjs",
     "test:browser:e2e": "node scripts/browser-agent-e2e.mjs"
   },
