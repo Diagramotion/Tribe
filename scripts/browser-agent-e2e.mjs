@@ -352,6 +352,13 @@ try {
     const electronExecutable = resolve(root, "node_modules/electron/dist", process.platform === "win32"
       ? "electron.exe"
       : process.platform === "darwin" ? "Electron.app/Contents/MacOS/Electron" : "electron");
+    try {
+      await fs.access(electronExecutable);
+    } catch {
+      const electronInstaller = resolve(root, "node_modules/electron/install.js");
+      await runProcess(process.execPath, [electronInstaller], { cwd: root, env: safeEnv, timeoutMs: 300_000 });
+      await fs.access(electronExecutable);
+    }
     vite = startProcess(process.execPath, [viteCli, "--host", "127.0.0.1", "--port", String(devPort), "--strictPort"]);
     await waitFor(async () => {
       try { return (await fetch(safeEnv.TRIBE_DEV_URL)).ok; } catch { return false; }
