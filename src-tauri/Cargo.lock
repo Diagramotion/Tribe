@@ -3044,9 +3044,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "screencapturekit"
-version = "11.1.0"
+version = "11.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96dc7e1416cef5fa47a05396b886fbbf8463a663eb4d5d85ed667e69e5f02395"
+checksum = "da7669c5c60db0a577c464ddfd111e9823c4572a7966a25b31688bbf7cff3d58"
 dependencies = [
  "apple-cf",
  "apple-metal",
