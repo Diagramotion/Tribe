@@ -346,6 +346,7 @@ try {
     delete packagedEnv.TRIBE_DEV_URL;
     delete packagedEnv.TRIBE_DEV_ORIGIN;
     delete packagedEnv.TRIBE_ELECTRON_VITE_PORT;
+    packagedEnv.TRIBE_BROWSER_API_TOKEN = browserApiToken;
     desktopLaunch = { command: path.resolve(root, packagedAppPath), args: [], env: packagedEnv };
   } else {
     const viteCli = resolve(root, "node_modules/vite/bin/vite.js");
@@ -363,7 +364,10 @@ try {
     await waitFor(async () => {
       try { return (await fetch(safeEnv.TRIBE_DEV_URL)).ok; } catch { return false; }
     }, "Vite to become ready");
-    desktopLaunch = { command: electronExecutable, args: ["."], env: safeEnv };
+    desktopLaunch = {
+      command: electronExecutable, args: ["."],
+      env: { ...safeEnv, TRIBE_BROWSER_API_TOKEN: browserApiToken },
+    };
   }
   launchDesktop();
 
