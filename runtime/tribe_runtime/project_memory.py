@@ -36,8 +36,13 @@ def _store():
     return memory_store, parse_markdown
 
 
+def _canonical_memory_id(entry_id: str) -> str:
+    """Keep Smriti's logical memory IDs stable across POSIX and Windows paths."""
+    return str(entry_id).replace("\\", "/").removeprefix("tribe/")
+
+
 def _memory_id(entry_id: str) -> str:
-    return f"tribe/{entry_id}"
+    return f"tribe/{_canonical_memory_id(entry_id)}"
 
 
 def _write(project_id: str, entry: dict[str, Any], *, only_missing: bool = False) -> None:
@@ -388,7 +393,7 @@ def list_project_memory(store: MissionStore, project_id: str,
             metadata, content = parse_markdown(memory_store.get_memory(identifier))
         except (OSError, ValueError):
             continue
-        tribe_id = identifier.removeprefix("tribe/")
+        tribe_id = _canonical_memory_id(identifier)
         entries.append({
             "id": tribe_id,
             "project_id": project_id,
@@ -412,7 +417,7 @@ def search_project_memory(store: MissionStore, project_id: str, query: str,
                  "scope": {"tribe_project_id": project_id}},
     )
     return [{
-        "id": str(item["id"]).removeprefix("tribe/"),
+        "id": _canonical_memory_id(str(item["id"])),
         "title": item.get("title", "Untitled memory"),
         "content": item.get("content", ""),
         "score": item.get("score"),
@@ -430,7 +435,7 @@ def read_project_memory(project_id: str, entry_id: str) -> dict[str, Any] | None
             or (metadata.get("scope") or {}).get("tribe_project_id") != project_id):
         return None
     return {
-        "id": entry_id, "title": metadata.get("title", "Untitled memory"),
+        "id": _canonical_memory_id(entry_id), "title": metadata.get("title", "Untitled memory"),
         "content": content.strip(), "status": metadata.get("status", "active"),
         "updated_at": metadata.get("updated_at"),
         "created_by": metadata.get("source_agent") or "Smriti",

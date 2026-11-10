@@ -234,7 +234,10 @@ class RuntimeCase(unittest.TestCase):
         )
         capability_names = {type(capability).__name__ for capability in capabilities}
         self.assertTrue(tools.root.samefile(workspace_root))
-        self.assertTrue({"LocalWorkspace", "FileSystem", "Shell"}.issubset(capability_names))
+        if os.name == "posix":
+            self.assertTrue({"LocalWorkspace", "FileSystem", "Shell"}.issubset(capability_names))
+        else:
+            self.assertTrue({"LocalWorkspace", "FileSystem", "Shell"}.isdisjoint(capability_names))
 
         tools.write_file("src/main.py", "print('greenfield')")
         self.assertEqual((workspace_root / "src/main.py").read_text(), "print('greenfield')")
@@ -1628,6 +1631,8 @@ for line in sys.stdin:
         self.assertNotIn("write_file", set(getattr(filesystem, "tools", ()) or ()))
 
     def test_approval_modes_pause_only_the_configured_harness_actions(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
         from pydantic_ai.models.test import TestModel
 
         definition = AgentDefinition(
@@ -5280,6 +5285,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         workspace = WorkspaceTools(self.store, self.mission["id"], "builder")
         capabilities = build_capabilities(workspace, catalog)
         self.assertNotIn("Skills", {type(item).__name__ for item in capabilities})
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native skill loader requires its POSIX workspace backend")
         selected_skill_id = next(item["id"] for item in catalog.list() if item["name"] == "review")
         capabilities = build_capabilities(workspace, catalog, selected_skill_ids=[selected_skill_id])
         native_skills = next(item for item in capabilities if type(item).__name__ == "Skills")
@@ -5869,6 +5876,11 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         )
         read_only_names = {type(capability).__name__ for capability in read_only}
         writer_names = {type(capability).__name__ for capability in writer}
+
+        if os.name != "posix":
+            self.assertTrue({"FileSystem", "Shell"}.isdisjoint(writer_names))
+            self.assertTrue({"LocalWorkspace", "FileSystem", "Shell"}.isdisjoint(read_only_names))
+            return
 
         self.assertNotIn("FileSystem", read_only_names)
         self.assertNotIn("Shell", read_only_names)
@@ -6690,6 +6702,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertIn("comment_on_artifact", agent._function_toolset.tools)
 
     def test_harness_filesystem_tool_writes_and_records_a_repository_change(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
         from pydantic_ai.models.test import TestModel
 
         definition = AgentDefinition(
@@ -6767,6 +6781,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertEqual(snapshot.state, "complete")
 
     def test_harness_releases_path_lock_after_each_completed_write(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
         from pydantic_ai.models.test import TestModel
 
         definition = AgentDefinition(
@@ -6839,6 +6855,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                 dependencies.file_locks.clear()
 
     def test_harness_directory_creation_records_change_and_releases_path_lock(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
         from pydantic_ai.models.test import TestModel
 
         definition = AgentDefinition(
