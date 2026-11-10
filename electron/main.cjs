@@ -40,7 +40,7 @@ if (process.env.TRIBE_ELECTRON_DATA_DIR) {
   app.setPath("userData", electronDataDirectory);
 }
 let browserApiPort = Number(process.env.TRIBE_BROWSER_API_PORT || 0);
-let browserApiToken = "";
+let browserApiToken = process.env.TRIBE_BROWSER_API_TOKEN || "";
 delete process.env.TRIBE_BROWSER_API_TOKEN;
 delete process.env.TRIBE_BROWSER_API_PORT;
 
@@ -2439,7 +2439,7 @@ async function startPackagedServices() {
     if (!Number.isInteger(browserApiPort) || browserApiPort < 1 || browserApiPort > 65535) {
       throw new Error("The packaged browser test needs a reserved local API port.");
     }
-    browserApiToken = await readBrowserApiToken();
+    if (!browserApiToken) browserApiToken = await readBrowserApiToken();
     if (browserApiToken.length < 32) throw new Error("The packaged browser test needs its one-time local API token.");
   } else {
     browserApiPort = await reserveLocalPort();
@@ -2878,7 +2878,7 @@ async function createMainWindow() {
 
 app.whenReady().then(async () => {
   if (app.isPackaged) await startPackagedServices();
-  else browserApiToken = await readBrowserApiToken();
+  else if (!browserApiToken) browserApiToken = await readBrowserApiToken();
   installMacApplicationMenu();
   registerIpc();
   startBrowserAutomationServer();
