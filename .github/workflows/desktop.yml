@@ -24,14 +24,14 @@ jobs:
             bundles: all
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
       - run: npm ci
@@ -60,7 +60,7 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
       - name: Packaged runtime smoke check
         run: uv run --project runtime python scripts/smoke-runtime.py --target ${{ matrix.target }} --agent-dir agents
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tribe-${{ matrix.target }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/**
@@ -83,14 +83,14 @@ jobs:
             package-app: release/electron/win-unpacked/Tribe.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - run: npm ci
       - run: python -m pip install uv
       - run: uv sync --project runtime --extra ai --extra desktop
@@ -111,7 +111,7 @@ jobs:
           TRIBE_BROWSER_E2E_SKIP_APPROVAL: "1"
       - name: Build Electron installer
         run: npx electron-builder --${{ matrix.package-platform }} ${{ matrix.package-target }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tribe-electron-${{ matrix.target }}
           path: release/electron/**
