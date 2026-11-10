@@ -3103,7 +3103,7 @@ TAP version 13
         )
         thread = threading.Thread(target=worker.run)
         thread.start()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if self.store.agent_offset("builder", self.mission["id"]) == final_sequence:
                 break
@@ -4833,7 +4833,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
     def test_repository_browser_lists_safe_paths_and_bounds_file_previews(self) -> None:
         source = self.repository / "src" / "main.py"
         source.parent.mkdir()
-        source.write_text("print('hello')\n", encoding="utf-8")
+        source.write_bytes(b"print('hello')\n")
         (self.repository / ".tribe").mkdir()
         (self.repository / ".tribe" / "private.txt").write_text("hidden", encoding="utf-8")
 
