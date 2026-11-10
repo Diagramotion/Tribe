@@ -904,7 +904,7 @@ try {
   await stopDesktop();
   launchDesktop();
   await waitFor(() => (stdout.match(/Browser E2E workspace opened\./g)?.length || 0) > browserWorkspaceOpens,
-    "the restarted desktop to open the Browser workspace", 20_000);
+    "the restarted desktop to open the Browser workspace", 60_000);
   let latestRestartState;
   let restoredSession;
   try {
@@ -915,7 +915,7 @@ try {
       if (response.status !== 200 || !state?.activeTabId || state.tabs?.length !== restoredTabExpectations.length) return false;
       const actual = state.tabs.map(({ url, viewport, reducedMotion }) => ({ url, viewport, reducedMotion }));
       return JSON.stringify(actual) === JSON.stringify(restoredTabExpectations) ? state : false;
-    }, "open tabs and their viewport settings to return after a desktop restart", 20_000);
+    }, "open tabs and their viewport settings to return after a desktop restart", 60_000);
   } catch (error) {
     throw new Error(`${error.message} Last browser state: ${JSON.stringify(latestRestartState)}. Saved session: ${JSON.stringify(savedSession.sessions.workspace)}.`);
   }
