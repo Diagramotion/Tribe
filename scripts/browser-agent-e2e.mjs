@@ -194,7 +194,12 @@ async function stopDesktop() {
   if (!desktop || desktop.exitCode !== null) return;
   const child = desktop;
   const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
-  child.kill("SIGTERM");
+  try {
+    const response = await request("quit");
+    assert.equal(response.status, 200, "the disposable desktop app must accept its authenticated shutdown request");
+  } catch {
+    child.kill("SIGTERM");
+  }
   await Promise.race([exited, delay(15_000)]);
   if (child.exitCode === null) {
     if (process.platform === "win32") {
