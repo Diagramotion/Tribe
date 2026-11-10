@@ -736,8 +736,8 @@ try {
   assert.equal(reloadedPixel.viewportSize.userAgentData.highEntropy.model, "Pixel 7");
   const responsive = await call("viewport", { tabId, viewport: "responsive", allowedDomains: ["127.0.0.1"] });
   assert.equal(responsive.viewport, "responsive");
-  assert.ok(responsive.viewportSize.width > 412);
-  assert.ok(responsive.viewportSize.height > 600);
+  assert.equal(responsive.viewportSize.width, baseline.viewportSize.width);
+  assert.equal(responsive.viewportSize.height, baseline.viewportSize.height);
   assert.equal(responsive.viewportSize.maxTouchPoints, baseline.viewportSize.maxTouchPoints);
   assert.equal(responsive.viewportSize.touch, false);
   const reducedMotionSnapshot = await call("snapshot", { tabId, allowedDomains: ["127.0.0.1"] });
