@@ -197,7 +197,15 @@ async function stopDesktop() {
   child.kill("SIGTERM");
   await Promise.race([exited, delay(15_000)]);
   if (child.exitCode === null) {
-    child.kill("SIGKILL");
+    if (process.platform === "win32") {
+      try {
+        execFileSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+          stdio: "ignore", windowsHide: true, timeout: 5_000,
+        });
+      } catch { /* The app may have exited between the timeout and taskkill. */ }
+    } else {
+      child.kill("SIGKILL");
+    }
     await Promise.race([new Promise((resolveExit) => child.once("exit", resolveExit)), delay(2_000)]);
   }
   assert.notEqual(child.exitCode, null, "the disposable desktop app must exit before its restart");
