@@ -1,0 +1,4 @@
+# The Vite preview uses import.meta.hot, which CodeQL's JavaScript parser
+# currently flags even though Vite compiles and runs it correctly.
+paths-ignore:
+  - src/dev/markdown-preview.jsx
