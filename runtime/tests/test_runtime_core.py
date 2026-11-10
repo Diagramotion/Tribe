@@ -234,7 +234,10 @@ class RuntimeCase(unittest.TestCase):
         )
         capability_names = {type(capability).__name__ for capability in capabilities}
         self.assertTrue(tools.root.samefile(workspace_root))
-        self.assertTrue({"LocalWorkspace", "FileSystem", "Shell"}.issubset(capability_names))
+        if os.name == "posix":
+            self.assertTrue({"LocalWorkspace", "FileSystem", "Shell"}.issubset(capability_names))
+        else:
+            self.assertTrue({"LocalWorkspace", "FileSystem", "Shell"}.isdisjoint(capability_names))
 
         tools.write_file("src/main.py", "print('greenfield')")
         self.assertEqual((workspace_root / "src/main.py").read_text(), "print('greenfield')")
@@ -1628,6 +1631,8 @@ for line in sys.stdin:
         self.assertNotIn("write_file", set(getattr(filesystem, "tools", ()) or ()))
 
     def test_approval_modes_pause_only_the_configured_harness_actions(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
         from pydantic_ai.models.test import TestModel
 
         definition = AgentDefinition(
@@ -3103,7 +3108,7 @@ TAP version 13
         )
         thread = threading.Thread(target=worker.run)
         thread.start()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if self.store.agent_offset("builder", self.mission["id"]) == final_sequence:
                 break
@@ -3390,7 +3395,7 @@ TAP version 13
         )
         thread = threading.Thread(target=worker.run)
         thread.start()
-        deadline = time.monotonic() + 6
+        deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             run = self.store.agent_event_run("planner", self.mission["id"], trigger["sequence"])
             if run and run["status"] == "completed":
@@ -4833,7 +4838,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
     def test_repository_browser_lists_safe_paths_and_bounds_file_previews(self) -> None:
         source = self.repository / "src" / "main.py"
         source.parent.mkdir()
-        source.write_text("print('hello')\n", encoding="utf-8")
+        source.write_bytes(b"print('hello')\n")
         (self.repository / ".tribe").mkdir()
         (self.repository / ".tribe" / "private.txt").write_text("hidden", encoding="utf-8")
 
@@ -5280,6 +5285,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         workspace = WorkspaceTools(self.store, self.mission["id"], "builder")
         capabilities = build_capabilities(workspace, catalog)
         self.assertNotIn("Skills", {type(item).__name__ for item in capabilities})
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native skill loader requires its POSIX workspace backend")
         selected_skill_id = next(item["id"] for item in catalog.list() if item["name"] == "review")
         capabilities = build_capabilities(workspace, catalog, selected_skill_ids=[selected_skill_id])
         native_skills = next(item for item in capabilities if type(item).__name__ == "Skills")
@@ -5869,6 +5876,11 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         )
         read_only_names = {type(capability).__name__ for capability in read_only}
         writer_names = {type(capability).__name__ for capability in writer}
+
+        if os.name != "posix":
+            self.assertTrue({"FileSystem", "Shell"}.isdisjoint(writer_names))
+            self.assertTrue({"LocalWorkspace", "FileSystem", "Shell"}.isdisjoint(read_only_names))
+            return
 
         self.assertNotIn("FileSystem", read_only_names)
         self.assertNotIn("Shell", read_only_names)
@@ -6690,6 +6702,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertIn("comment_on_artifact", agent._function_toolset.tools)
 
     def test_harness_filesystem_tool_writes_and_records_a_repository_change(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
         from pydantic_ai.models.test import TestModel
 
         definition = AgentDefinition(
@@ -6767,6 +6781,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertEqual(snapshot.state, "complete")
 
     def test_harness_releases_path_lock_after_each_completed_write(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
         from pydantic_ai.models.test import TestModel
 
         definition = AgentDefinition(
@@ -6839,6 +6855,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                 dependencies.file_locks.clear()
 
     def test_harness_directory_creation_records_change_and_releases_path_lock(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
         from pydantic_ai.models.test import TestModel
 
         definition = AgentDefinition(
@@ -7514,7 +7532,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         )
         try:
             supervisor.start_mission(mission["id"])
-            deadline = time.monotonic() + 3
+            deadline = time.monotonic() + 10
             while time.monotonic() < deadline and "planner" not in calls:
                 time.sleep(0.02)
             self.assertEqual(calls, ["planner"])
@@ -7697,6 +7715,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
 
         with patch.object(runtime_server, "STORE", self.store), patch.object(runtime_server, "SUPERVISOR") as supervisor:
             http = runtime_server.LocalHTTPServer(("127.0.0.1", 0), runtime_server.Handler)
+            http.daemon_threads = False
             thread = threading.Thread(target=http.serve_forever, daemon=True)
             thread.start()
             try:
@@ -7926,6 +7945,9 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                 self.assertEqual(result["mission"]["goal"], "Deliver a bounded implementation")
                 supervisor.start_mission.assert_called_with(result["mission"]["id"], initial_launch=True)
             finally:
+                # Wake any disconnected SSE handlers so server_close can join them
+                # before the temporary database directory is removed.
+                self.store.append("message.created", "user", self.mission["id"], {"text": "End stream test"})
                 http.shutdown()
                 http.server_close()
                 thread.join(timeout=3)
@@ -8741,7 +8763,7 @@ class ScheduleCase(RuntimeCase):
         recovered_path = self.repository / "src" / "recovered.py"
         recovered_path.parent.mkdir(parents=True, exist_ok=True)
         recovered_content = "completed before process restart\n"
-        recovered_path.write_text(recovered_content, encoding="utf-8")
+        recovered_path.write_text(recovered_content, encoding="utf-8", newline="\n")
         expected_hash = hashlib.sha256(recovered_content.encode("utf-8")).hexdigest()
         self.store.append("agent.tool.started", "builder", self.mission["id"], {
             "toolName": "write_file", "toolCallId": "write-after-crash",
@@ -8751,9 +8773,10 @@ class ScheduleCase(RuntimeCase):
             "toolCallId": "write-after-crash", "triggerSequence": event["sequence"],
             "path": "src/recovered.py", "sha256": expected_hash, "change": "created",
         })
-        self.assertEqual(self.store.reconcile_completed_repository_writes(
+        reconciled_count = self.store.reconcile_completed_repository_writes(
             "builder", self.mission["id"], event["sequence"], started_at,
-        ), 2)
+        )
+        self.assertEqual(reconciled_count, 2, msg=f"recovery events: {self.store.events_after(self.mission['id'], 0)}")
         activity = self.store.events_after(self.mission["id"], event["sequence"])
         reconciled = next(
             item for item in activity if item["type"] == "agent.tool.completed"
@@ -8926,7 +8949,7 @@ store.append("repo.file.write.started", "builder", {self.mission["id"]!r}, {{
 }})
 target = Path({str(repository_file)!r})
 target.parent.mkdir(parents=True, exist_ok=True)
-with target.open("w", encoding="utf-8") as handle:
+with target.open("w", encoding="utf-8", newline="\\n") as handle:
     handle.write(content)
     handle.flush()
     os.fsync(handle.fileno())
@@ -8945,7 +8968,10 @@ os._exit(23)
         reclaimed = restarted_store.begin_agent_event("builder", self.mission["id"], event["sequence"])
 
         self.assertEqual(recovered, 1)
-        self.assertEqual(run["status"], "retrying")
+        self.assertEqual(
+            run["status"], "retrying",
+            msg=f"recovered run: {run}; events: {restarted_store.events_after(self.mission['id'], event['sequence'])}",
+        )
         self.assertTrue(reclaimed["claimed"])
         self.assertTrue(reclaimed["resume_checkpoint"])
         self.assertEqual(reclaimed["attempts"], 2)

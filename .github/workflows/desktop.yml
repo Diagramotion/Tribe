@@ -2,10 +2,15 @@ name: Desktop builds
 
 on:
   pull_request:
+    branches: [main]
   push:
-    branches: ["**"]
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -21,7 +26,7 @@ jobs:
             bundles: app
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bundles: all
+            bundles: msi,nsis
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -35,9 +40,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: npm ci
+      - name: Build web assets for packaging checks
+        run: npm run build
       - run: python -m pip install uv
       - run: uv sync --project runtime --extra ai --extra desktop --extra test
       - name: Runtime invariants
+        env:
+          # The runtime tests construct provider-backed agents but never call the live API.
+          OPENAI_API_KEY: tribe-ci-test-key
         run: uv run --project runtime --extra ai --extra desktop --extra test python -m unittest discover -s runtime/tests
       - name: Sites packaging checks
         run: npm run test:sites
@@ -54,19 +64,78 @@ jobs:
           SWIFT_TOOLCHAIN="${SWIFT_BIN%/usr/bin/swift}"
           SWIFT_RUNTIME="$SWIFT_TOOLCHAIN/usr/lib/swift-5.5/macosx"
           test -f "$SWIFT_RUNTIME/libswift_Concurrency.dylib"
-          DYLD_LIBRARY_PATH="$SWIFT_RUNTIME${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+          DYLD_FALLBACK_LIBRARY_PATH="$SWIFT_RUNTIME${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
       - name: Native shell tests (Windows)
         if: runner.os == 'Windows'
         run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
       - name: Packaged runtime smoke check
         run: uv run --project runtime python scripts/smoke-runtime.py --target ${{ matrix.target }} --agent-dir agents
+      - name: Package macOS app for GitHub release
+        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'macOS'
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p release-assets
+          ditto -c -k --sequesterRsrc --keepParent \
+            "src-tauri/target/${{ matrix.target }}/release/bundle/macos/Tribe.app" \
+            "release-assets/Tribe-${RELEASE_VERSION}-macos-arm64.zip"
+      - name: Stage Windows installers for GitHub release
+        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'Windows'
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          $releaseDirectory = Join-Path $env:GITHUB_WORKSPACE "release-assets"
+          New-Item -ItemType Directory -Force -Path $releaseDirectory | Out-Null
+          $msi = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/msi" -Filter "*.msi" | Select-Object -First 1
+          $nsis = Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $msi -or -not $nsis) { throw "Expected both MSI and NSIS installers." }
+          Copy-Item $msi.FullName (Join-Path $releaseDirectory "Tribe-$env:RELEASE_VERSION-windows-x64.msi")
+          Copy-Item $nsis.FullName (Join-Path $releaseDirectory "Tribe-$env:RELEASE_VERSION-windows-x64-setup.exe")
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tribe-${{ matrix.target }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/**
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: tribe-release-${{ matrix.target }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download verified desktop installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-assets
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name tribe-release-aarch64-apple-darwin --dir release-assets
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name tribe-release-x86_64-pc-windows-msvc --dir release-assets
+          (cd release-assets && find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Tribe $GITHUB_REF_NAME" \
+            --notes-file "docs/releases/$GITHUB_REF_NAME.md" \
+            --latest
 
   electron-browser:
     name: Electron browser (${{ matrix.target }})
+    if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
@@ -102,15 +171,15 @@ jobs:
           TRIBE_BROWSER_E2E_AUTO_UPLOAD: "1"
           TRIBE_BROWSER_E2E_SKIP_APPROVAL: "1"
       - name: Build unpacked Electron app
-        run: npm run build && npm run runtime:package && npx electron-builder --${{ matrix.package-platform }} --dir
+        run: npm run build && npm run runtime:package && npx electron-builder --${{ matrix.package-platform }} --dir --publish never
+      - name: Build Electron installer
+        run: npx electron-builder --${{ matrix.package-platform }} ${{ matrix.package-target }} --publish never
       - name: Live packaged browser and agent test
         run: npm run test:browser:e2e
         env:
           TRIBE_BROWSER_E2E_PACKAGED_APP: ${{ matrix.package-app }}
           TRIBE_BROWSER_E2E_AUTO_UPLOAD: "1"
           TRIBE_BROWSER_E2E_SKIP_APPROVAL: "1"
-      - name: Build Electron installer
-        run: npx electron-builder --${{ matrix.package-platform }} ${{ matrix.package-target }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tribe-electron-${{ matrix.target }}
