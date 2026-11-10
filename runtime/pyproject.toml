@@ -26,7 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 ai = [
     "pydantic-ai-harness[skills]==0.61.0",
-    "pydantic-ai-slim[anthropic,cerebras,cohere,duckduckgo,google,groq,mcp,mistral,openai,openrouter,web-fetch,xai]==2.61.0",
+    "pydantic-ai-slim[anthropic,cerebras,cohere,duckduckgo,google,groq,mcp,mistral,openai,openrouter,web-fetch,xai]==2.66.0",
     "playwright>=1.52,<2",
 ]
 desktop = ["pyinstaller>=6.10,<7"]
