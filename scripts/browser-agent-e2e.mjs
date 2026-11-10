@@ -216,7 +216,20 @@ function killWindowsProcessTree(child) {
     execFileSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
       stdio: "ignore", windowsHide: true, timeout: 5_000,
     });
-  } catch { /* The app may have exited between the timeout and taskkill. */ }
+  } catch { /* The root process may have exited while its descendants remain. */ }
+
+  const script = [
+    "$processes = Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId",
+    `$pending = [System.Collections.Generic.Queue[int]]::new(); $pending.Enqueue(${child.pid})`,
+    "$descendants = [System.Collections.Generic.List[int]]::new()",
+    "while ($pending.Count -gt 0) { $parent = $pending.Dequeue(); foreach ($process in $processes) { if ($process.ParentProcessId -eq $parent) { $descendants.Add([int]$process.ProcessId); $pending.Enqueue([int]$process.ProcessId) } } }",
+    "for ($index = $descendants.Count - 1; $index -ge 0; $index--) { Stop-Process -Id $descendants[$index] -Force -ErrorAction SilentlyContinue }",
+  ].join("; ");
+  try {
+    execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      stdio: "ignore", windowsHide: true, timeout: 15_000,
+    });
+  } catch { /* Best-effort cleanup; the CI step reports a timeout if handles remain. */ }
 }
 
 function runProcess(command, args, { cwd, env, input = "", timeoutMs = 300_000 }) {
