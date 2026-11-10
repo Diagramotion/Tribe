@@ -60,7 +60,7 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
       - name: Packaged runtime smoke check
         run: uv run --project runtime python scripts/smoke-runtime.py --target ${{ matrix.target }} --agent-dir agents
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tribe-${{ matrix.target }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/**
@@ -111,7 +111,7 @@ jobs:
           TRIBE_BROWSER_E2E_SKIP_APPROVAL: "1"
       - name: Build Electron installer
         run: npx electron-builder --${{ matrix.package-platform }} ${{ matrix.package-target }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tribe-electron-${{ matrix.target }}
           path: release/electron/**
