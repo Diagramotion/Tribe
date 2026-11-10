@@ -24,12 +24,12 @@ async function request(path, options) {
   throw lastError;
 }
 
-async function requestBlob(path) {
+async function requestBlob(path, options) {
   const attempts = 20;
   let lastError;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      const response = await fetch(`${API_BASE}${path}`);
+      const response = await fetch(`${API_BASE}${path}`, options);
       if (!response.ok) {
         const data = await response.json();
         throw new Error(data.error ?? `Could not complete the request (${response.status})`);
@@ -151,6 +151,30 @@ export const runtime = {
   saveRecipe: (recipe) => request("/api/recipes", {
     method: "POST", body: JSON.stringify(recipe),
   }),
+  listDesignSystems: () => request("/api/design-systems"),
+  deleteDesignSystem: (id) => request(`/api/design-systems/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  listDesignSystemVersions: (id) => request(`/api/design-systems/${encodeURIComponent(id)}/versions`),
+  getDesignSystemVersion: (id, version) => request(`/api/design-systems/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}`),
+  exportDesignSystemPackage: (system) => requestBlob("/api/design-systems/export", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ system }),
+  }),
+  readDesignSystemPackageArchive: (archive) => request("/api/design-systems/read-package", {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: archive,
+  }),
+  saveDesignSystem: (system, expectedVersion) => request("/api/design-systems", {
+    method: "POST", body: JSON.stringify({ system, expectedVersion }),
+  }),
+  applyDesignSystem: (projectId, designSystem) => request(`/api/projects/${encodeURIComponent(projectId)}/design-system`, {
+    method: "PUT", body: JSON.stringify({ designSystem }),
+  }),
+  getProjectDesignSystem: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/design-system`),
+  clearProjectDesignSystem: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/design-system`, {
+    method: "PUT", body: JSON.stringify({ remove: true }),
+  }),
   createProject: (repository, name) => request("/api/projects", {
     method: "POST", body: JSON.stringify({ repository, name }),
   }),
@@ -237,6 +261,7 @@ export const runtime = {
     }
     return request(`/api/projects/${encodeURIComponent(projectId)}/artifacts?${params}`);
   },
+  listProjectExperimentRuns: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/experiments`),
   exportBackup: async () => {
     const response = await fetch(`${API_BASE}/api/backup`, { headers: { Accept: "application/octet-stream" } });
     if (!response.ok) {
@@ -301,6 +326,10 @@ export const runtime = {
   getInteractiveAccess: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/interactive-access`),
   setInteractiveAccess: (projectId, enabled) => request(`/api/projects/${encodeURIComponent(projectId)}/interactive-access`, {
     method: "PUT", body: JSON.stringify({ enabled }),
+  }),
+  getProjectApprovalPolicy: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/approval-policy`),
+  setProjectApprovalPolicy: (projectId, mode) => request(`/api/projects/${encodeURIComponent(projectId)}/approval-policy`, {
+    method: "PUT", body: JSON.stringify({ mode }),
   }),
   listComputerRequests: () => request("/api/computer/requests"),
   claimComputerRequest: (id, completionToken) => request(`/api/computer/requests/${encodeURIComponent(id)}/claim`, {
@@ -430,8 +459,9 @@ export const runtime = {
   }),
   listCommands: (missionId) => request(`/api/commands?mission=${encodeURIComponent(missionId)}`),
   listAgentRequests: (missionId) => request(`/api/agent-requests?mission=${encodeURIComponent(missionId)}`),
-  startCommand: (missionId, command) => request("/api/commands", {
-    method: "POST", body: JSON.stringify({ missionId, command }),
+  listNotebookEnvironments: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/notebook-environments`),
+  startCommand: (missionId, command, options = {}) => request("/api/commands", {
+    method: "POST", body: JSON.stringify({ missionId, command, ...options }),
   }),
   stopCommand: (runId) => request(`/api/commands/${encodeURIComponent(runId)}/stop`, {
     method: "POST", body: JSON.stringify({}),
@@ -447,6 +477,23 @@ export const runtime = {
     }
     return request(`/api/schedules/${encodeURIComponent(id)}/runs?${query}`);
   },
+  listEventTriggerFailures: (projectId, beforeStartedAt, beforeId, limit = 20) => {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (projectId) query.set("project", projectId);
+    if (beforeStartedAt && beforeId) {
+      query.set("beforeStartedAt", beforeStartedAt);
+      query.set("beforeId", beforeId);
+    }
+    return request(`/api/event-trigger-failures?${query}`);
+  },
+  dismissEventTriggerFailure: (projectId, scheduleId, runId) => request(
+    `/api/schedules/${encodeURIComponent(scheduleId)}/runs/${encodeURIComponent(runId)}/dismiss`,
+    { method: "POST", body: JSON.stringify({ projectId }) },
+  ),
+  retryEventScheduleRun: (projectId, scheduleId, runId) => request(
+    `/api/schedules/${encodeURIComponent(scheduleId)}/runs/${encodeURIComponent(runId)}/retry`,
+    { method: "POST", body: JSON.stringify({ projectId }) },
+  ),
   getUsage: (projectId) => request(`/api/usage?project=${encodeURIComponent(projectId)}`),
   setUsageBudget: (projectId, monthlyTokensLimit, maxRunCostUsd, maxRunTokens) => request(`/api/projects/${encodeURIComponent(projectId)}/usage-budget`, {
     method: "PUT", body: JSON.stringify({ monthlyTokensLimit, maxRunCostUsd, maxRunTokens }),
@@ -455,11 +502,11 @@ export const runtime = {
   setWebAccess: (projectId, enabled, allowedDomains) => request(`/api/projects/${encodeURIComponent(projectId)}/web-access`, {
     method: "PUT", body: JSON.stringify({ enabled, allowedDomains }),
   }),
-  createSchedule: (projectId, title, prompt, cadence, timezone, deliveryTime, runAt = null, cronExpression = "", targetMissionId = "") => request("/api/schedules", {
-    method: "POST", body: JSON.stringify({ projectId, title, prompt, cadence, timezone, deliveryTime, runAt, cronExpression, targetMissionId }),
+  createSchedule: (projectId, title, prompt, cadence, timezone, deliveryTime, runAt = null, cronExpression = "", targetMissionId = "", triggerEventType = "", eventSourceMissionId = "", eventPathPattern = "", eventAutoRetryLimit = 0, eventExternalRepository = "") => request("/api/schedules", {
+    method: "POST", body: JSON.stringify({ projectId, title, prompt, cadence, timezone, deliveryTime, runAt, cronExpression, targetMissionId, triggerEventType, eventSourceMissionId, eventPathPattern, eventAutoRetryLimit, eventExternalRepository }),
   }),
-  editSchedule: (projectId, id, title, prompt, cadence, timezone, deliveryTime, runAt = null, cronExpression = "", targetMissionId = "") => request(`/api/schedules/${encodeURIComponent(id)}`, {
-    method: "PUT", body: JSON.stringify({ projectId, title, prompt, cadence, timezone, deliveryTime, runAt, cronExpression, targetMissionId }),
+  editSchedule: (projectId, id, title, prompt, cadence, timezone, deliveryTime, runAt = null, cronExpression = "", targetMissionId = "", triggerEventType = "", eventSourceMissionId = "", eventPathPattern = "", eventAutoRetryLimit = 0, eventExternalRepository = "") => request(`/api/schedules/${encodeURIComponent(id)}`, {
+    method: "PUT", body: JSON.stringify({ projectId, title, prompt, cadence, timezone, deliveryTime, runAt, cronExpression, targetMissionId, triggerEventType, eventSourceMissionId, eventPathPattern, eventAutoRetryLimit, eventExternalRepository }),
   }),
   updateSchedule: (projectId, id, action) => request(`/api/schedules/${encodeURIComponent(id)}/${action}`, {
     method: "POST", body: JSON.stringify({ projectId }),

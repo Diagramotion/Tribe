@@ -48,6 +48,7 @@ export function schedulePresentation(schedule, agentsConfigured, now = Date.now(
   const nextRun = ["completed", "cancelled", "failed"].includes(schedule.status)
     ? "No upcoming run"
     : oneOffInProgress ? `${activeRun.mission_title} · ${runStatusLabels[activeRun.status]}`
+      : schedule.cadence === "event" ? "Waiting for a matching event"
       : waiting ? "Next run when agents are ready"
         : schedule.status === "paused" ? "Paused · resume to continue"
           : `Next run ${new Date(dueAt).toLocaleString()}`;

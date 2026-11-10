@@ -48,15 +48,14 @@ test("every Workspace Settings category renders without missing UI components", 
     assert.match(html, new RegExp(expectedText));
     assert.match(html, /role="tabpanel"/);
     if (initialSection === "models") {
-      assert.match(html, /value="google:gemini-3\.1-flash-lite-image"/);
-      assert.match(html, /value="google:gemini-3-pro-image"/);
-      assert.match(html, /value="xai:grok-imagine-image-2\.0"/);
-      assert.match(html, /value="xai:grok-imagine-image"/);
+      assert.match(html, /Fallback image model/);
+      assert.match(html, /Native support only/);
+      assert.match(html, /only to roles granted the Image generation capability/);
     }
     if (initialSection === "web-search") {
       assert.match(html, /Automatic · model provider, with DuckDuckGo fallback/);
-      assert.match(html, /DuckDuckGo only/);
-      assert.match(html, /value="off"/);
+      assert.match(html, /Search provider/);
+      assert.match(html, /tribe-select-trigger/);
     }
   }
 });

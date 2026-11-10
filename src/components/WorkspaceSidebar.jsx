@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   CaretDown, CaretRight, ChatCircleDots, ClockCounterClockwise, DotsThree,
-  FileText, FolderOpen, FolderSimple, Gear, GitBranch, Globe, Plus, Sparkle, Trash,
+  FileText, FolderOpen, FolderSimple, Gear, GitBranch, Globe, PaintBrush, Plus, PushPin, Sparkle, Trash,
 } from "@phosphor-icons/react";
 import tribeMark from "../assets/tribe-mark.svg";
 import { compactChatTitle } from "../domain/chat-title.js";
@@ -22,11 +22,39 @@ export function IconButton({ label, className = "", children, ...props }) {
   );
 }
 
+function ExplorerRowButton({ leading, trailing, className = "", children, ...props }) {
+  return (
+    <button className={`explorer-row-button ${className}`.trim()} type="button" {...props}>
+      {leading && <span className="explorer-row-leading" aria-hidden="true">{leading}</span>}
+      <span className="explorer-row-label">{children}</span>
+      {trailing}
+    </button>
+  );
+}
+
 export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onSelectMission, onSelectGeneralChat, onCreateGeneralChat, selectedGeneralChat, generalChats = [], onCreateProject, onCreateMission, onOpenProjectSettings, onArchiveMission, onRestoreMission, onDeleteMission, onDeleteProject, project, mission, projects }) {
+  const pinnedStorageKey = "tribe.sidebar.pinned-items";
   const [expandedProjects, setExpandedProjects] = useState(() => new Set(project?.id ? [project.id] : []));
   const [expandedArchived, setExpandedArchived] = useState(new Set());
   const [projectQuery, setProjectQuery] = useState("");
   const [openMenu, setOpenMenu] = useState(null);
+  const [showAllRecentChats, setShowAllRecentChats] = useState(false);
+  const [pinnedItems, setPinnedItems] = useState(() => {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(pinnedStorageKey) ?? "[]");
+      return Array.isArray(saved) ? saved.filter((item) => typeof item === "string") : [];
+    } catch {
+      return [];
+    }
+  });
+  useEffect(() => {
+    try { window.localStorage.setItem(pinnedStorageKey, JSON.stringify(pinnedItems)); } catch { /* Pins remain available for this session. */ }
+  }, [pinnedItems]);
+  function isPinned(type, id) { return pinnedItems.includes(`${type}:${id}`); }
+  function togglePin(type, id) {
+    const key = `${type}:${id}`;
+    setPinnedItems((current) => current.includes(key) ? current.filter((item) => item !== key) : [key, ...current]);
+  }
   function toggleMenu(key, event) {
     if (openMenu?.key === key) { setOpenMenu(null); return; }
     const rect = event.currentTarget.getBoundingClientRect();
@@ -60,11 +88,29 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
   const workspaceItems = [
     { label: "Browser", icon: Globe, tab: "Browser" },
     { label: "Scheduled tasks", icon: ClockCounterClockwise, tab: "WorkspaceSchedules" },
+    { label: "Design systems", icon: PaintBrush, tab: "DesignSystems" },
     { label: "Skills", icon: Sparkle, tab: "Skills" },
     { label: "Workflows", icon: GitBranch, tab: "Recipes" },
   ];
-  const visibleProjects = projects.filter((item) => `${item.name} ${item.repository} ${(item.missions ?? []).map((session) => session.title).join(" ")}`.toLowerCase().includes(projectQuery.trim().toLowerCase()));
-  const visibleGeneralChats = generalChats.filter((chat) => chat.title.toLowerCase().includes(projectQuery.trim().toLowerCase()));
+  const query = projectQuery.trim().toLowerCase();
+  const visibleProjects = [...projects]
+    .filter((item) => `${item.name} ${item.repository} ${(item.missions ?? []).map((session) => session.title).join(" ")}`.toLowerCase().includes(query))
+    .sort((a, b) => Number(isPinned("project", b.id)) - Number(isPinned("project", a.id)) || pinnedItems.indexOf(`project:${a.id}`) - pinnedItems.indexOf(`project:${b.id}`));
+  const sortedGeneralChats = [...generalChats]
+    .filter((chat) => chat.title.toLowerCase().includes(query))
+    .sort((a, b) => {
+      const aPin = pinnedItems.indexOf(`chat:${a.id}`);
+      const bPin = pinnedItems.indexOf(`chat:${b.id}`);
+      if (aPin !== -1 || bPin !== -1) return aPin === -1 ? 1 : bPin === -1 ? -1 : aPin - bPin;
+      return Date.parse(b.updated_at ?? b.updatedAt ?? b.created_at ?? "") - Date.parse(a.updated_at ?? a.updatedAt ?? a.created_at ?? "");
+    });
+  const pinnedChats = sortedGeneralChats.filter((chat) => isPinned("chat", chat.id));
+  const unpinnedChats = sortedGeneralChats.filter((chat) => !isPinned("chat", chat.id));
+  const recentChatLimit = 5;
+  const recentChats = query || showAllRecentChats
+    ? sortedGeneralChats
+    : [...pinnedChats, ...unpinnedChats.slice(0, recentChatLimit), ...(selectedGeneralChat && !isPinned("chat", selectedGeneralChat.id) && !unpinnedChats.slice(0, recentChatLimit).some((chat) => chat.id === selectedGeneralChat.id) ? [sortedGeneralChats.find((chat) => chat.id === selectedGeneralChat.id)].filter(Boolean) : [])];
+  const hiddenRecentChatCount = query ? 0 : Math.max(0, sortedGeneralChats.length - recentChats.length);
 
   return (
     <aside className={`sidebar ${collapsed ? "sidebar--collapsed" : ""}`}>
@@ -75,36 +121,63 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
 
       {!collapsed && <section className="project-explorer" aria-label="Project explorer">
         <div className="project-explorer-heading"><span className="sidebar-section-label">Project explorer</span><button aria-label="Add project" className="explorer-add" onClick={onCreateProject} title="Add project" type="button"><Plus size={15} /></button></div>
-        <input aria-label="Filter projects" className="project-explorer-search" onChange={(event) => setProjectQuery(event.target.value)} placeholder="Find a project" value={projectQuery} />
-        <button className="explorer-new-mission project-new-mission" onClick={onCreateGeneralChat} type="button"><ChatCircleDots size={15} />New chat</button>
+        <input aria-label="Find projects and chats" className="project-explorer-search" onChange={(event) => setProjectQuery(event.target.value)} placeholder="Find projects and chats" value={projectQuery} />
+        <ExplorerRowButton className="explorer-new-chat-row" leading={<ChatCircleDots size={15} />} onClick={onCreateGeneralChat}>New chat</ExplorerRowButton>
         <div className="project-explorer-list">
-          {visibleGeneralChats.length > 0 && <div className="explorer-general-chats"><span className="sidebar-section-label">General chats</span>{visibleGeneralChats.map((chat) => <button aria-current={selectedGeneralChat?.id === chat.id ? "page" : undefined} className={`explorer-mission ${selectedGeneralChat?.id === chat.id ? "explorer-mission--selected" : ""}`} key={chat.id} onClick={() => onSelectGeneralChat(chat.id)} title={chat.title} type="button"><ChatCircleDots aria-hidden="true" className="explorer-general-chat-icon" size={14} /><span>{chat.title}</span></button>)}</div>}
+          {sortedGeneralChats.length > 0 && <div className="explorer-general-chats">
+            <span className="sidebar-section-label">Recent chats</span>
+            {recentChats.map((chat) => <div className="explorer-chat-row explorer-chat-row--recent" key={chat.id}>
+              <ExplorerRowButton aria-current={selectedGeneralChat?.id === chat.id ? "page" : undefined} className={`explorer-mission ${selectedGeneralChat?.id === chat.id ? "explorer-mission--selected" : ""}`} leading={<ChatCircleDots className="explorer-general-chat-icon" size={15} />} onClick={() => onSelectGeneralChat(chat.id)} title={chat.title} trailing={isPinned("chat", chat.id) && <PushPin aria-label="Pinned" className="explorer-pin-indicator" size={12} weight="fill" />}>
+                {chat.title}
+              </ExplorerRowButton>
+              <div className="explorer-menu-wrap">
+                <button aria-expanded={openMenu?.key === `general-chat-${chat.id}`} aria-label={`More actions for ${chat.title}`} className="explorer-menu-trigger" onClick={(event) => toggleMenu(`general-chat-${chat.id}`, event)} title={`More actions for ${chat.title}`} type="button"><DotsThree size={17} weight="bold" /></button>
+                {openMenu?.key === `general-chat-${chat.id}` && createPortal(<div className="explorer-context-menu" onClick={(event) => event.stopPropagation()} role="menu" style={{ left: openMenu.left, top: openMenu.top }}>
+                  <button onClick={() => { setOpenMenu(null); onSelectGeneralChat(chat.id); }} role="menuitem" type="button"><ChatCircleDots size={15} />Open chat</button>
+                  <button onClick={() => { setOpenMenu(null); togglePin("chat", chat.id); }} role="menuitem" type="button"><PushPin size={15} />{isPinned("chat", chat.id) ? "Unpin chat" : "Pin chat"}</button>
+                </div>, document.body)}
+              </div>
+            </div>)}
+            {hiddenRecentChatCount > 0 && <button aria-expanded={showAllRecentChats} className="explorer-show-more" onClick={() => setShowAllRecentChats(true)} type="button">Show {hiddenRecentChatCount} more</button>}
+            {!query && showAllRecentChats && sortedGeneralChats.length > recentChatLimit && <button className="explorer-show-more" onClick={() => setShowAllRecentChats(false)} type="button">Show fewer</button>}
+          </div>}
+          <div className="explorer-projects-heading"><span className="sidebar-section-label">Projects</span></div>
           {visibleProjects.map((item) => <div className="explorer-project" key={item.id}>
-            <div className={`explorer-project-row ${project.id === item.id ? "explorer-project-row--selected" : ""}`} onClick={() => toggleProject(item.id)}>
-              <button aria-label={`${expandedProjects.has(item.id) ? "Collapse" : "Expand"} ${item.name}`} aria-expanded={expandedProjects.has(item.id)} className="explorer-disclosure" type="button">{expandedProjects.has(item.id) ? <FolderOpen size={15} /> : <FolderSimple size={15} />}</button>
-              <button aria-current={project.id === item.id ? "page" : undefined} className={`explorer-project-button ${project.id === item.id ? "explorer-project-button--selected" : ""}`} onClick={() => onSelectProject(item)} title={item.repository} type="button"><span>{item.name}</span><small>{item.missions?.length ?? 0}</small></button>
+            <div className={`explorer-project-row ${project.id === item.id ? "explorer-project-row--selected" : ""}`}>
+              <ExplorerRowButton aria-current={project.id === item.id ? "page" : undefined} aria-expanded={expandedProjects.has(item.id)} aria-label={`${item.name} · ${expandedProjects.has(item.id) ? "Collapse" : "Expand"} chats`} className={`explorer-project-button ${project.id === item.id ? "explorer-project-button--selected" : ""}`} leading={expandedProjects.has(item.id) ? <FolderOpen size={15} /> : <FolderSimple size={15} />} onClick={() => { if (project.id !== item.id) onSelectProject(item); toggleProject(item.id); }} title={item.name} trailing={<>{isPinned("project", item.id) && <PushPin aria-label="Pinned" className="explorer-pin-indicator" size={12} weight="fill" />}<small aria-label={`${item.missions?.length ?? 0} chats`} title={`${item.missions?.length ?? 0} chats`}>{item.missions?.length ?? 0}</small></>}>
+                {item.name}
+              </ExplorerRowButton>
               <div className="explorer-menu-wrap">
                 <button aria-expanded={openMenu?.key === `project-${item.id}`} aria-label={`More actions for ${item.name}`} className="explorer-menu-trigger" onClick={(event) => { event.stopPropagation(); toggleMenu(`project-${item.id}`, event); }} title={`More actions for ${item.name}`} type="button"><DotsThree size={17} weight="bold" /></button>
                 {openMenu?.key === `project-${item.id}` && createPortal(<div className="explorer-context-menu" onClick={(event) => event.stopPropagation()} role="menu" style={{ left: openMenu.left, top: openMenu.top }}>
                   <button onClick={() => { setOpenMenu(null); onCreateMission(item); }} role="menuitem" type="button"><ChatCircleDots size={15} />New chat</button>
                   <button onClick={() => { setOpenMenu(null); onOpenProjectSettings?.(item, openMenu?.trigger); }} role="menuitem" type="button"><Gear size={15} />Project settings</button>
                   {item.repository && <button onClick={() => { setOpenMenu(null); onSelectProject(item); onNavigate("Code"); }} role="menuitem" type="button"><FolderSimple size={15} />Open repository</button>}
+                  <button onClick={() => { setOpenMenu(null); togglePin("project", item.id); }} role="menuitem" type="button"><PushPin size={15} />{isPinned("project", item.id) ? "Unpin project" : "Pin project"}</button>
                   <div className="explorer-context-menu-divider" />
                   <button className="explorer-context-menu-danger" onClick={() => { setOpenMenu(null); onDeleteProject(item.id); }} role="menuitem" type="button"><Trash size={15} />Delete project</button>
                 </div>, document.body)}
               </div>
             </div>
             {expandedProjects.has(item.id) && <div className="explorer-missions">
-              {(item.missions ?? []).filter((session) => !session.archived_at).map((session) => {
+              {[...(item.missions ?? []).filter((session) => !session.archived_at)].sort((a, b) => {
+                const aPin = pinnedItems.indexOf(`chat:${a.id}`);
+                const bPin = pinnedItems.indexOf(`chat:${b.id}`);
+                if (aPin !== -1 || bPin !== -1) return aPin === -1 ? 1 : bPin === -1 ? -1 : aPin - bPin;
+                return Date.parse(b.updated_at ?? b.updatedAt ?? b.created_at ?? "") - Date.parse(a.updated_at ?? a.updatedAt ?? a.created_at ?? "");
+              }).map((session) => {
                 const statusLabel = missionStatusLabel(session.status);
                 const displayTitle = compactChatTitle(session.title);
                 return <div className="explorer-chat-row" key={session.id}>
-                <button aria-current={mission?.id === session.id ? "page" : undefined} aria-label={`Open chat: ${displayTitle} · ${statusLabel}`} className={`explorer-mission ${mission?.id === session.id ? "explorer-mission--selected" : ""}`} onClick={() => onSelectMission(session.id, item)} title={`${session.title} · ${statusLabel}`} type="button"><i aria-hidden="true" className={`explorer-mission-dot explorer-mission-dot--${session.status}`} /><span>{displayTitle}</span></button>
+                <ExplorerRowButton aria-current={mission?.id === session.id ? "page" : undefined} aria-label={`Open chat: ${displayTitle} · ${statusLabel}`} className={`explorer-mission ${mission?.id === session.id ? "explorer-mission--selected" : ""}`} leading={<i aria-hidden="true" className={`explorer-mission-dot explorer-mission-dot--${session.status}`} />} onClick={() => onSelectMission(session.id, item)} title={`${session.title} · ${statusLabel}`} trailing={isPinned("chat", session.id) && <PushPin aria-label="Pinned" className="explorer-pin-indicator" size={12} weight="fill" />}>
+                  {displayTitle}
+                </ExplorerRowButton>
                 <div className="explorer-menu-wrap">
                   <button aria-expanded={openMenu?.key === `chat-${session.id}`} aria-label={`More actions for ${displayTitle}`} className="explorer-menu-trigger" onClick={(event) => toggleMenu(`chat-${session.id}`, event)} title={`More actions for ${displayTitle}`} type="button"><DotsThree size={17} weight="bold" /></button>
                   {openMenu?.key === `chat-${session.id}` && createPortal(<div className="explorer-context-menu" role="menu" style={{ left: openMenu.left, top: openMenu.top }}>
                     <button onClick={() => { setOpenMenu(null); onSelectMission(session.id, item); }} role="menuitem" type="button"><ChatCircleDots size={15} />Open chat</button>
                     <button onClick={() => { setOpenMenu(null); onCreateMission(item); }} role="menuitem" type="button"><Plus size={15} />New chat in {item.name}</button>
+                    <button onClick={() => { setOpenMenu(null); togglePin("chat", session.id); }} role="menuitem" type="button"><PushPin size={15} />{isPinned("chat", session.id) ? "Unpin chat" : "Pin chat"}</button>
                     <button onClick={() => { setOpenMenu(null); onArchiveMission(session.id); }} role="menuitem" type="button"><ClockCounterClockwise size={15} />{session.status === "active" ? "Pause and archive chat" : "Archive chat"}</button>
                     <button className="explorer-context-menu-danger" onClick={() => { setOpenMenu(null); onDeleteMission(session.id); }} role="menuitem" type="button"><Trash size={15} />Delete permanently</button>
                   </div>, document.body)}
@@ -114,10 +187,13 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
               {(item.missions ?? []).some((session) => session.archived_at) && <>
                 <button aria-expanded={expandedArchived.has(item.id)} className="explorer-archived-toggle" onClick={() => setExpandedArchived((current) => { const next = new Set(current); next.has(item.id) ? next.delete(item.id) : next.add(item.id); return next; })} type="button">{expandedArchived.has(item.id) ? <CaretDown size={13} /> : <CaretRight size={13} />} Archived chats <small>{item.missions.filter((session) => session.archived_at).length}</small></button>
                 {expandedArchived.has(item.id) && (item.missions ?? []).filter((session) => session.archived_at).map((session) => <div className="explorer-chat-row" key={session.id}>
-                  <button aria-current={mission?.id === session.id ? "page" : undefined} aria-label={`Open archived chat: ${compactChatTitle(session.title)}`} className={`explorer-mission explorer-mission--archived ${mission?.id === session.id ? "explorer-mission--selected" : ""}`} onClick={() => onSelectMission(session.id, item)} title={`${session.title} · Archived`} type="button"><i className="explorer-mission-dot explorer-mission-dot--archived" /><span>{compactChatTitle(session.title)}</span></button>
+                  <ExplorerRowButton aria-current={mission?.id === session.id ? "page" : undefined} aria-label={`Open archived chat: ${compactChatTitle(session.title)}`} className={`explorer-mission explorer-mission--archived ${mission?.id === session.id ? "explorer-mission--selected" : ""}`} leading={<i aria-hidden="true" className="explorer-mission-dot explorer-mission-dot--archived" />} onClick={() => onSelectMission(session.id, item)} title={`${session.title} · Archived`}>
+                    {compactChatTitle(session.title)}
+                  </ExplorerRowButton>
                   <div className="explorer-menu-wrap"><button aria-expanded={openMenu?.key === `chat-${session.id}`} aria-label={`More actions for ${session.title}`} className="explorer-menu-trigger" onClick={(event) => toggleMenu(`chat-${session.id}`, event)} title={`More actions for ${session.title}`} type="button"><DotsThree size={17} weight="bold" /></button>
                     {openMenu?.key === `chat-${session.id}` && createPortal(<div className="explorer-context-menu" role="menu" style={{ left: openMenu.left, top: openMenu.top }}>
                       <button onClick={() => { setOpenMenu(null); onCreateMission(item); }} role="menuitem" type="button"><Plus size={15} />New chat in {item.name}</button>
+                      <button onClick={() => { setOpenMenu(null); togglePin("chat", session.id); }} role="menuitem" type="button"><PushPin size={15} />{isPinned("chat", session.id) ? "Unpin chat" : "Pin chat"}</button>
                       <button onClick={() => { setOpenMenu(null); onRestoreMission(session.id); }} role="menuitem" type="button"><ClockCounterClockwise size={15} />Restore chat</button>
                       <button className="explorer-context-menu-danger" onClick={() => { setOpenMenu(null); onDeleteMission(session.id); }} role="menuitem" type="button"><Trash size={15} />Delete permanently</button>
                     </div>, document.body)}

@@ -29,7 +29,9 @@ from zoneinfo import ZoneInfo
 from pydantic_ai import RunContext
 
 from tribe_runtime import project_memory
+from tribe_runtime.design_systems import export_design_system_package
 from tribe_runtime.agent_runtime import (
+    _design_system_context,
     AgentDependencies,
     AgentSupervisor,
     AgentWorker,
@@ -888,6 +890,179 @@ for line in sys.stdin:
         event = self.store.events_after(mission["id"], 0)[0]
         self.assertEqual(event["payload"]["workflow"]["version"], saved.version)
 
+    def test_design_system_versions_apply_to_project_and_survive_reload(self) -> None:
+        system = {
+            "name": "Field kit", "description": "Research components", "source": "user",
+            "tokens": {
+                "canvas": "#111827", "surface": "#182234", "raised": "#202d42",
+                "text": "#e8edf5", "muted": "#a0aec2", "accent": "#6b9df7",
+                "line": "#42516a", "focus": "#83c5ff", "success": "#59d5a2",
+                "warning": "#ffb34d", "danger": "#f07d7d", "radius": "8px",
+                "spacing": "12px", "fontSize": "14px", "font": "'Inter', 'SF Pro', sans-serif",
+            },
+            "components": {"button": "Clear actions", "card": "Open groups", "input": "Visible focus"},
+            "guidance": "Keep data labels readable.", "references": [],
+            "category": "Research", "license": "Apache-2.0", "tags": ["data", "research"],
+            "manifest": {"schemaVersion": "od-design-system-project/v1", "id": "field-kit"},
+            "packageFiles": [
+                {"path": "DESIGN.md", "content": "# Design rules"},
+                {"path": "tokens.css", "content": ":root { --bg: #111827; }"},
+                {"path": "source/evidence report.md", "content": "Source notes"},
+                {"path": "source/evidence.json", "content": '{"schema":"tribe-design-system-evidence/v1"}'},
+                {"path": "tokens/field-kit.tokens", "content": '{"color":{"primary":{"$type":"color","$value":"#6b9df7"}}}'},
+            ],
+        }
+        palette_steps = [50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 950]
+        system["palettes"] = {
+            role: [{"step": step, "color": "#6b9df7"} for step in palette_steps]
+            for role in ("brand", "neutral", "success", "warning", "danger")
+        }
+        invalid_palette = {**system, "palettes": {**system["palettes"], "brand": system["palettes"]["brand"][:-1]}}
+        with self.assertRaisesRegex(ValueError, "design_system_palette_brand_invalid"):
+            self.store.save_design_system(invalid_palette)
+        saved = self.store.save_design_system(system)
+        self.assertEqual(saved["version"], 1)
+        self.assertEqual(saved["palettes"]["brand"][5], {"step": 500, "color": "#6b9df7"})
+        self.assertEqual(saved["packageFiles"][0]["path"], "DESIGN.md")
+        self.assertEqual(saved["packageFiles"][2]["path"], "source/evidence report.md")
+        self.assertEqual(saved["packageFiles"][3]["path"], "source/evidence.json")
+        self.assertEqual(saved["license"], "Apache-2.0")
+        package = zipfile.ZipFile(io.BytesIO(export_design_system_package(saved)))
+        self.assertIn("manifest.json", package.namelist())
+        self.assertIn("DESIGN.md", package.namelist())
+        self.assertIn("tokens.css", package.namelist())
+        self.assertIn("components.html", package.namelist())
+        self.assertIn("source/evidence.json", package.namelist())
+        self.assertIn("tokens/field-kit.tokens", package.namelist())
+        manifest = json.loads(package.read("manifest.json"))
+        self.assertEqual(manifest["files"]["designTokens"], "tokens/field-kit.tokens")
+        self.assertNotIn("design-tokens.json", package.namelist())
+        self.assertIn("tribe-system.json", package.namelist())
+        self.assertEqual(package.read("DESIGN.md").decode(), "# Design rules")
+        http_reference = self.store.save_design_system({
+            **system,
+            "name": "HTTP visual reference",
+            "sourceUrl": "http://design.example/reference",
+            "references": [{"url": "http://design.example/reference", "label": "Captured visual reference"}],
+        })
+        self.assertEqual(http_reference["sourceUrl"], "http://design.example/reference")
+        self.assertEqual(http_reference["references"][0]["url"], "http://design.example/reference")
+        generated_package = zipfile.ZipFile(io.BytesIO(export_design_system_package({**system, "packageFiles": []})))
+        self.assertIn(b"--tribe-font-size", generated_package.read("tokens.css"))
+        revised = {**saved, "description": "Updated research components"}
+        saved_v2 = self.store.save_design_system(revised, expected_version=1)
+        self.assertEqual(saved_v2["version"], 2)
+        unchanged = self.store.save_design_system(saved_v2, expected_version=2)
+        self.assertEqual(unchanged["version"], 2)
+        self.assertEqual(
+            [item["version"] for item in self.store.design_system_versions(saved["id"])], [2, 1],
+        )
+        with self.assertRaisesRegex(ValueError, "design_system_version_conflict"):
+            self.store.save_design_system(revised, expected_version=1)
+
+        applied = self.store.apply_project_design_system(self.project["id"], saved_v2)
+        self.assertEqual(applied["version"], 2)
+        project = self.store.project_for_mission(self.mission["id"])
+        self.assertEqual(project["designSystem"]["guidance"], "Keep data labels readable.")
+        self.assertEqual(project["designSystem"]["version"], 2)
+        restarted = MissionStore(self.store.path)
+        self.assertEqual(restarted.design_systems()[0]["id"], saved["id"])
+        self.assertEqual(restarted.design_system_version(saved["id"], 1)["description"], "Research components")
+        official = {**saved_v2, "id": "field-notes", "name": "Field Notes", "source": "official"}
+        applied_official = restarted.apply_project_design_system(self.project["id"], official)
+        self.assertEqual(applied_official["source"], "official")
+        self.assertEqual(applied_official["id"], "field-notes")
+        self.assertTrue(restarted.remove_project_design_system(self.project["id"]))
+        self.assertIsNone(restarted.project_for_mission(self.mission["id"])["designSystem"])
+
+        imported_snapshot = {**saved_v2, "source": "user", "version": 1}
+        imported_snapshot.pop("id")
+        imported = restarted.save_design_system(imported_snapshot)
+        self.assertNotEqual(imported["id"], saved_v2["id"])
+        self.assertEqual(imported["version"], 1)
+        self.assertEqual(imported["tokens"], saved_v2["tokens"])
+        self.assertEqual(imported["components"], saved_v2["components"])
+        self.assertEqual(imported["palettes"], saved_v2["palettes"])
+        self.assertEqual(imported["packageFiles"], saved_v2["packageFiles"])
+        invalid_package = {**system, "packageFiles": [{"path": "../outside.md", "content": "not safe"}]}
+        with self.assertRaisesRegex(ValueError, "design_system_package_path_invalid"):
+            self.store.save_design_system(invalid_package)
+
+    def test_project_design_system_endpoint_loads_the_exact_applied_package_snapshot(self) -> None:
+        with patch.dict(os.environ, {"TRIBE_DATA_DIR": str(self.root / "runtime-data")}):
+            from tribe_runtime import server as runtime_server
+
+        system = {
+            "name": "Endpoint fixture", "description": "Snapshot comparison fixture", "source": "user",
+            "tokens": {
+                "canvas": "#111827", "surface": "#182234", "raised": "#202d42",
+                "text": "#e8edf5", "muted": "#a0aec2", "accent": "#6b9df7",
+                "line": "#42516a", "focus": "#83c5ff", "success": "#59d5a2",
+                "warning": "#ffb34d", "danger": "#f07d7d",
+            },
+            "packageFiles": [
+                {"path": "components.html", "content": "<main>Applied snapshot</main>"},
+                {"path": "preview/dashboard.html", "content": "<main>Current project</main>"},
+            ],
+        }
+        saved = self.store.save_design_system(system)
+        self.store.apply_project_design_system(self.project["id"], saved)
+
+        with patch.object(runtime_server, "STORE", self.store):
+            http = runtime_server.LocalHTTPServer(("127.0.0.1", 0), runtime_server.Handler)
+            thread = threading.Thread(target=http.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{http.server_port}/api/projects/{self.project['id']}/design-system",
+                    timeout=3,
+                ) as response:
+                    payload = json.loads(response.read())
+                self.assertEqual(payload["designSystem"]["version"], saved["version"])
+                self.assertEqual(payload["designSystem"]["packageFiles"], system["packageFiles"])
+                self.assertEqual(payload["designSystem"]["appliedAt"], self.store.project(self.project["id"])["designSystem"]["appliedAt"])
+
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{http.server_port}/api/projects", timeout=3,
+                ) as response:
+                    projects = json.loads(response.read())["projects"]
+                listed = next(item for item in projects if item["id"] == self.project["id"])
+                self.assertNotIn("packageFiles", listed["designSystem"])
+            finally:
+                http.shutdown()
+                http.server_close()
+                thread.join(timeout=2)
+
+    def test_agent_design_system_context_includes_patterns_and_selected_previews(self) -> None:
+        context = _design_system_context({
+            "name": "Field kit", "version": 2,
+            "manifest": {"componentsManifest": "indexes/component-index.json", "files": {"patterns": ["patterns/empty-state.md"]}, "preview": {"pages": [
+                {"path": "preview/desktop.html"}, {"path": "preview/mobile.html"}, {"path": "preview/unselected.html"},
+            ]}},
+            "packageFiles": [
+                {"path": "USAGE.md", "content": "Read the package guide first."},
+                {"path": "DESIGN.md", "content": "# Principles"},
+                {"path": "tokens.css", "content": ":root { --surface: #fff; }"},
+                {"path": "source/evidence.md", "content": "Selected reference; not official brand assets."},
+                {"path": "indexes/component-index.json", "content": '{"components":[{"name":"Button"}]}'},
+                {"path": "patterns/empty-state.md", "content": "Keep recovery actions near the empty state."},
+                {"path": "guidance/interactions.md", "content": "Use visible focus and concise validation."},
+                {"path": "components.html", "content": "<button>Save</button>"},
+                {"path": "preview/desktop.html", "content": "<main>large preview</main>"},
+                {"path": "preview/mobile.html", "content": "<main>small preview</main>"},
+                {"path": "preview/unselected.html", "content": "<main>extra preview</main>"},
+                {"path": "assets/brand.png", "content": "binary"},
+            ],
+        })
+        paths = [file["path"] for file in context["packageFiles"]]
+        self.assertEqual(paths, [
+            "USAGE.md", "DESIGN.md", "tokens.css", "indexes/component-index.json", "components.html", "source/evidence.md",
+            "patterns/empty-state.md", "guidance/interactions.md", "preview/desktop.html", "preview/mobile.html",
+        ])
+        self.assertNotIn("preview/unselected.html", paths)
+        self.assertNotIn("assets/brand.png", paths)
+        self.assertEqual(context["name"], "Field kit")
+
     def test_workflow_progress_stage_is_durable_and_bound_to_the_mission_snapshot(self) -> None:
         workflow = {
             "id": "research-flow", "version": 1, "title": "Research flow",
@@ -1418,6 +1593,138 @@ for line in sys.stdin:
                 http.server_close()
                 thread.join(timeout=2)
 
+    def test_project_approval_policy_is_persisted_validated_and_does_not_grant_tools(self) -> None:
+        self.assertEqual(self.store.project_approval_policy(self.project["id"]), {"mode": "standard"})
+        for mode in ("review_changes", "confirm_every_call"):
+            self.assertEqual(self.store.set_project_approval_policy(self.project["id"], mode), {"mode": mode})
+            self.assertEqual(
+                self.store.project_approval_policy_for_mission(self.mission["id"]), mode,
+            )
+        with self.assertRaisesRegex(ValueError, "approval_mode_invalid"):
+            self.store.set_project_approval_policy(self.project["id"], "allow_all")
+        self.assertEqual(
+            self.store.project_approval_policy_for_mission(self.mission["id"]),
+            "confirm_every_call",
+        )
+
+        definition = AgentDefinition(
+            "restricted", "Restricted", "Read only", "Inspect work", "restricted.md",
+            tool_permissions=("read_repository_file",),
+        )
+        agent = _build_agent(definition, "openai:test-model")
+        capabilities = build_capabilities(
+            WorkspaceTools(self.store, self.mission["id"], definition.id),
+            SkillCatalog(self.repository), tool_permissions=definition.tool_permissions,
+            approval_mode="confirm_every_call",
+        )
+        granted_tools = {tool.name for tool in _tools_for_agent(
+            agent, definition.repository_access, definition.tool_permissions,
+        )}
+        self.assertIn("read_repository_file", granted_tools)
+        self.assertNotIn("write_repository_file", granted_tools)
+        filesystem = next(
+            (item for item in capabilities if type(item).__name__ == "FileSystem"), None,
+        )
+        self.assertNotIn("write_file", set(getattr(filesystem, "tools", ()) or ()))
+
+    def test_approval_modes_pause_only_the_configured_harness_actions(self) -> None:
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build work", "builder.md",
+            tool_permissions=("read_repository_file", "write_file"),
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
+        skills = SkillCatalog(self.repository)
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"], {"text": "Write and inspect a file"}
+        )
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, skills,
+            file_locks={}, pending_file_changes={}, trigger_sequence=trigger["sequence"],
+        )
+        agent = _build_agent(definition, "openai:test-model")
+        expected_gates = {
+            "standard": ("write_file", False),
+            "review_changes": ("write_file", True),
+            "confirm_every_call": ("read_repository_file", True),
+        }
+
+        for index, (mode, (tool_name, gated)) in enumerate(expected_gates.items()):
+            with self.subTest(mode=mode):
+                self.store.set_project_approval_policy(self.project["id"], mode)
+                capabilities = build_capabilities(
+                    workspace, skills, trigger_sequence=trigger["sequence"],
+                    tool_permissions=definition.tool_permissions,
+                )
+                self.reveal_deferred_test_tools(agent, capabilities)
+                failures: list[BaseException] = []
+
+                class ApprovalModeModel(TestModel):
+                    def gen_tool_args(self, tool_def):
+                        if tool_def.name == "write_file":
+                            return {"path": f"approval-{mode}.txt", "content": mode}
+                        if tool_def.name == "read_repository_file":
+                            return {"path": "README.md"}
+                        return super().gen_tool_args(tool_def)
+
+                test_model = ApprovalModeModel(call_tools=[tool_name], custom_output_text="action complete")
+
+                def run_agent() -> None:
+                    try:
+                        with agent.override(model=test_model):
+                            asyncio.run(agent.run(
+                                f"Perform the action for approval mode test {index}.",
+                                deps=dependencies,
+                                capabilities=capabilities,
+                                conversation_id=f"tribe:{self.mission['id']}:{definition.id}:approval-{mode}",
+                            ))
+                    except Exception as error:  # noqa: BLE001 - surfaced below
+                        failures.append(error)
+
+                worker = threading.Thread(target=run_agent)
+                worker.start()
+                interaction = None
+                try:
+                    if gated:
+                        deadline = time.monotonic() + 10
+                        while time.monotonic() < deadline:
+                            pending = [item for item in self.store.pending_interactions()
+                                       if item["mission_id"] == self.mission["id"]]
+                            if pending:
+                                interaction = pending[0]
+                                break
+                            time.sleep(0.05)
+                        self.assertIsNotNone(interaction, f"{mode} did not ask before writing: {failures}")
+                        self.assertIn(tool_name, interaction["details"])
+                        approval = next(
+                            row for row in self.store.deferred_tool_approvals(
+                                self.mission["id"], definition.id,
+                            ) if row["interaction_id"] == interaction["id"]
+                        )
+                        self.assertEqual(approval["status"], "pending")
+                        if tool_name == "write_file":
+                            self.assertFalse((self.repository / f"approval-{mode}.txt").exists())
+                        self.store.resolve_interaction(interaction["id"], "approved_once")
+                    worker.join(timeout=10)
+                    self.assertFalse(worker.is_alive(), f"{mode} run did not finish")
+                    self.assertFalse(failures, str(failures))
+                    if gated:
+                        approval = next(
+                            row for row in self.store.deferred_tool_approvals(
+                                self.mission["id"], definition.id,
+                            ) if row["interaction_id"] == interaction["id"]
+                        )
+                        self.assertEqual(approval["status"], "consumed")
+                    else:
+                        self.assertEqual(self.store.pending_interactions(), [])
+                finally:
+                    worker.join(timeout=1)
+                    if dependencies.file_locks is not None:
+                        for lock in dependencies.file_locks.values():
+                            lock.close()
+                        dependencies.file_locks.clear()
+
     def test_web_search_requires_exact_approval_then_resumes_once(self) -> None:
         from ddgs.ddgs import DDGS
         from pydantic_ai import Agent
@@ -1490,6 +1797,7 @@ for line in sys.stdin:
             workspace, SkillCatalog(self.repository), trigger_sequence=1,
             step_store=SqliteStepStore(database=self.store.data_dir / "browser-approval-steps.sqlite3"),
             tool_permissions=("browser_control",),
+            approval_mode="confirm_every_call",
         )
         called: list[tuple[str, str]] = []
         agent = Agent(TestModel(call_tools=["browser_fill"]))
@@ -1524,7 +1832,7 @@ for line in sys.stdin:
                     break
                 time.sleep(0.05)
             self.assertIsNotNone(interaction, f"browser action must pause; failures={failures}")
-            self.assertEqual(interaction["title"], "Use browser · fill")
+            self.assertEqual(interaction["title"], "Confirm agent action")
             self.assertEqual(interaction["target"], "Browser session")
             self.assertIn("text omitted", interaction["details"])
             row = self.store.deferred_tool_approvals(self.mission["id"], "builder")[0]
@@ -4547,6 +4855,27 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             return  # Windows hosts without symlink privileges still exercise traversal checks.
         with self.assertRaisesRegex(ValueError, "outside_project"):
             browse_repository(self.repository, "outside-link.txt")
+
+    def test_notebook_git_diff_includes_bounded_before_and_after_versions(self) -> None:
+        notebook_path = self.repository / "analysis.ipynb"
+        original = {"nbformat": 4, "cells": [{"id": "cell-a", "cell_type": "code", "source": ["x = 1"], "outputs": []}]}
+        updated = {"nbformat": 4, "cells": [{"id": "cell-a", "cell_type": "code", "source": ["x = 2"], "outputs": []}]}
+        notebook_path.write_text(json.dumps(original), encoding="utf-8")
+        self.git("add", "analysis.ipynb")
+        self.git("commit", "-qm", "add notebook")
+        notebook_path.write_text(json.dumps(updated), encoding="utf-8")
+
+        changed = project_git_diff(self.repository, "analysis.ipynb")
+        versions = changed["notebookVersions"]
+        self.assertEqual(json.loads(versions["before"]), original)
+        self.assertEqual(json.loads(versions["after"]), updated)
+        self.assertIn("-", changed["diff"])
+
+        new_notebook = self.repository / "new-analysis.ipynb"
+        new_notebook.write_text(json.dumps(updated), encoding="utf-8")
+        added = project_git_diff(self.repository, "new-analysis.ipynb")
+        self.assertEqual(added["notebookVersions"]["before"], "")
+        self.assertEqual(json.loads(added["notebookVersions"]["after"]), updated)
 
     def test_test_commands_do_not_inherit_credentials_from_the_agent_process(self) -> None:
         workspace = WorkspaceTools(self.store, self.mission["id"], "builder")
@@ -7819,6 +8148,412 @@ with workspace._path_lock(Path(repository) / 'README.md'):
 
 
 class ScheduleCase(RuntimeCase):
+    def test_failed_test_event_creates_one_project_scoped_schedule_run(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Investigate failures", "Find the cause and suggest a fix", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=self.mission["id"],
+        )
+        self.store.append("repo.test_run.completed", "builder", self.mission["id"], {
+            "testCount": 4, "passed": 3, "failed": 1, "exitCode": 1,
+        })
+        event = self.store.append("repo.test_run.completed", "builder", self.mission["id"], {
+            "testCount": 5, "passed": 3, "failed": 2, "exitCode": 1,
+        })
+
+        claimed = self.store.claim_event_schedules()
+        run = self.store.schedules(self.project["id"])[0]["runs"][0]
+        events = self.store.events_after(claimed[0]["missionId"], 0)
+
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(run["source_event_sequence"], event["sequence"])
+        self.assertEqual(events[-1]["actorId"], "scheduler")
+        self.assertIn("2 of 5 tests failed", events[-1]["payload"]["goal"] if events[-1]["type"] == "mission.created" else events[-1]["payload"]["text"])
+        self.assertEqual(self.store.claim_event_schedules(), [])
+
+        self.store.finish_scheduled_run(claimed[0]["missionId"])
+        next_event = self.store.append("repo.test_run.completed", "builder", self.mission["id"], {
+            "testCount": 2, "passed": 1, "failed": 1, "exitCode": 1,
+        })
+        self.assertEqual(self.store.claim_event_schedules(), [])
+        with self.store._connect() as db:
+            db.execute(
+                "UPDATE schedules SET last_event_triggered_at='2020-01-01T00:00:00+00:00' WHERE id=?",
+                (schedule["id"],),
+            )
+        next_claim = self.store.claim_event_schedules()
+        self.assertEqual(len(next_claim), 1)
+        self.assertEqual(
+            self.store.schedules(self.project["id"])[0]["runs"][0]["source_event_sequence"],
+            next_event["sequence"],
+        )
+
+    def test_event_trigger_dispatches_background_run_to_selected_agent(self) -> None:
+        self.store.set_project_agent_ids(self.project["id"], ["planner"], ["planner"], "planner")
+        schedule = self.store.create_schedule(
+            self.project["id"], "Investigate failures", "Find the cause", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=self.mission["id"],
+        )
+        source_event = self.store.append("repo.test_run.completed", "builder", self.mission["id"], {
+            "testCount": 5, "passed": 3, "failed": 2, "exitCode": 1,
+        })
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual(len(claimed), 1)
+        run = claimed[0]
+        received_events: list[dict] = []
+        dispatched = threading.Event()
+
+        class Provider:
+            async def run(self, store: MissionStore, mission_id: str, event: dict) -> str:
+                received_events.append(event)
+                dispatched.set()
+                return "The synthetic failure was received and is ready for investigation."
+
+        class EnabledSupervisor(AgentSupervisor):
+            @property
+            def enabled(self) -> bool:
+                return True
+
+        supervisor = EnabledSupervisor(
+            self.store,
+            [AgentDefinition("planner", "Planner", "Investigate events", "Review the event context.", "planner.md")],
+            provider_factory=lambda _definition, _model: Provider(),
+        )
+        try:
+            supervisor.start_mission(run["missionId"])
+            self.assertTrue(dispatched.wait(3), "the event-triggered mission was not dispatched")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if any(event["type"] == "agent.message.created"
+                       for event in self.store.events_after(run["missionId"], 0)):
+                    break
+                time.sleep(0.02)
+
+            background = self.store.mission(run["missionId"])
+            self.assertTrue(background["background"])
+            self.assertEqual(received_events[0]["type"], "mission.created")
+            self.assertEqual(received_events[0]["payload"]["sourceEventSequence"], source_event["sequence"])
+            self.assertTrue(any(
+                event["type"] == "agent.message.created"
+                and event["actorId"] == "planner"
+                and "synthetic failure" in event["payload"].get("text", "")
+                for event in self.store.events_after(run["missionId"], 0)
+            ), "the selected agent's reply was not persisted in the triggered run")
+            history = self.store.schedule_runs(schedule["id"])
+            self.assertEqual(history["runs"][0]["source_event_sequence"], source_event["sequence"])
+        finally:
+            supervisor.close()
+
+    def test_failed_event_run_can_be_retried_once_with_original_context(self) -> None:
+        source_chat = self.store.create_mission(
+            self.project["id"], "Test run", "Run the project tests",
+        )
+        schedule = self.store.create_schedule(
+            self.project["id"], "Investigate failures", "Find the cause and suggest a fix", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=source_chat["id"],
+        )
+        source_event = self.store.append("repo.test_run.completed", "builder", source_chat["id"], {
+            "testCount": 3, "passed": 1, "failed": 2, "exitCode": 1,
+        })
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual(len(claimed), 1)
+        with self.store._connect() as db:
+            db.execute(
+                "UPDATE scheduled_runs SET status='failed',finished_at=?,error=? WHERE id=?",
+                (datetime.now(UTC).isoformat(), "Agent run failed", claimed[0]["runId"]),
+            )
+
+        retry = self.store.retry_event_schedule_run(
+            self.project["id"], schedule["id"], claimed[0]["runId"],
+        )
+        self.assertEqual(retry["status"], "queued")
+        self.assertEqual(retry["mission_id"], claimed[0]["missionId"])
+        self.assertEqual(retry["source_event_sequence"], source_event["sequence"])
+        self.assertEqual(retry["retry_of_run_id"], claimed[0]["runId"])
+        self.assertIn(retry["mission_id"], self.store.queued_scheduled_missions())
+        self.assertEqual(self.store.schedules(self.project["id"])[0]["status"], "active")
+        history = self.store.schedule_runs(schedule["id"])
+        parent = next(run for run in history["runs"] if run["id"] == claimed[0]["runId"])
+        attempt = next(run for run in history["runs"] if run["id"] == retry["id"])
+        self.assertTrue(parent["has_retry"])
+        self.assertEqual(attempt["retry_of_run_id"], parent["id"])
+        retry_message = self.store.events_after(retry["mission_id"], attempt["trigger_sequence"] - 1)[0]
+        self.assertEqual(retry_message["payload"]["sourceEventSequence"], source_event["sequence"])
+        self.assertIn("2 of 3 tests failed", retry_message["payload"]["text"])
+        self.assertIn("Review the earlier chat activity", retry_message["payload"]["text"])
+        with self.assertRaisesRegex(ValueError, "already_been_retried"):
+            self.store.retry_event_schedule_run(
+                self.project["id"], schedule["id"], claimed[0]["runId"],
+            )
+
+    def test_automatic_event_retries_are_bounded_and_stop_after_any_tool_starts(self) -> None:
+        source_chat = self.store.create_mission(
+            self.project["id"], "Test run", "Run the project tests",
+        )
+        schedule = self.store.create_schedule(
+            self.project["id"], "Investigate failures", "Find the cause", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=source_chat["id"], event_auto_retry_limit=2,
+        )
+        self.store.append("repo.test_run.completed", "builder", source_chat["id"], {
+            "testCount": 3, "passed": 1, "failed": 2, "exitCode": 1,
+        })
+        claimed = self.store.claim_event_schedules()[0]
+        with self.store._connect() as db:
+            db.execute(
+                "UPDATE scheduled_runs SET status='failed',invocation_started_at=?,finished_at=? WHERE id=?",
+                (datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat(), claimed["runId"]),
+            )
+
+        self.assertEqual(self.store.claim_automatic_event_retries(), 1)
+        retry = next(
+            run for run in self.store.schedule_runs(schedule["id"])["runs"]
+            if run["retry_kind"] == "automatic"
+        )
+        self.assertEqual(retry["retry_kind"], "automatic")
+        self.assertGreater(datetime.fromisoformat(retry["scheduled_for"]), datetime.now(UTC))
+        self.assertEqual(self.store.queued_scheduled_missions(), [])
+        self.assertEqual(self.store.claim_automatic_event_retries(), 0)
+
+        with self.store._connect() as db:
+            db.execute("UPDATE scheduled_runs SET scheduled_for=? WHERE id=?",
+                       ("2020-01-01T00:00:00+00:00", retry["id"]))
+            db.execute("UPDATE scheduled_runs SET status='failed',finished_at=? WHERE id=?",
+                       (datetime.now(UTC).isoformat(), retry["id"]))
+        self.assertEqual(self.store.claim_automatic_event_retries(), 1)
+        second_retry = next(
+            run for run in self.store.schedule_runs(schedule["id"])["runs"]
+            if run["retry_kind"] == "automatic" and run["id"] != retry["id"]
+        )
+        self.assertEqual(second_retry["retry_kind"], "automatic")
+        with self.store._connect() as db:
+            db.execute("UPDATE scheduled_runs SET status='failed',finished_at=? WHERE id=?",
+                       (datetime.now(UTC).isoformat(), second_retry["id"]))
+        self.assertEqual(self.store.claim_automatic_event_retries(), 0)
+
+        side_effect_schedule = self.store.create_schedule(
+            self.project["id"], "Review again", "Inspect the failure", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=source_chat["id"], event_auto_retry_limit=1,
+        )
+        with self.store._connect() as db:
+            db.execute(
+                "UPDATE schedules SET last_event_triggered_at='2020-01-01T00:00:00+00:00' WHERE id=?",
+                (side_effect_schedule["id"],),
+            )
+        self.store.append("repo.test_run.completed", "builder", source_chat["id"], {
+            "testCount": 1, "passed": 0, "failed": 1, "exitCode": 1,
+        })
+        side_effect_run = next(
+            item for item in self.store.claim_event_schedules()
+            if item["scheduleId"] == side_effect_schedule["id"]
+        )
+        with self.store._connect() as db:
+            db.execute(
+                "UPDATE scheduled_runs SET status='failed',invocation_started_at=?,finished_at=? WHERE id=?",
+                (datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat(), side_effect_run["runId"]),
+            )
+        self.store.append("agent.tool.started", "builder", side_effect_run["missionId"], {
+            "toolName": "write_file", "toolCallId": "call-side-effect",
+            "triggerSequence": side_effect_run["event"]["sequence"],
+        })
+        self.assertEqual(self.store.claim_automatic_event_retries(), 0)
+        failures = self.store.event_trigger_failures(self.project["id"])
+        self.assertIn(side_effect_run["runId"], {item["id"] for item in failures["failures"]})
+
+        replied_schedule = self.store.create_schedule(
+            self.project["id"], "Avoid duplicate replies", "Summarise the failure", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=source_chat["id"], event_auto_retry_limit=1,
+        )
+        with self.store._connect() as db:
+            db.execute(
+                "UPDATE schedules SET last_event_triggered_at='2020-01-01T00:00:00+00:00' WHERE id=?",
+                (replied_schedule["id"],),
+            )
+        self.store.append("repo.test_run.completed", "builder", source_chat["id"], {
+            "testCount": 1, "passed": 0, "failed": 1, "exitCode": 1,
+        })
+        replied_run = next(
+            item for item in self.store.claim_event_schedules()
+            if item["scheduleId"] == replied_schedule["id"]
+        )
+        with self.store._connect() as db:
+            db.execute(
+                "UPDATE scheduled_runs SET status='failed',invocation_started_at=?,finished_at=? WHERE id=?",
+                (datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat(), replied_run["runId"]),
+            )
+        self.store.append("agent.message.created", "builder", replied_run["missionId"], {
+            "text": "I found the cause.", "recipient": None, "channelAudience": "conversation",
+            "triggerSequence": replied_run["event"]["sequence"],
+        })
+        self.assertEqual(self.store.claim_automatic_event_retries(), 0)
+        failures = self.store.event_trigger_failures(self.project["id"])
+        self.assertIn(replied_run["runId"], {item["id"] for item in failures["failures"]})
+
+    def test_event_auto_retry_limit_rejects_unsupported_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "event_auto_retry_limit"):
+            self.store.create_schedule(
+                self.project["id"], "Invalid retry policy", "Investigate", "event", "UTC",
+                trigger_event_type="repo.test_run.completed",
+                event_source_mission_id=self.mission["id"], event_auto_retry_limit=3,
+            )
+
+    def test_event_failures_are_paginated_and_can_be_dismissed_durably(self) -> None:
+        source_chat = self.store.create_mission(
+            self.project["id"], "Test run", "Run the project tests",
+        )
+        schedules = [self.store.create_schedule(
+            self.project["id"], f"Investigate failures {index}", "Find the cause", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=source_chat["id"],
+        ) for index in range(2)]
+        self.store.append("repo.test_run.completed", "builder", source_chat["id"], {
+            "testCount": 3, "passed": 1, "failed": 2, "exitCode": 1,
+        })
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual(len(claimed), 2)
+        with self.store._connect() as db:
+            for item in claimed:
+                db.execute(
+                    "UPDATE scheduled_runs SET status='failed',finished_at=?,error='Agent run failed' WHERE id=?",
+                    (datetime.now(UTC).isoformat(), item["runId"]),
+                )
+
+        first_page = self.store.event_trigger_failures(self.project["id"], limit=1)
+        self.assertEqual(first_page["total"], 2)
+        self.assertTrue(first_page["has_more"])
+        self.assertEqual(len(first_page["failures"]), 1)
+        first = first_page["failures"][0]
+        second_page = self.store.event_trigger_failures(
+            self.project["id"], limit=1,
+            before_started_at=first["started_at"], before_id=first["id"],
+        )
+        self.assertEqual(len(second_page["failures"]), 1)
+        self.assertFalse(second_page["has_more"])
+
+        dismissed = self.store.dismiss_event_trigger_failure(
+            self.project["id"], first["schedule_id"], first["id"],
+        )
+        self.assertEqual(dismissed["scheduled_run_id"], first["id"])
+        self.assertEqual(self.store.event_trigger_failures(self.project["id"])["total"], 1)
+        history = self.store.schedule_runs(first["schedule_id"])
+        self.assertTrue(next(run for run in history["runs"] if run["id"] == first["id"])["failure_reviewed"])
+        with self.assertRaisesRegex(ValueError, "already_dismissed"):
+            self.store.retry_event_schedule_run(self.project["id"], first["schedule_id"], first["id"])
+        self.assertEqual(
+            self.store.dismiss_event_trigger_failure(self.project["id"], first["schedule_id"], first["id"]),
+            dismissed,
+        )
+
+    def test_event_schedule_cannot_watch_another_project_or_run_back_into_source_chat(self) -> None:
+        (self.root / "other-event-project").mkdir()
+        other_project, other_chat = self.store.create_project(
+            str(self.root / "other-event-project"), "Other event project", "Other chat", "Other goal",
+        )
+        with self.assertRaisesRegex(ValueError, "event_source_chat_must_belong_to_project"):
+            self.store.create_schedule(
+                self.project["id"], "Invalid source", "Investigate", "event", "UTC",
+                trigger_event_type="repo.test_run.completed",
+                event_source_mission_id=other_chat["id"],
+            )
+        with self.assertRaisesRegex(ValueError, "event_source_and_target_chats_must_be_different"):
+            self.store.create_schedule(
+                self.project["id"], "Looping source", "Investigate", "event", "UTC",
+                target_mission_id=self.mission["id"],
+                trigger_event_type="repo.test_run.completed",
+                event_source_mission_id=self.mission["id"],
+            )
+
+    def test_local_event_schedules_support_file_chat_and_artifact_events(self) -> None:
+        watched = [
+            ("repo.file.changed", {"path": "src/app.py", "change": "updated"}, "A repository file changed"),
+            ("mission.completed", {"title": "Finished"}, "A chat completed"),
+            ("artifact.created", {"title": "Research brief"}, "An artifact was created"),
+        ]
+        schedules = [self.store.create_schedule(
+            self.project["id"], event_type, "Handle this project change", "event", "UTC",
+            trigger_event_type=event_type,
+            event_source_mission_id=self.mission["id"],
+        ) for event_type, _payload, _summary in watched]
+        source_events = [self.store.append(
+            event_type, "builder", self.mission["id"], payload,
+        ) for event_type, payload, _summary in watched]
+
+        claimed = self.store.claim_event_schedules()
+
+        self.assertEqual(len(claimed), len(watched))
+        for schedule, source_event, (_event_type, _payload, summary) in zip(schedules, source_events, watched):
+            run = next(item for item in self.store.schedules(self.project["id"])
+                       if item["id"] == schedule["id"])["runs"][0]
+            self.assertEqual(run["source_event_sequence"], source_event["sequence"])
+            mission_id = next(item["missionId"] for item in claimed if item["scheduleId"] == schedule["id"])
+            context = self.store.mission(mission_id)["goal"]
+            self.assertIn(summary, context)
+
+    def test_file_event_schedule_filters_paths_and_restarts_cursor_when_filter_changes(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Python file review", "Review changed Python files", "event", "UTC",
+            trigger_event_type="repo.file.changed",
+            event_source_mission_id=self.mission["id"],
+            event_path_pattern="src/*.py",
+        )
+        self.assertEqual(schedule["event_path_pattern"], "src/*.py")
+        ignored = self.store.append("repo.file.changed", "builder", self.mission["id"], {
+            "path": "docs/readme.md", "change": "updated",
+        })
+        self.assertEqual(self.store.claim_event_schedules(), [])
+        stored = next(item for item in self.store.schedules(self.project["id"])
+                      if item["id"] == schedule["id"])
+        self.assertEqual(stored["event_cursor"], ignored["sequence"])
+
+        matching = self.store.append("repo.file.changed", "builder", self.mission["id"], {
+            "path": "src/main.py", "change": "updated",
+        })
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual(len(claimed), 1)
+        run = next(item for item in self.store.schedules(self.project["id"])
+                   if item["id"] == schedule["id"])["runs"][0]
+        self.assertEqual(run["source_event_sequence"], matching["sequence"])
+        self.store.finish_scheduled_run(claimed[0]["missionId"])
+
+        with self.assertRaisesRegex(ValueError, "event_path_pattern_must_be_project_relative"):
+            self.store.create_schedule(
+                self.project["id"], "Unsafe path", "Review", "event", "UTC",
+                trigger_event_type="repo.file.changed",
+                event_source_mission_id=self.mission["id"],
+                event_path_pattern="../outside.py",
+            )
+        with self.assertRaisesRegex(ValueError, "event_path_pattern_requires_repository_file_trigger"):
+            self.store.create_schedule(
+                self.project["id"], "Wrong filter", "Review", "event", "UTC",
+                trigger_event_type="artifact.created",
+                event_source_mission_id=self.mission["id"],
+                event_path_pattern="*.py",
+            )
+
+        prior = self.store.append("repo.file.changed", "builder", self.mission["id"], {
+            "path": "docs/old.md", "change": "updated",
+        })
+        edited = self.store.edit_schedule(
+            self.project["id"], schedule["id"], "Docs review", "Review Markdown files", "event", "UTC",
+            trigger_event_type="repo.file.changed", event_source_mission_id=self.mission["id"],
+            event_path_pattern="docs/*.md",
+        )
+        self.assertEqual(edited["event_path_pattern"], "docs/*.md")
+        self.assertGreaterEqual(edited["event_cursor"], prior["sequence"])
+        self.assertEqual(self.store.claim_event_schedules(), [])
+        fresh = self.store.append("repo.file.changed", "builder", self.mission["id"], {
+            "path": "docs/current.md", "change": "updated",
+        })
+        fresh_claim = self.store.claim_event_schedules()
+        self.assertEqual(len(fresh_claim), 1)
+        fresh_run = next(item for item in self.store.schedules(self.project["id"])
+                         if item["id"] == schedule["id"])["runs"][0]
+        self.assertEqual(fresh_run["source_event_sequence"], fresh["sequence"])
+
     def test_schedule_can_continue_existing_chat_and_marks_message_source(self) -> None:
         schedule = self.store.create_schedule(
             self.project["id"], "Morning review", "Review recent changes", "daily", "UTC",

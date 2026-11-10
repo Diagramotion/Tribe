@@ -96,16 +96,21 @@ const RepositoryView = lazy(() => import("./views/RepositoryView.jsx").then((mod
 const GitChangesView = lazy(() => import("./views/GitChangesView.jsx").then((module) => ({ default: module.GitChangesView })));
 const ProjectHomeView = lazy(() => import("./views/ProjectHomeView.jsx").then((module) => ({ default: module.ProjectHomeView })));
 const ProjectKnowledgeView = lazy(() => import("./views/ProjectKnowledgeView.jsx").then((module) => ({ default: module.ProjectKnowledgeView })));
+const ProjectDatasetsView = lazy(() => import("./components/ProjectDatasetsView.jsx").then((module) => ({ default: module.ProjectDatasetsView })));
 const InteractiveAccessView = lazy(() => import("./views/InteractiveAccessView.jsx").then((module) => ({ default: module.InteractiveAccessView })));
+const ApprovalSettingsView = lazy(() => import("./views/ApprovalSettingsView.jsx").then((module) => ({ default: module.ApprovalSettingsView })));
 const TestRunsView = lazy(() => import("./views/TestRunsView.jsx").then((module) => ({ default: module.TestRunsView })));
 const WorkflowsView = lazy(() => import("./views/WorkflowsView.jsx").then((module) => ({ default: module.WorkflowsView })));
+const DesignSystemsView = lazy(() => import("./views/DesignSystemsView.jsx"));
 const BrowserView = lazy(() => import("./views/BrowserView.jsx").then((module) => ({ default: module.BrowserView })));
+const ExperimentsView = lazy(() => import("./views/ExperimentsView.jsx").then((module) => ({ default: module.ExperimentsView })));
 const secondaryPaneTools = [
   { id: "Browser", label: "Browser", icon: Globe },
   { id: "Activity", label: "Agent activity", icon: UsersThree },
   { id: "Plan", label: "Plan", icon: ListChecks },
   { id: "Tests", label: "Tests", icon: Flask },
   { id: "Runs", label: "Runs", icon: ClockCounterClockwise },
+  { id: "Experiments", label: "Experiments", icon: ChartLine },
   { id: "Code", label: "Repository", icon: FolderSimple },
   { id: "Browser", label: "Browser", icon: Globe },
   { id: "Git", label: "Git changes", icon: GitBranch },
@@ -693,7 +698,7 @@ export function App() {
   const isMissionTab = tabs.includes(activeTab);
   const splitBrowserTitlebarActive = Boolean(projectPaneOpen && mission && isMissionTab && selectedWorkspaceTab?.kind === "browser");
   const browserTitlebarActive = activeTab === "Browser" || splitBrowserTitlebarActive;
-  const isGlobalWorkspaceTab = ["Browser", "WorkspaceSchedules", "Skills", "Recipes", "Settings"].includes(activeTab);
+  const isGlobalWorkspaceTab = ["Browser", "WorkspaceSchedules", "DesignSystems", "Skills", "Recipes", "Settings"].includes(activeTab);
   const isProjectWorkspace = Boolean(project.id)
     && ["Code", "Git", "Artifacts", "Schedules", "Skills", "Agents", "Knowledge", "Recipes"].includes(activeTab);
   const unavailableAgentStatuses = new Set(["Not configured", "Provider setup failed"]);
@@ -710,6 +715,7 @@ export function App() {
     Artifacts: "Artifacts",
     Schedules: "Schedules",
     WorkspaceSchedules: "Scheduled tasks",
+    DesignSystems: "Design systems",
     Knowledge: "Project memory",
     Skills: "Skills",
     Recipes: "Workflows",
@@ -2549,7 +2555,7 @@ export function App() {
       const { contentBase64 } = await runtime.getArtifact(artifact.id);
       const bytes = Uint8Array.from(atob(contentBase64), (character) => character.charCodeAt(0));
       const extension = artifact.name.split(".").pop()?.toLowerCase();
-      const textExtensions = new Set(["md", "txt", "json", "yaml", "yml", "log", "diff", "patch", "csv", "tsv", "js", "jsx", "ts", "tsx", "py", "rs", "html", "css", "xml", "toml", "sql", "sh"]);
+      const textExtensions = new Set(["md", "txt", "json", "yaml", "yml", "log", "diff", "patch", "csv", "tsv", "js", "jsx", "ts", "tsx", "py", "rs", "html", "css", "xml", "toml", "sql", "sh", "ipynb"]);
       if (artifact.type.startsWith("text/") || textExtensions.has(extension)) {
         const content = new TextDecoder().decode(bytes);
         const isDelimited = extension === "csv" || extension === "tsv"
@@ -2739,10 +2745,11 @@ export function App() {
     setWorkspaceSchedules(all.schedules);
   }
 
-  async function createSchedule(projectId, title, prompt, cadence, deliveryTime, runAt, cronExpression, targetMissionId) {
+  async function createSchedule(projectId, title, prompt, cadence, deliveryTime, runAt, cronExpression, targetMissionId, triggerEventType, eventSourceMissionId, eventPathPattern, eventAutoRetryLimit, eventExternalRepository) {
     try {
       await runtime.createSchedule(projectId, title, prompt, cadence,
-        Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", deliveryTime, runAt, cronExpression, targetMissionId);
+        Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", deliveryTime, runAt, cronExpression, targetMissionId,
+        triggerEventType, eventSourceMissionId, eventPathPattern, eventAutoRetryLimit, eventExternalRepository);
       await refreshScheduleLists(projectId);
       notify("Schedule created.");
       return true;
@@ -2752,9 +2759,10 @@ export function App() {
     }
   }
 
-  async function editSchedule(projectId, id, title, prompt, cadence, timezone, deliveryTime, runAt, cronExpression, targetMissionId) {
+  async function editSchedule(projectId, id, title, prompt, cadence, timezone, deliveryTime, runAt, cronExpression, targetMissionId, triggerEventType, eventSourceMissionId, eventPathPattern, eventAutoRetryLimit, eventExternalRepository) {
     try {
-      await runtime.editSchedule(projectId, id, title, prompt, cadence, timezone, deliveryTime, runAt, cronExpression, targetMissionId);
+      await runtime.editSchedule(projectId, id, title, prompt, cadence, timezone, deliveryTime, runAt, cronExpression, targetMissionId,
+        triggerEventType, eventSourceMissionId, eventPathPattern, eventAutoRetryLimit, eventExternalRepository);
       await refreshScheduleLists(projectId);
       notify("Schedule updated.");
       return true;
@@ -2774,6 +2782,18 @@ export function App() {
 
   async function loadScheduleRuns(id, beforeStartedAt, beforeId, limit) {
     return runtime.getScheduleRuns(id, beforeStartedAt, beforeId, limit);
+  }
+
+  async function retryEventScheduleRun(projectId, scheduleId, runId) {
+    try {
+      await runtime.retryEventScheduleRun(projectId, scheduleId, runId);
+      await refreshScheduleLists(projectId);
+      notify("Retry queued with the original event context.");
+      return true;
+    } catch (error) {
+      notify(`Retry could not be queued: ${error.message}`);
+      return false;
+    }
   }
 
   async function saveWorkflowRecipe(recipe) {
@@ -2868,6 +2888,7 @@ export function App() {
     if (tab === "Plan") return <PlanView agents={projectAgents} project={project} mission={mission} agentConfigured={agentRuntime.enabled} workItems={workItemsState} onSelectWork={selectWork} onEditProjectGoal={openProjectGoalEditor} onConnectModel={() => openAgentSettings("model")} />;
     if (tab === "Tests") return <TestRunsView runs={runs} />;
     if (tab === "Runs") return <RunsView agentRequests={agentRequests} mission={mission} onStop={stopBackgroundCommand} runs={commandRuns} />;
+    if (tab === "Experiments" && project.id) return <Suspense fallback={<div className="tab-panel column-empty">Loading experiments…</div>}><ExperimentsView projectId={project.id} projectName={project.name} /></Suspense>;
     if (tab === "Code") return <RepositoryView artifact={selectedArtifact} missionId={selectedArtifact?.missionId ?? mission?.id} agents={agents} project={project} reviewRevision={artifactReviewRevision} onArtifactSaved={onArtifactSaved} onUseSpreadsheetSelection={prepareSpreadsheetSelection} onBrowseRepository={() => { setSelectedArtifact(null); setSelectedCanvasDocument(null); }} />;
     if (tab === "Browser") return <Suspense fallback={<div className="tab-panel column-empty">Opening browser…</div>}><BrowserView agents={projectAgents} mission={mission} onOpenWebsiteSettings={() => openWorkspaceSettings("connections")} /></Suspense>;
     if (tab === "Git") return <GitChangesView project={project} />;
@@ -2880,7 +2901,7 @@ export function App() {
     /></Suspense></ViewErrorBoundary>;
     if (tab === "Preview" && selectedArtifact) return <RepositoryView artifact={selectedArtifact} missionId={selectedArtifact?.missionId ?? mission?.id} agents={agents} project={project} reviewRevision={artifactReviewRevision} onArtifactSaved={onArtifactSaved} onUseSpreadsheetSelection={prepareSpreadsheetSelection} onBrowseRepository={() => { setSelectedArtifact(null); setProjectPaneTab("Code"); }} />;
     if (tab === "Preview") return <div className="project-preview-empty"><FileText size={22} /><strong>No preview selected</strong><span>Select a file in Project artifacts to view it beside the chat.</span></div>;
-    if (tab === "Schedules") return <SchedulesView agentsConfigured={agentRuntime.enabled} project={project} schedules={schedules} onCreate={createSchedule} onEdit={editSchedule} onAction={updateSchedule} onLoadMoreRuns={loadScheduleRuns} />;
+    if (tab === "Schedules") return <SchedulesView agentsConfigured={agentRuntime.enabled} project={project} schedules={schedules} onCreate={createSchedule} onEdit={editSchedule} onAction={updateSchedule} onLoadMoreRuns={loadScheduleRuns} onRetryEventRun={retryEventScheduleRun} />;
     if (tab === "Knowledge") return <ProjectKnowledgeView entries={knowledge} proposals={knowledgeProposals} migration={knowledgeMigration} onResolveMigration={resolveKnowledgeMigration} onSave={saveKnowledge} onReview={reviewKnowledgeProposal} onArchive={archiveKnowledge} onRestore={restoreKnowledge} />;
     if (tab === "Artifacts" && selectedCanvasDocument && !projectPaneOpen) return <ViewErrorBoundary backLabel="Back to artifacts" key={`artifacts:${selectedCanvasDocument.id}`} onBack={() => setSelectedCanvasDocument(null)} title="Document preview couldn't be opened"><Suspense fallback={<div className="tab-panel column-empty">Opening shared document…</div>}><CanvasView
       document={selectedCanvasDocument}
@@ -2920,6 +2941,8 @@ export function App() {
 
   function renderProjectSettingsSection(section) {
     if (section === "team") return <AgentRolesView agents={agents} capabilityCatalog={capabilityCatalog} projectAgentIds={project.agentIds ?? agents.map((agent) => agent.id)} agentConfigured={agentRuntime.enabled} onCreate={(definition) => createAgentDefinition(definition, project.id)} onUpdate={updateAgentDefinition} onArchive={archiveAgentDefinition} onUpdateProjectTeam={updateProjectTeam} onConnectModel={() => openAgentSettings("model")} onManageModels={() => { setProjectSettingsOpen(false); openWorkspaceSettings("models"); }} />;
+    if (section === "datasets") return <ProjectDatasetsView projectId={project.id} />;
+    if (section === "approvals") return <ApprovalSettingsView projectId={project.id} />;
     if (section === "interactive") return <InteractiveAccessView onSave={saveInteractiveAccess} policy={interactiveAccess} projectName={project.name} />;
     if (section === "guidance") return <form className="project-settings-guidance" onSubmit={saveProjectGoal}>
       <label>Project goal<textarea autoFocus maxLength={10000} onChange={(event) => setProjectGoalInput(event.target.value)} rows={5} value={projectGoalInput} /></label>
@@ -2929,7 +2952,7 @@ export function App() {
       <div className="dialog-actions"><button className="button button--primary" disabled={!projectGoalInput.trim()} type="submit">Save project guidance</button></div>
     </form>;
     if (section === "knowledge") return <ProjectKnowledgeView entries={knowledge} proposals={knowledgeProposals} migration={knowledgeMigration} onResolveMigration={resolveKnowledgeMigration} onSave={saveKnowledge} onReview={reviewKnowledgeProposal} onArchive={archiveKnowledge} onRestore={restoreKnowledge} />;
-    if (section === "schedules") return <SchedulesView agentsConfigured={agentRuntime.enabled} project={project} schedules={schedules} onCreate={createSchedule} onEdit={editSchedule} onAction={updateSchedule} onLoadMoreRuns={loadScheduleRuns} />;
+    if (section === "schedules") return <SchedulesView agentsConfigured={agentRuntime.enabled} project={project} schedules={schedules} onCreate={createSchedule} onEdit={editSchedule} onAction={updateSchedule} onLoadMoreRuns={loadScheduleRuns} onRetryEventRun={retryEventScheduleRun} />;
     if (section === "artifacts") return <ArtifactsView
       artifacts={projectArtifacts}
       canvasDocuments={canvasDocuments}
@@ -2968,7 +2991,12 @@ export function App() {
       onEdit={editSchedule}
       onAction={updateSchedule}
       onLoadMoreRuns={loadScheduleRuns}
+      onRetryEventRun={retryEventScheduleRun}
     />;
+    if (activeTab === "DesignSystems") return <DesignSystemsView projects={projects} onProjectDesignSystemChanged={(projectId, designSystem) => {
+      setProjects((current) => current.map((item) => item.id === projectId ? { ...item, designSystem } : item));
+      setProject((current) => current.id === projectId ? { ...current, designSystem } : current);
+    }} />;
     if (isMissionTab && !mission) return renderMissionView();
     if (isMissionTab && mission) return renderMissionView();
     if (["Code", "Git", "Artifacts", "Schedules", "Knowledge"].includes(activeTab)) return renderProjectTool(activeTab);

@@ -43,6 +43,7 @@ from .credentials import (
     validate_openai_base_url,
 )
 from .general_chats import GeneralChatService
+from .github_actions import GitHubActionsError, fetch_public_workflow_runs
 from .instance_lock import RuntimeInstanceLock
 from .mcp_registry import MCPRegistry
 from .pdf_analysis import render_pdf_page
@@ -89,6 +90,12 @@ def _agent_payload(definition) -> dict:
         **definition.__dict__,
         "capabilities": list(definition.capabilities),
     }
+
+
+def _design_system_summary(system):
+    if not isinstance(system, dict):
+        return system
+    return {key: value for key, value in system.items() if key != "packageFiles"}
 
 
 def validate_agent_model_override(identifier: str, effort: str = "") -> None:
@@ -162,6 +169,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self._cors_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _bytes(self, status: int, content_type: str, filename: str, body: bytes) -> None:
+        safe_filename = re.sub(r"[^A-Za-z0-9._-]+", "-", filename).strip(".-_") or "design-system.zip"
+        self.send_response(status)
+        self._cors_headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -412,7 +430,27 @@ class Handler(BaseHTTPRequestHandler):
             except RuntimeError as error:
                 return self._json(503, {"error": str(error)})
         if parsed.path == "/api/projects":
-            return self._json(200, {"projects": STORE.bootstrap()["projects"]})
+            projects = STORE.bootstrap()["projects"]
+            for project in projects:
+                project["designSystem"] = _design_system_summary(project.get("designSystem"))
+            return self._json(200, {"projects": projects})
+        project_datasets_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/datasets", parsed.path)
+        if project_datasets_match:
+            project_id = project_datasets_match.group(1)
+            project = STORE.project(project_id)
+            if not project:
+                return self._json(404, {"error": "project_not_found"})
+            return self._json(200, {"datasets": STORE.project_datasets(project_id)})
+        project_experiments_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/experiments", parsed.path)
+        if project_experiments_match:
+            try:
+                return self._json(200, {
+                    "runs": STORE.project_experiment_runs(project_experiments_match.group(1)),
+                    "modelArtifacts": STORE.project_model_artifacts(project_experiments_match.group(1)),
+                })
+            except ValueError as error:
+                status = 404 if str(error) == "project_not_found" else 422
+                return self._json(status, {"error": str(error) or "invalid_request"})
         artifacts_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/artifacts", parsed.path)
         if artifacts_match:
             query = parse_qs(parsed.query)
@@ -466,6 +504,18 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     return
             return
+        notebook_environments_match = re.fullmatch(
+            r"/api/projects/([0-9a-f-]{36})/notebook-environments", parsed.path,
+        )
+        if notebook_environments_match:
+            try:
+                root = STORE.repository_for_project(notebook_environments_match.group(1))
+                return self._json(200, {"environments": COMMANDS.notebook_environments(root)})
+            except ValueError as error:
+                status = 404 if str(error) == "project_not_found" else 422
+                return self._json(status, {"error": str(error)})
+            except OSError:
+                return self._json(422, {"error": "repository_path_could_not_be_read"})
         files_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/files", parsed.path)
         if files_match:
             project_id = files_match.group(1)
@@ -531,6 +581,40 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(422, {"error": "workflow_definition_invalid", "detail": str(error)})
             except OSError:
                 return self._json(422, {"error": "workflow_library_could_not_be_read"})
+        if parsed.path == "/api/design-systems":
+            # Package fixtures can be large. Keep the library response light;
+            # the selected system is fetched with its version endpoint.
+            systems = [
+                {key: value for key, value in system.items() if key != "packageFiles"}
+                for system in STORE.design_systems()
+            ]
+            return self._json(200, {"systems": systems})
+        project_design_system_match = re.fullmatch(
+            r"/api/projects/([0-9a-f-]{36})/design-system", parsed.path,
+        )
+        if project_design_system_match:
+            project = STORE.project(project_design_system_match.group(1))
+            if not project:
+                return self._json(404, {"error": "project_not_found"})
+            return self._json(200, {"designSystem": project.get("designSystem")})
+        design_system_versions_match = re.fullmatch(
+            r"/api/design-systems/([a-z0-9_-]{2,64})/versions", parsed.path,
+        )
+        if design_system_versions_match:
+            versions = STORE.design_system_versions(design_system_versions_match.group(1))
+            if not versions:
+                return self._json(404, {"error": "design_system_not_found"})
+            return self._json(200, {"versions": versions})
+        design_system_version_match = re.fullmatch(
+            r"/api/design-systems/([a-z0-9_-]{2,64})/versions/([1-9][0-9]*)", parsed.path,
+        )
+        if design_system_version_match:
+            system = STORE.design_system_version(
+                design_system_version_match.group(1), int(design_system_version_match.group(2)),
+            )
+            if not system:
+                return self._json(404, {"error": "design_system_version_not_found"})
+            return self._json(200, {"system": system})
         if parsed.path == "/api/schedules":
             project_id = parse_qs(parsed.query).get("project", [""])[0]
             schedules = STORE.schedules(project_id) if project_id else STORE.workspace_schedules()
@@ -548,6 +632,18 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as error:
                 return self._json(422, {"error": str(error)})
             return self._json(404, {"error": "schedule_not_found"}) if result is None else self._json(200, result)
+        if parsed.path == "/api/event-trigger-failures":
+            query = parse_qs(parsed.query)
+            try:
+                limit = int(query.get("limit", ["20"])[0])
+                result = STORE.event_trigger_failures(
+                    query.get("project", [None])[0], limit,
+                    query.get("beforeStartedAt", [None])[0], query.get("beforeId", [None])[0],
+                )
+            except ValueError as error:
+                status = 404 if str(error) == "project_not_found" else 422
+                return self._json(status, {"error": str(error) or "invalid_request"})
+            return self._json(200, result)
         if parsed.path == "/api/usage":
             project_id = parse_qs(parsed.query).get("project", [""])[0]
             if not project_id or not STORE.project(project_id):
@@ -557,6 +653,16 @@ class Handler(BaseHTTPRequestHandler):
         if web_access_match:
             try:
                 return self._json(200, {"webAccess": STORE.project_web_access(web_access_match.group(1))})
+            except ValueError as error:
+                return self._json(404, {"error": str(error)})
+        approval_policy_match = re.fullmatch(
+            r"/api/projects/([0-9a-f-]{36})/approval-policy", parsed.path
+        )
+        if approval_policy_match:
+            try:
+                return self._json(200, {
+                    "approvalPolicy": STORE.project_approval_policy(approval_policy_match.group(1))
+                })
             except ValueError as error:
                 return self._json(404, {"error": str(error)})
         interactive_access_match = re.fullmatch(
@@ -648,6 +754,7 @@ class Handler(BaseHTTPRequestHandler):
                 select_default_mission=not keep_mission_empty,
             )
             if data.get("project"):
+                data["project"]["designSystem"] = _design_system_summary(data["project"].get("designSystem"))
                 data["knowledge"] = list_project_memory(
                     STORE, data["project"]["id"], include_archived=True,
                 )
@@ -680,6 +787,7 @@ class Handler(BaseHTTPRequestHandler):
             data["capabilityCatalog"] = capability_catalog(tuple(sorted(extra_capabilities)))
             available_agent_ids = [agent.id for agent in available_agents]
             for project in data.get("projects", []):
+                project["designSystem"] = _design_system_summary(project.get("designSystem"))
                 project["agentIds"] = STORE.project_agent_ids(project["id"], available_agent_ids)
             data["agentDirectory"] = str(USER_AGENT_DIRECTORY)
             data["agentRuntime"] = SUPERVISOR.status
@@ -803,8 +911,43 @@ class Handler(BaseHTTPRequestHandler):
             return self._restore_workspace_backup()
         if RESTORE_PENDING.is_set() and self.path != "/api/shutdown":
             return self._json(503, {"error": "workspace_restore_shutting_down"})
+        if self.path == "/api/design-systems/read-package":
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/octet-stream":
+                return self._json(415, {"error": "design_system_archive_must_be_binary"})
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._json(400, {"error": "invalid_content_length"})
+            if length < 1:
+                return self._json(400, {"error": "design_system_archive_empty"})
+            if length > 14_000_000:
+                return self._json(413, {"error": "design_system_archive_too_large"})
+            payload = self.rfile.read(length)
+            if len(payload) != length:
+                return self._json(400, {"error": "design_system_archive_invalid"})
+            try:
+                from .design_systems import read_design_system_package_archive
+                return self._json(200, {"files": read_design_system_package_archive(payload)})
+            except OverflowError:
+                return self._json(413, {"error": "design_system_archive_too_large"})
+            except ValueError as error:
+                return self._json(422, {"error": str(error) or "design_system_archive_invalid"})
         try:
             body = self._body()
+            if self.path == "/api/design-systems/export":
+                try:
+                    from .design_systems import export_design_system_package
+                    system = body.get("system")
+                    if not isinstance(system, dict):
+                        return self._json(422, {"error": "design_system_invalid"})
+                    archive = export_design_system_package(system)
+                    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", str(system.get("name", "design-system"))).strip("-_")
+                    return self._bytes(200, "application/zip", f"{slug or 'design-system'}.zip", archive)
+                except OverflowError:
+                    return self._json(413, {"error": "request_too_large"})
+                except ValueError as error:
+                    return self._json(422, {"error": str(error) or "design_system_invalid"})
             if self.path == "/api/link-previews":
                 from .link_previews import link_preview
                 raw_urls = body.get("urls", [])
@@ -1175,6 +1318,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(status, {"error": str(error), "currentVersion": getattr(error, "current_version", None)})
                 except OSError:
                     return self._json(422, {"error": "workflow_could_not_be_saved"})
+            if self.path == "/api/design-systems":
+                try:
+                    system = STORE.save_design_system(
+                        body.get("system"), body.get("expectedVersion"),
+                    )
+                    return self._json(201, {"system": system})
+                except OverflowError:
+                    return self._json(413, {"error": "request_too_large"})
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    status = 409 if str(error) == "design_system_version_conflict" else 422
+                    return self._json(status, {"error": str(error) or "invalid_request"})
             if self.path == "/api/projects":
                 fields = [str(body.get(key, "")).strip() for key in ("repository", "name", "missionTitle", "goal")]
                 if not fields[0] or not fields[1] or len(fields[1]) > 200:
@@ -1354,7 +1508,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(404, {"error": "mission_not_found"})
                 approved_tools = STORE.project_command_tools(mission["project_id"])
                 run = COMMANDS.start(
-                    mission_id, COMMANDS.parse(command_line, approved_tools)
+                    mission_id, COMMANDS.parse(command_line, approved_tools),
+                    jupyter_environment=str(body.get("jupyterEnvironment", "")),
+                    notebook_setup_environment=str(body.get("notebookSetupEnvironment", "")),
+                    notebook_setup_manager=str(body.get("notebookSetupManager", "")),
                 )
                 return self._json(201, {"run": run})
             if self.path == "/api/schedules":
@@ -1368,8 +1525,41 @@ class Handler(BaseHTTPRequestHandler):
                                                  str(body.get("deliveryTime", "09:00")),
                                                  body.get("runAt"),
                                                  str(body.get("cronExpression", "")),
-                                                 str(body.get("targetMissionId", "")))
+                                                 str(body.get("targetMissionId", "")),
+                                                 str(body.get("triggerEventType", "")),
+                                                 str(body.get("eventSourceMissionId", "")),
+                                                 str(body.get("eventPathPattern", "")),
+                                                 body.get("eventAutoRetryLimit", 0),
+                                                 str(body.get("eventExternalRepository", "")))
                 return self._json(201, {"schedule": schedule})
+            event_retry_match = re.fullmatch(
+                r"/api/schedules/([0-9a-f-]{36})/runs/([0-9a-f-]{36})/retry", self.path,
+            )
+            if event_retry_match:
+                try:
+                    result = STORE.retry_event_schedule_run(
+                        str(body.get("projectId", "")), event_retry_match.group(1),
+                        event_retry_match.group(2),
+                    )
+                except ValueError as error:
+                    return self._json(422, {"error": str(error)})
+                return self._json(404, {"error": "schedule_run_not_found"}) if result is None else self._json(202, {"run": result})
+            event_dismiss_match = re.fullmatch(
+                r"/api/schedules/([0-9a-f-]{36})/runs/([0-9a-f-]{36})/dismiss", self.path,
+            )
+            if event_dismiss_match:
+                try:
+                    result = STORE.dismiss_event_trigger_failure(
+                        str(body.get("projectId", "")), event_dismiss_match.group(1),
+                        event_dismiss_match.group(2),
+                    )
+                except ValueError as error:
+                    conflict = str(error) in {
+                        "event_failure_already_retried", "event_failure_already_dismissed",
+                        "only_failed_event_runs_can_be_dismissed",
+                    }
+                    return self._json(409 if conflict else 422, {"error": str(error) or "invalid_request"})
+                return self._json(404, {"error": "schedule_run_not_found"}) if result is None else self._json(200, {"review": result})
             schedule_action = re.fullmatch(r"/api/schedules/([0-9a-f-]{36})/(pause|resume|run-now|cancel)", self.path)
             if schedule_action:
                 schedule = STORE.update_project_schedule(
@@ -1669,6 +1859,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "local_origin_required"})
         if RESTORE_PENDING.is_set():
             return self._json(503, {"error": "workspace_restore_shutting_down"})
+        project_datasets_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/datasets", self.path)
+        if project_datasets_match:
+            try:
+                body = self._body()
+                datasets = body.get("datasets")
+                if not isinstance(datasets, list):
+                    return self._json(422, {"error": "project_datasets_required"})
+                saved = STORE.set_project_datasets(project_datasets_match.group(1), datasets)
+                if saved is None:
+                    return self._json(404, {"error": "project_not_found"})
+                return self._json(200, {"datasets": saved})
+            except ValueError as error:
+                return self._json(422, {"error": str(error)})
+            except (json.JSONDecodeError, binascii.Error):
+                return self._json(400, {"error": "invalid_request"})
         general_chat_preferences_match = re.fullmatch(
             r"/api/general-chats/([0-9a-f-]{36})/preferences", self.path,
         )
@@ -1700,6 +1905,10 @@ class Handler(BaseHTTPRequestHandler):
                     str(body.get("deliveryTime", "09:00")), body.get("runAt"),
                     str(body.get("cronExpression", "")),
                     str(body.get("targetMissionId", "")),
+                    body.get("triggerEventType"), body.get("eventSourceMissionId"),
+                    body.get("eventPathPattern"),
+                    body.get("eventAutoRetryLimit"),
+                    body.get("eventExternalRepository"),
                 )
                 return self._json(404, {"error": "schedule_not_found"}) if not schedule else self._json(200, {"schedule": schedule})
             except (TypeError, ValueError, json.JSONDecodeError) as error:
@@ -1871,6 +2080,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(413, {"error": "request_too_large"})
             except (ValueError, json.JSONDecodeError) as error:
                 return self._json(422, {"error": str(error) or "invalid_request"})
+        project_design_system_match = re.fullmatch(
+            r"/api/projects/([0-9a-f-]{36})/design-system", self.path,
+        )
+        if project_design_system_match:
+            try:
+                body = self._body()
+                if body.get("remove") is True:
+                    STORE.remove_project_design_system(project_design_system_match.group(1))
+                    return self._json(200, {"designSystem": None})
+                applied = STORE.apply_project_design_system(
+                    project_design_system_match.group(1), body.get("designSystem"),
+                )
+                return self._json(200, {"designSystem": _design_system_summary(applied)})
+            except OverflowError:
+                return self._json(413, {"error": "request_too_large"})
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                status = 404 if str(error) in {"project_not_found", "design_system_version_not_found"} else 422
+                return self._json(status, {"error": str(error) or "invalid_request"})
         usage_budget_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/usage-budget", self.path)
         if usage_budget_match:
             try:
@@ -1895,6 +2122,20 @@ class Handler(BaseHTTPRequestHandler):
                     web_access_match.group(1), body.get("enabled"), body.get("allowedDomains", [])
                 )
                 return self._json(200, {"webAccess": policy})
+            except OverflowError:
+                return self._json(413, {"error": "request_too_large"})
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                status = 404 if str(error) == "project_not_found" else 422
+                return self._json(status, {"error": str(error) or "invalid_request"})
+        approval_policy_match = re.fullmatch(
+            r"/api/projects/([0-9a-f-]{36})/approval-policy", self.path
+        )
+        if approval_policy_match:
+            try:
+                policy = STORE.set_project_approval_policy(
+                    approval_policy_match.group(1), self._body().get("mode")
+                )
+                return self._json(200, {"approvalPolicy": policy})
             except OverflowError:
                 return self._json(413, {"error": "request_too_large"})
             except (TypeError, ValueError, json.JSONDecodeError) as error:
@@ -2014,6 +2255,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "local_origin_required"})
         if RESTORE_PENDING.is_set():
             return self._json(503, {"error": "workspace_restore_shutting_down"})
+        design_system_match = re.fullmatch(r"/api/design-systems/([a-z0-9_-]{2,64})", self.path)
+        if design_system_match:
+            try:
+                deleted = STORE.delete_design_system(design_system_match.group(1))
+            except ValueError as error:
+                return self._json(422, {"error": str(error) or "invalid_request"})
+            return self._json(200, {"deleted": True}) if deleted else self._json(404, {"error": "design_system_not_found"})
         access_grant_match = re.fullmatch(r"/api/access-grants/([0-9a-f-]{36})", self.path)
         if access_grant_match:
             grant = STORE.revoke_access_grant(access_grant_match.group(1))
@@ -2156,18 +2404,89 @@ def main() -> None:
         raise ValueError("TRIBE_PORT must be between 0 and 65535")
     server = None
     price_updater = None
+    e2e_skip_supervisor_dispatch = (
+        os.environ.get("TRIBE_BROWSER_E2E") == "1"
+        and os.environ.get("TRIBE_BROWSER_E2E_SKIP_SUPERVISOR_DISPATCH") == "1"
+    )
 
     def run_scheduler() -> None:
         while True:
             try:
                 STORE.reconcile_scheduled_runs()
-                if SUPERVISOR.enabled and not RESTORE_PENDING.is_set():
+                if (SUPERVISOR.enabled or e2e_skip_supervisor_dispatch) and not RESTORE_PENDING.is_set():
+                    STORE.claim_automatic_event_retries()
                     for mission_id in STORE.queued_scheduled_missions():
-                        SUPERVISOR.start_mission(mission_id)
+                        if not e2e_skip_supervisor_dispatch:
+                            SUPERVISOR.start_mission(mission_id)
                     for run in STORE.claim_due_schedules():
-                        SUPERVISOR.start_mission(run["missionId"])
+                        if not e2e_skip_supervisor_dispatch:
+                            SUPERVISOR.start_mission(run["missionId"])
+                    for run in STORE.claim_event_schedules():
+                        if not e2e_skip_supervisor_dispatch:
+                            SUPERVISOR.start_mission(run["missionId"])
             except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
                 print(f"Schedule poll failed: {error}", flush=True)
+            time.sleep(3)
+
+    def run_github_actions_poller() -> None:
+        while True:
+            try:
+                if not RESTORE_PENDING.is_set():
+                    for group in STORE.claim_due_github_action_polls():
+                        allowed = [
+                            schedule for schedule in group["schedules"]
+                            if STORE.project_web_domain_allowed(schedule["project_id"], "api.github.com")
+                        ]
+                        denied = [schedule for schedule in group["schedules"] if schedule not in allowed]
+                        for schedule in denied:
+                            STORE.record_github_action_poll(
+                                schedule["id"], error="github_actions_requires_project_web_access",
+                            )
+                        if not allowed:
+                            continue
+                        quota = STORE.reserve_github_actions_api_request()
+                        if not quota["allowed"]:
+                            STORE.defer_github_action_polls(
+                                [schedule["id"] for schedule in allowed], quota["retry_at"],
+                                "github_actions_local_rate_budget",
+                            )
+                            continue
+                        try:
+                            if (os.environ.get("TRIBE_BROWSER_E2E") == "1"
+                                    and os.environ.get("TRIBE_BROWSER_E2E_GITHUB_ACTIONS_FIXTURE") == "1"):
+                                repository = group["repository"]
+                                owner, name = repository.split("/", 1)
+                                run_id = 84_501
+                                result = {
+                                    "repository": repository,
+                                    "fetched_at": datetime.now(UTC).isoformat(),
+                                    "rate_limit": {"limit": 60, "remaining": 59},
+                                    "runs": [{
+                                        "id": run_id, "workflow_id": 9_201, "run_number": 7,
+                                        "name": "Tribe E2E workflow", "display_title": "Synthetic failing workflow",
+                                        "event": "push", "head_branch": "main", "head_sha": "a" * 40,
+                                        "conclusion": "failure", "updated_at": datetime.now(UTC).isoformat(),
+                                        "html_url": f"https://github.com/{owner}/{name}/actions/runs/{run_id}",
+                                    }],
+                                }
+                            else:
+                                result = fetch_public_workflow_runs(group["repository"])
+                        except GitHubActionsError as error:
+                            STORE.update_github_actions_api_rate_limit(
+                                error.rate_limit, retry_at=error.retry_at,
+                            )
+                            STORE.advance_github_actions_poll_cursor(group["repository"])
+                            for schedule in allowed:
+                                STORE.record_github_action_poll(
+                                    schedule["id"], error=str(error), retry_at=error.retry_at,
+                                )
+                            continue
+                        STORE.update_github_actions_api_rate_limit(result.get("rate_limit", {}))
+                        STORE.advance_github_actions_poll_cursor(group["repository"])
+                        for schedule in allowed:
+                            STORE.record_github_action_poll(schedule["id"], result["runs"])
+            except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+                print(f"External trigger poll failed: {error}", flush=True)
             time.sleep(3)
 
     try:
@@ -2190,6 +2509,9 @@ def main() -> None:
         SUPERVISOR.recover_interrupted_agent_runs()
         SUPERVISOR.start_active_missions()
         threading.Thread(target=run_scheduler, daemon=True, name="tribe-scheduler").start()
+        threading.Thread(
+            target=run_github_actions_poller, daemon=True, name="tribe-external-event-poller",
+        ).start()
         try:
             from pydantic_ai import prices
             price_updater = prices.update_in_background()

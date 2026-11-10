@@ -74,6 +74,12 @@ class CapabilityContractTests(unittest.TestCase):
         self.assertIn("browser_click", browser.tools)
         self.assertIn("browser_upload", browser.tools)
 
+    def test_data_analysis_grant_includes_only_registered_dataset_operations(self) -> None:
+        tools = set(tools_for_capabilities(("data_analysis",)))
+        self.assertTrue({"list_project_datasets", "profile_project_dataset", "aggregate_project_dataset"}.issubset(tools))
+        self.assertTrue({"record_experiment_run", "list_project_experiment_runs"}.issubset(tools))
+        self.assertNotIn("read_file", tools)
+
     def test_stage_guidance_is_a_valid_workflow_without_global_instructions(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tribe-workflow-") as temporary:
             recipe = save_recipe(

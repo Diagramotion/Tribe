@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import tomllib
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -22,7 +23,7 @@ ALLOWED_EXECUTABLES = frozenset({
     # JavaScript and TypeScript
     "bun", "corepack", "deno", "node", "npm", "npx", "pnpm", "yarn",
     # Python
-    "mypy", "nox", "pip", "pip3", "pipenv", "pipx", "poetry", "pytest", "python", "python3", "ruff", "tox", "uv",
+    "conda-lock", "jupyter", "mypy", "nox", "pip", "pip3", "pipenv", "pipx", "pixi", "poetry", "pytest", "python", "python3", "ruff", "tox", "uv",
     # Compiled languages and build tools
     "cargo", "cmake", "ctest", "dotnet", "go", "gradle", "java", "javac", "make", "mvn", "swift", "xcodebuild",
     # Ruby and PHP
@@ -157,7 +158,8 @@ class BackgroundCommandRunner:
             raise ValueError("command_argument_is_invalid")
         return argv
 
-    def start(self, mission_id: str, argv: list[str]) -> dict:
+    def start(self, mission_id: str, argv: list[str], *, jupyter_environment: str = "",
+              notebook_setup_environment: str = "", notebook_setup_manager: str = "") -> dict:
         with self._lock:
             if self._closed:
                 raise RuntimeError("command_runner_closed")
@@ -172,15 +174,56 @@ class BackgroundCommandRunner:
         if not argv or argv[0] not in allowed or len(argv) > 32:
             raise ValueError("command_must_use_a_project_approved_executable_and_at_most_31_arguments")
         root = self.store.project_repository(mission_id)
-        executable = shutil.which(argv[0])
+        if jupyter_environment and (argv[0] != "jupyter" or jupyter_environment not in {".venv", "venv"}):
+            raise ValueError("jupyter_environment_invalid")
+        if notebook_setup_environment or notebook_setup_manager:
+            expected_commands = {
+                "uv": ["uv", "add", "--dev", "jupyter"],
+                "pipenv": ["pipenv", "install", "--dev", "jupyter"],
+                "poetry": ["poetry", "add", "--group", "dev", "jupyter"],
+            }
+            valid_setup_environment = (
+                notebook_setup_environment == ".venv"
+                and notebook_setup_manager in {"uv", "pipenv", "poetry"}
+            )
+            if not valid_setup_environment or argv != expected_commands.get(notebook_setup_manager):
+                raise ValueError("notebook_setup_environment_invalid")
+            project_root = Path(root)
+            local_environment = project_root / ".venv"
+            if local_environment.is_symlink():
+                try:
+                    resolved_venv = local_environment.resolve(strict=True)
+                except OSError as error:
+                    raise ValueError("notebook_setup_environment_invalid") from error
+                if not resolved_venv.is_relative_to(project_root.resolve()) or not resolved_venv.is_dir():
+                    raise ValueError("notebook_setup_environment_invalid")
+            elif local_environment.exists() and not local_environment.is_dir():
+                raise ValueError("notebook_setup_environment_invalid")
+            project_manifests = {
+                "uv": (project_root / "pyproject.toml").is_file() and (project_root / "uv.lock").is_file(),
+                "pipenv": (project_root / "Pipfile").is_file() and (project_root / "Pipfile.lock").is_file(),
+                "poetry": (project_root / "pyproject.toml").is_file() and (project_root / "poetry.lock").is_file(),
+            }
+            if not project_manifests.get(notebook_setup_manager) or not shutil.which(notebook_setup_manager):
+                raise ValueError("notebook_setup_manager_unavailable")
+        executable = self._resolve_executable(argv[0], root, jupyter_environment or None)
         if not executable:
             raise ValueError(f"executable_not_found:{argv[0]}")
         launch_argv = build_launch_argv([executable, *argv[1:]], executable)
+        process_environment = None
+        if notebook_setup_environment:
+            process_environment = os.environ.copy()
+            if notebook_setup_manager == "uv":
+                process_environment["UV_PROJECT_ENVIRONMENT"] = str(root / notebook_setup_environment)
+            elif notebook_setup_manager == "pipenv":
+                process_environment["PIPENV_VENV_IN_PROJECT"] = "1"
+            elif notebook_setup_manager == "poetry":
+                process_environment["POETRY_VIRTUALENVS_IN_PROJECT"] = "1"
         try:
             process = subprocess.Popen(
                 launch_argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-                bufsize=1, shell=False, start_new_session=os.name != "nt",
+                bufsize=1, shell=False, env=process_environment, start_new_session=os.name != "nt",
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             )
         except OSError as error:
@@ -220,6 +263,66 @@ class BackgroundCommandRunner:
             self._collectors[run["id"]] = collector
             collector.start()
         return run
+
+    @staticmethod
+    def _resolve_executable(name: str, root: Path, jupyter_environment: str | None = None) -> str | None:
+        """Resolve Jupyter only from a locked, project-local Python environment."""
+        if name == "jupyter":
+            python_lockfiles = ("uv.lock", "poetry.lock", "Pipfile.lock")
+            if not any((root / lockfile).is_file() for lockfile in python_lockfiles):
+                return None
+            names = [jupyter_environment] if jupyter_environment else [".venv", "venv"]
+            project_root = root.resolve()
+            for environment in names:
+                if environment not in {".venv", "venv"}:
+                    continue
+                base = root / environment
+                executable = "jupyter.exe" if os.name == "nt" else "jupyter"
+                scripts = [base / ("Scripts" if os.name == "nt" else "bin") / executable]
+                for candidate in scripts:
+                    located = shutil.which(str(candidate))
+                    if not located:
+                        continue
+                    try:
+                        resolved = Path(located).resolve(strict=True)
+                    except OSError:
+                        continue
+                    if resolved.is_relative_to(project_root) and resolved.is_file():
+                        return str(candidate)
+            return None
+        return shutil.which(name)
+
+    @staticmethod
+    def notebook_environments(root: Path) -> list[dict[str, object]]:
+        """Describe recognised local notebook environments without exposing filesystem paths."""
+        python_lockfiles = ("uv.lock", "poetry.lock", "Pipfile.lock")
+        lockfile = next((name for name in python_lockfiles if (root / name).is_file()), "")
+        locked = bool(lockfile)
+        if os.name == "nt":
+            scripts = {".venv": root / ".venv" / "Scripts" / "jupyter.exe",
+                       "venv": root / "venv" / "Scripts" / "jupyter.exe"}
+        else:
+            scripts = {".venv": root / ".venv" / "bin" / "jupyter",
+                       "venv": root / "venv" / "bin" / "jupyter"}
+        environments = [{
+            "id": name,
+            "label": name,
+            "locked": locked,
+            "lockfile": lockfile or None,
+            "uvSetupAvailable": bool(
+                lockfile == "uv.lock" and (root / "pyproject.toml").is_file() and shutil.which("uv")
+            ),
+            "pipenvSetupAvailable": bool(
+                name == ".venv" and lockfile == "Pipfile.lock" and (root / "Pipfile").is_file()
+                and shutil.which("pipenv")
+            ),
+            "poetrySetupAvailable": bool(
+                name == ".venv" and lockfile == "poetry.lock" and (root / "pyproject.toml").is_file()
+                and shutil.which("poetry")
+            ),
+            "jupyterAvailable": bool(locked and shutil.which(str(script))),
+        } for name, script in scripts.items()]
+        return environments
 
     def list(self, mission_id: str) -> list[dict]:
         return self.store.background_runs(mission_id)

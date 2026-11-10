@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { FileText, SquaresFour, UsersThree, ClockCounterClockwise, Sparkle, X } from "@phosphor-icons/react";
+import { FileText, SquaresFour, UsersThree, ClockCounterClockwise, Sparkle, ShieldCheck, ChartLineUp, X } from "@phosphor-icons/react";
 import { IconButton } from "./WorkspaceSidebar.jsx";
 import { useDialogFocus } from "../hooks/useDialogFocus.js";
 
 const sections = [
   { id: "team", label: "Team", icon: UsersThree, description: "Review roles available to this project. Custom role definitions are shared across projects." },
+  { id: "approvals", label: "Approvals", icon: ShieldCheck, description: "Choose when agents need your approval before acting." },
   { id: "guidance", label: "Guidance", icon: FileText, description: "Set the project goal and the repository files agents should read." },
+  { id: "datasets", label: "Datasets", icon: ChartLineUp, description: "Choose which local tables agents with Data analysis access may inspect." },
   { id: "knowledge", label: "Memory", icon: FileText, description: "Manage durable project memory and review suggestions." },
   { id: "artifacts", label: "Artifacts", icon: SquaresFour, description: "Browse files and shared documents created in this project." },
   { id: "interactive", label: "Interactive apps", icon: Sparkle, description: "Choose whether agents can create interactive tools in chat replies." },

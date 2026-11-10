@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import difflib
+import json
 import mimetypes
 import os
 import subprocess
@@ -195,7 +196,47 @@ def project_git_diff(repository_root: Path, relative_path: str) -> dict[str, obj
         diff = result.stdout.decode("utf-8", errors="replace")
     if len(diff) > 500_000:
         diff = diff[:500_000] + "\n… diff truncated …\n"
-    return {"path": relative_path, "diff": diff or "No text changes to show."}
+    response: dict[str, object] = {"path": relative_path, "diff": diff or "No text changes to show."}
+    if relative_path.lower().endswith(".ipynb"):
+        before = ""
+        after = ""
+        try:
+            current_entry = browse_repository(root, relative_path)
+        except FileNotFoundError:
+            current_entry = {"kind": "file", "content": ""}
+        except ValueError:
+            current_entry = {"kind": "file", "binary": True}
+        if not current_entry.get("binary") and not current_entry.get("tooLarge"):
+            after = str(current_entry.get("content", ""))
+            try:
+                object_result = subprocess.run(
+                    ["git", "rev-parse", "--verify", f"HEAD:{relative_path}"],
+                    cwd=root, capture_output=True, timeout=4, check=False,
+                )
+                object_id = object_result.stdout.decode("ascii", errors="ignore").strip()
+                if object_result.returncode == 0 and object_id:
+                    size_result = subprocess.run(
+                        ["git", "cat-file", "-s", object_id], cwd=root,
+                        capture_output=True, timeout=4, check=False,
+                    )
+                    size = int(size_result.stdout) if size_result.returncode == 0 else 1_000_001
+                    if size <= 1_000_000:
+                        blob_result = subprocess.run(
+                            ["git", "cat-file", "blob", object_id], cwd=root,
+                            capture_output=True, timeout=4, check=False,
+                        )
+                        if blob_result.returncode == 0:
+                            before = blob_result.stdout.decode("utf-8")
+            except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, ValueError):
+                before = ""
+            try:
+                json.loads(before or "{}")
+                json.loads(after or "{}")
+            except json.JSONDecodeError:
+                pass
+            else:
+                response["notebookVersions"] = {"before": before, "after": after}
+    return response
 
 
 def _retain_path_lock(path: Path) -> _PathLockEntry:

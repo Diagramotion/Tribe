@@ -52,6 +52,24 @@ function parseDelimitedText(source, delimiter) {
   };
 }
 
+function profileColumns(headers, rows) {
+  return headers.map((name, column) => {
+    const values = rows.map((row) => row[column] ?? "");
+    const nonEmpty = values.filter((value) => value.trim() !== "");
+    const numbers = nonEmpty.map(Number);
+    const numeric = nonEmpty.length > 0 && numbers.every(Number.isFinite);
+    return {
+      index: column,
+      name,
+      type: nonEmpty.length === 0 ? "Empty" : numeric ? "Number" : "Text",
+      missing: values.length - nonEmpty.length,
+      distinct: new Set(nonEmpty).size,
+      minimum: numeric ? Math.min(...numbers) : null,
+      maximum: numeric ? Math.max(...numbers) : null,
+    };
+  });
+}
+
 function compareCells(left, right) {
   if (left === "") return right === "" ? 0 : 1;
   if (right === "") return -1;
@@ -76,6 +94,7 @@ export function TabularArtifactPreview({ text, fileName, delimiter, truncated = 
   const [sort, setSort] = useState({ column: -1, descending: false });
   const [page, setPage] = useState(0);
   const parsed = useMemo(() => parseDelimitedText(text, delimiter), [text, delimiter]);
+  const columnProfiles = useMemo(() => profileColumns(parsed.headers, parsed.rows), [parsed]);
   const filteredRows = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
     let rows = query
@@ -115,6 +134,16 @@ export function TabularArtifactPreview({ text, fileName, delimiter, truncated = 
         <button aria-label="View source" className="icon-button" onClick={onViewSource} title="View source" type="button"><Code size={16} /></button>
       </div>
     </div>
+    {columnProfiles.length > 0 && <details className="tabular-artifact-profile">
+      <summary>Column profile · {columnProfiles.length} columns{parsed.truncated || truncated ? " · preview rows" : ""}</summary>
+      <div className="tabular-artifact-profile-scroll"><table><thead><tr><th scope="col">Column</th><th scope="col">Type</th><th scope="col">Missing</th><th scope="col">Distinct in preview</th><th scope="col">Range</th></tr></thead>
+        <tbody>{columnProfiles.map((profile) => <tr key={`${profile.index}-${profile.name}`}>
+          <th scope="row" title={profile.name}>{profile.name}</th>
+          <td>{profile.type}</td><td>{profile.missing.toLocaleString()}</td><td>{profile.distinct.toLocaleString()}</td>
+          <td>{profile.type === "Number" ? `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 }).format(profile.minimum)}–${new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 }).format(profile.maximum)}` : "—"}</td>
+        </tr>)}</tbody>
+      </table></div>
+    </details>}
     {parsed.headers.length === 0
       ? <div className="tabular-artifact-empty">This file has no table header.</div>
       : <div className="tabular-artifact-scroll">
