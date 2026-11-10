@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowClockwise, GitBranch, GitDiff, FileText } from "@phosphor-icons/react";
 import { runtime } from "../api/runtime.js";
+import { notebookCellDiff } from "../domain/notebook.js";
 
 function changeLabel(status) {
   if (status === "??") return "U";
@@ -44,11 +45,15 @@ export function GitChangesView({ project }) {
   const [status, setStatus] = useState(null);
   const [selectedPath, setSelectedPath] = useState("");
   const [diff, setDiff] = useState("");
+  const [notebookVersions, setNotebookVersions] = useState(null);
   const [loading, setLoading] = useState(true);
   const [diffLoading, setDiffLoading] = useState(false);
   const [error, setError] = useState("");
   const lastDiffTarget = useRef({ projectId: "", path: "" });
   const wrapDiffLines = /\.(?:md|markdown|mdx|txt|text|rst)$/i.test(selectedPath);
+  const notebookChanges = useMemo(() => notebookVersions
+    ? notebookCellDiff(notebookVersions.before, notebookVersions.after)
+    : null, [notebookVersions]);
 
   const refresh = useCallback(async () => {
     if (!project?.id) return;
@@ -65,6 +70,7 @@ export function GitChangesView({ project }) {
     setStatus(null);
     setSelectedPath("");
     setDiff("");
+    setNotebookVersions(null);
     setLoading(true);
     void refresh();
     const timer = window.setInterval(() => void refresh(), 5000);
@@ -75,11 +81,11 @@ export function GitChangesView({ project }) {
     let current = true;
     const targetChanged = lastDiffTarget.current.projectId !== project?.id || lastDiffTarget.current.path !== selectedPath;
     lastDiffTarget.current = { projectId: project?.id ?? "", path: selectedPath };
-    if (!project?.id || !selectedPath) { setDiff(""); setDiffLoading(false); return undefined; }
-    if (targetChanged) { setDiff(""); setDiffLoading(true); }
+    if (!project?.id || !selectedPath) { setDiff(""); setNotebookVersions(null); setDiffLoading(false); return undefined; }
+    if (targetChanged) { setDiff(""); setNotebookVersions(null); setDiffLoading(true); }
     runtime.getProjectGitDiff(project.id, selectedPath).then((result) => {
-      if (current) { setDiff(result.diff); setError(""); }
-    }).catch((loadError) => { if (current) { if (targetChanged) setDiff(""); setError(loadError.message); } })
+      if (current) { setDiff(result.diff); setNotebookVersions(result.notebookVersions ?? null); setError(""); }
+    }).catch((loadError) => { if (current) { if (targetChanged) { setDiff(""); setNotebookVersions(null); } setError(loadError.message); } })
       .finally(() => { if (current) setDiffLoading(false); });
     return () => { current = false; };
   }, [project?.id, selectedPath, status]);
@@ -103,7 +109,13 @@ export function GitChangesView({ project }) {
           </nav>
           <div className="git-diff-panel">
             <div className="git-diff-heading"><span title={selectedPath}>{selectedPath || "Select a file"}</span>{selectedPath && <small>{status.files.find((file) => file.path === selectedPath)?.staged ? "Staged" : "Unstaged"}</small>}</div>
-            {diffLoading ? <div className="git-changes-empty">Loading diff…</div> : <div aria-label={`${selectedPath} diff`} className={`git-diff-content${wrapDiffLines ? " git-diff-content--wrap" : ""}`} role="region" tabIndex={0}>{diff
+            {diffLoading ? <div className="git-changes-empty">Loading diff…</div> : selectedPath.toLowerCase().endsWith(".ipynb") && notebookChanges ? <div aria-label={`${selectedPath} cell changes`} className="notebook-git-diff" role="region" tabIndex={0}>
+              <div className="notebook-git-diff-summary">{notebookChanges.length} changed {notebookChanges.length === 1 ? "cell" : "cells"}</div>
+              {notebookChanges.length === 0 ? <div className="git-changes-empty">No cell source or output changes.</div> : notebookChanges.map((change) => <article className="notebook-git-cell" key={`${change.key}-${change.status}`}>
+                <header><strong>Cell {change.index + 1} · {change.cellType}</strong><span>{change.status}{change.outputsChanged ? " · outputs changed" : ""}</span></header>
+                {change.lines.length > 0 && <pre>{change.lines.map((line, index) => <code className={`notebook-git-line notebook-git-line--${line.kind}`} key={index}>{line.kind === "added" ? "+" : line.kind === "removed" ? "−" : " "}{line.text || " "}</code>)}</pre>}
+              </article>)}
+            </div> : <div aria-label={`${selectedPath} diff`} className={`git-diff-content${wrapDiffLines ? " git-diff-content--wrap" : ""}`} role="region" tabIndex={0}>{diff
               ? decorateDiff(diff).map((line) => <div className={`git-diff-line ${line.kind ? `git-diff-line--${line.kind}` : ""}`} key={line.index}>
                 <span aria-hidden="true" className="git-diff-number">{line.oldLine}</span>
                 <span aria-hidden="true" className="git-diff-number">{line.newLine}</span>

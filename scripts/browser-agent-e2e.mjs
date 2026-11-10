@@ -18,6 +18,7 @@ const uploadFixtureContent = "Tribe browser upload fixture\n";
 await fs.writeFile(uploadFixturePath, uploadFixtureContent, { mode: 0o600 });
 if (process.env.TRIBE_BROWSER_E2E_INTERACTIVE === "1") console.log(`Disposable upload fixture: ${uploadFixturePath}`);
 const browserApiToken = crypto.randomBytes(32).toString("hex");
+let approvalUiProjectId = "";
 const browserApiPort = await reserveLocalPort();
 const runtimePort = await reserveLocalPort();
 const devPort = await reserveLocalPort();
@@ -115,8 +116,8 @@ const server = http.createServer((request, response) => {
     return;
   }
   response.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-  response.end(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.ico"><title>Browser Bridge Fixture</title></head>
-    <body><main><h1>Shared visible tab</h1><p id="count">Count: 0</p>
+  response.end(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.ico"><title>Browser Bridge Fixture</title><style>body{background:#faf8f4;color:#202020;font-family:Inter,Arial,sans-serif;font-size:16px}a{color:#1f5ba8}button,input,select{border:1px solid #d4d5d7;border-radius:8px;padding:8px}button{background:#1f5ba8;color:#fff}</style></head>
+    <body><main><h1>Shared visible tab</h1><p id="count">Count: 0</p><label>Private field<input value="private-form-value"></label>
     <iframe title="Embedded storage fixture" src="${embeddedUrl}"></iframe>
     <button id="increment" type="button" onclick="document.querySelector('#count').textContent = 'Count: ' + (Number(document.querySelector('#count').textContent.replace('Count: ', '')) + 1)">Increment counter</button>
     <label>Plan period<select id="plan-period"><option value="" disabled selected>Choose a plan</option><option value="monthly">Monthly plan</option><option value="annual">Annual plan</option></select></label><p id="plan-result">Plan: not selected</p>
@@ -156,6 +157,9 @@ const safeEnv = {
   TRIBE_BROWSER_E2E_AUTO_UPLOAD: automaticUpload ? "1" : "0",
   TRIBE_BROWSER_E2E_UPLOAD_FILE: uploadFixturePath,
   TRIBE_BROWSER_E2E_SKIP_APPROVAL: process.env.TRIBE_BROWSER_E2E_SKIP_APPROVAL === "1" ? "1" : "0",
+  TRIBE_BROWSER_E2E_APPROVAL_UI: process.env.TRIBE_BROWSER_E2E_APPROVAL_UI === "1" ? "1" : "0",
+  TRIBE_BROWSER_E2E_SKIP_SUPERVISOR_DISPATCH: process.env.TRIBE_BROWSER_E2E_APPROVAL_UI === "1" ? "1" : "0",
+  TRIBE_BROWSER_E2E_GITHUB_ACTIONS_FIXTURE: process.env.TRIBE_BROWSER_E2E_APPROVAL_UI === "1" ? "1" : "0",
   TRIBE_BROWSER_E2E: "1",
 };
 let vite;
@@ -279,6 +283,34 @@ async function call(action, payload = {}) {
 }
 
 try {
+  if (safeEnv.TRIBE_BROWSER_E2E_APPROVAL_UI === "1") {
+    assert.ok(packagedAppPath, "approval UI acceptance requires the disposable packaged desktop app");
+    const repository = path.join(temporaryRoot, "approval-ui-repository");
+    await fs.mkdir(repository, { recursive: true });
+    const python = process.platform === "win32"
+      ? resolve(root, "runtime/.venv/Scripts/python.exe")
+      : resolve(root, "runtime/.venv/bin/python");
+    const seedSource = [
+      "import os",
+      "from pathlib import Path",
+      "from tribe_runtime.store import MissionStore",
+      "store = MissionStore(Path(os.environ['TRIBE_DATA_DIR']) / 'tribe.sqlite3')",
+      `project, mission = store.create_project(${JSON.stringify(repository)}, 'Approval UI Acceptance', 'Approval policy acceptance', 'Exercise approval settings in an isolated packaged-app profile.')`,
+      "store.set_project_web_access(project['id'], True, ['api.github.com'])",
+      "store.pause_mission(mission['id'])",
+      "print(project['id'])",
+    ].join("\n");
+    approvalUiProjectId = (await runProcess(python, ["-c", seedSource], {
+      cwd: root,
+      env: {
+        ...safeEnv,
+        TRIBE_DATA_DIR: safeEnv.TRIBE_ELECTRON_DATA_DIR,
+        PYTHONPATH: resolve(root, "runtime"),
+      },
+      timeoutMs: 30_000,
+    })).trim();
+    assert.match(approvalUiProjectId, /^[0-9a-f-]{36}$/i, "the isolated approval project must have a valid ID");
+  }
   if (safeEnv.TRIBE_BROWSER_E2E_SPLIT === "1" && !packagedAppPath) {
     const repository = path.join(temporaryRoot, "split-layout-repository");
     await fs.mkdir(repository, { recursive: true });
@@ -398,6 +430,30 @@ try {
   }, "the real Chromium page to replace the styled empty-tab surface");
   assert.equal(livePageLayout.browserHostVisible, true,
     "a navigated page must show the same native Chromium surface used for user and agent control");
+  await call("navigate", { tabId, url: `${fixtureUrl}?session=private#detail`, allowedDomains: ["127.0.0.1"] });
+  const capturedDesignReference = await call("extract-design-reference");
+  const capturedReference = capturedDesignReference.reference;
+  assert.equal(capturedDesignReference.screenshot?.mimeType, "image/jpeg",
+    "design reference capture must include a compressed screenshot of the selected page");
+  assert.ok(Buffer.from(capturedDesignReference.screenshot.data, "base64").length <= 600_000,
+    "design reference screenshots must stay within the bounded preview payload size");
+  assert.ok(capturedDesignReference.screenshot.width > 0 && capturedDesignReference.screenshot.height > 0,
+    "design reference screenshots must include their viewport dimensions");
+  assert.equal(capturedReference.url, fixtureUrl,
+    "design reference attribution must omit query strings and fragments");
+  assert.ok(capturedReference.backgrounds.some(({ value }) => value === "rgb(250, 248, 244)"),
+    "capture must read computed styles from the selected visible browser page");
+  assert.ok(capturedReference.links.some(({ value }) => value === "rgb(31, 91, 168)"),
+    "capture must include the computed link colour");
+  assert.ok(capturedReference.buttons.length > 0 && capturedReference.inputs.length > 0,
+    "capture must provide visible control style samples for the preview");
+  assert.equal(JSON.stringify(capturedReference).includes("Shared visible tab"), false,
+    "capture must not return page text");
+  assert.equal(JSON.stringify(capturedReference).includes("private-form-value"), false,
+    "capture must not return form values");
+  assert.equal((await call("state")).activeTabId, tabId,
+    "style capture must leave the user's selected visible tab active");
+  console.log("Browser E2E extracted visual styles from the same selected page while omitting page content and private URL parts.");
   if (process.platform === "darwin") {
     const nativeMenu = await call("menu-state");
     assert.equal(nativeMenu.active, true, "the native browser commands must activate with the Browser pane");
@@ -789,7 +845,14 @@ try {
   const beforeRestart = await call("state");
   const restoredTabExpectations = beforeRestart.tabs.map(({ url, viewport, reducedMotion }) => ({ url, viewport, reducedMotion }));
   const activeTabIndex = beforeRestart.tabs.findIndex((tab) => tab.active);
-  const savedSession = JSON.parse(await fs.readFile(path.join(safeEnv.TRIBE_ELECTRON_DATA_DIR, "browser-sessions.json"), "utf8"));
+  const savedSession = await waitFor(async () => {
+    try {
+      const snapshot = JSON.parse(await fs.readFile(path.join(safeEnv.TRIBE_ELECTRON_DATA_DIR, "browser-sessions.json"), "utf8"));
+      return snapshot.sessions.workspace.tabs.length === restoredTabExpectations.length ? snapshot : false;
+    } catch {
+      return false;
+    }
+  }, "the saved Browser session to include every open tab", 5_000);
   assert.equal(savedSession.sessions.workspace.tabs.length, restoredTabExpectations.length,
     "the Browser session file must contain each open tab before restart");
   const browserWorkspaceOpens = stdout.match(/Browser E2E workspace opened\./g)?.length || 0;
@@ -831,6 +894,385 @@ try {
   assert.equal(reopenedSession.tabs.length, 1, "the new-tab action must create a browser page on demand");
   assert.equal(reopenedSession.tabs[0].url, "", "a new browser page must start blank");
   console.log("Browser E2E closed every page tab, then created a fresh blank page with the explicit new-tab action.");
+  if (safeEnv.TRIBE_BROWSER_E2E_APPROVAL_UI === "1") {
+    const approvalUiState = () => call("approval-ui-state");
+    const readApprovalPolicy = async () => {
+      const { runtimeBaseUrl } = await approvalUiState();
+      assert.match(runtimeBaseUrl, /^http:\/\/127\.0\.0\.1:\d+$/,
+        "the packaged approval flow must expose its current local runtime address to the renderer");
+      const response = await fetch(`${runtimeBaseUrl}/api/projects/${approvalUiProjectId}/approval-policy`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      const body = await response.json();
+      assert.equal(response.status, 200, `approval policy read failed: ${body.error || response.status}`);
+      return body.approvalPolicy;
+    };
+    await waitFor(async () => (await approvalUiState()).projectVisible,
+      "the seeded approval project to appear in the packaged workspace", 10_000).catch(async (error) => {
+      throw new Error(`${error.message} Last UI state: ${JSON.stringify(await approvalUiState())}. Seeded project: ${approvalUiProjectId}`);
+    });
+    await call("approval-ui-action", { operation: "open-project-menu" });
+    await call("approval-ui-action", { operation: "open-project-settings" });
+    await waitFor(async () => (await approvalUiState()).settingsOpen,
+      "the seeded project's settings dialog to open");
+    await call("approval-ui-action", { operation: "open-approvals-section" });
+    const approvalScreen = await waitFor(async () => {
+      const state = await approvalUiState();
+      return state.activeSection === "project-settings-tab-approvals" ? state : false;
+    }, "the project's approval settings to open");
+    assert.deepEqual(approvalScreen.availableModes, ["standard", "review_changes", "confirm_every_call"]);
+    assert.deepEqual(approvalScreen.modeTitles, ["Standard", "Confirm changes", "Confirm every tool call"]);
+    assert.equal(approvalScreen.grantBoundaryVisible, true,
+      "the packaged settings must state that approval mode cannot grant role tools or access");
+    assert.equal(approvalScreen.exactApprovalVisible, true,
+      "the packaged settings must preserve exact approvals for destructive and external actions");
+    await waitFor(async () => (await approvalUiState()).modesEnabled,
+      "the approval policy to finish loading before interaction");
+    for (const mode of ["standard", "review_changes", "confirm_every_call"]) {
+      await call("approval-ui-action", { operation: "choose-approval-mode", mode });
+      await call("approval-ui-action", { operation: "save-approval-mode" });
+      const persisted = await waitFor(async () => {
+        const policy = await readApprovalPolicy();
+        return policy.mode === mode ? policy : false;
+      }, `the ${mode} approval mode to persist from the packaged settings`);
+      assert.equal(persisted.mode, mode);
+      const state = await waitFor(async () => {
+        const current = await approvalUiState();
+        return current.savedNotice === "Approval mode saved." ? current : false;
+      }, `the ${mode} approval save confirmation to appear`);
+      assert.equal(state.selectedMode, mode, `the settings UI must show ${mode} as selected after saving`);
+    }
+    await call("approval-ui-action", { operation: "close-project-settings" });
+    await waitFor(async () => !(await approvalUiState()).settingsOpen,
+      "the approval settings dialog to close");
+    console.log("Packaged approval settings saved and reloaded all three project modes, while showing the role-grant and exact-action approval boundaries.");
+
+    const readProjectSchedules = async () => {
+      const { runtimeBaseUrl } = await approvalUiState();
+      const response = await fetch(`${runtimeBaseUrl}/api/schedules?project=${approvalUiProjectId}`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      const body = await response.json();
+      assert.equal(response.status, 200, `schedule read failed: ${body.error || response.status}`);
+      return body.schedules;
+    };
+    const schedulesBefore = await readProjectSchedules();
+    await call("approval-ui-action", { operation: "open-scheduled-tasks" });
+    await waitFor(async () => (await approvalUiState()).scheduleViewVisible,
+      "the packaged Scheduled tasks workspace to open");
+    await call("approval-ui-action", { operation: "open-event-template" });
+    await waitFor(async () => (await approvalUiState()).scheduleDialogOpen,
+      "the failing-test event template to open its schedule editor");
+    await call("approval-ui-action", { operation: "open-trigger-selector" });
+    const triggerMenu = await waitFor(async () => {
+      const state = await approvalUiState();
+      return state.triggerOptions.length === 5 ? state : false;
+    }, "all five event trigger choices to appear in the packaged editor");
+    assert.deepEqual(triggerMenu.triggerOptions, [
+      "A test run fails", "A repository file changes", "A chat completes", "An artifact is created", "A GitHub Actions run fails",
+    ]);
+    for (const label of triggerMenu.triggerOptions) {
+      await call("approval-ui-action", { operation: "choose-event-trigger", mode: label });
+      const selectedTrigger = await approvalUiState();
+      assert.equal(selectedTrigger.triggerValue, label, `the event editor must select ${label}`);
+      assert.equal(selectedTrigger.pathFilterVisible, label === "A repository file changes",
+        "the repository path filter must appear only for file-change triggers");
+      assert.equal(selectedTrigger.githubRepositoryFieldVisible, label === "A GitHub Actions run fails",
+        "the public repository field must appear only for GitHub Actions triggers");
+      if (label !== triggerMenu.triggerOptions.at(-1)) await call("approval-ui-action", { operation: "open-trigger-selector" });
+    }
+    await call("approval-ui-action", { operation: "cancel-schedule" });
+    await waitFor(async () => !(await approvalUiState()).scheduleDialogOpen,
+      "the unsaved event trigger editor to close");
+    assert.equal((await readProjectSchedules()).length, schedulesBefore.length,
+      "cancelling the event trigger editor must not create a schedule");
+    console.log("Packaged Scheduled tasks exposed all five event sources and their conditional fields; cancelling left the project's saved schedules unchanged.");
+
+    await call("approval-ui-action", { operation: "open-event-template" });
+    await waitFor(async () => (await approvalUiState()).scheduleDialogOpen,
+      "the event template to reopen for schedule persistence acceptance");
+    await call("approval-ui-action", { operation: "open-source-chat-selector" });
+    const sourceChatOptions = await waitFor(async () => {
+      const state = await approvalUiState();
+      return state.scheduleOptionLabels.length > 0 ? state.scheduleOptionLabels : false;
+    }, "the local source chat choices to appear");
+    const sourceChatChoice = sourceChatOptions.find((label) => label !== "Choose a chat");
+    assert.ok(sourceChatChoice, `the event schedule must offer the seeded source chat: ${JSON.stringify(sourceChatOptions)}`);
+    await call("approval-ui-action", { operation: "choose-source-chat", mode: sourceChatChoice });
+    await waitFor(async () => (await approvalUiState()).scheduleCreateEnabled,
+      "the event schedule to become valid after selecting its source chat");
+    await call("approval-ui-action", { operation: "create-event-schedule" });
+    await waitFor(async () => !(await approvalUiState()).scheduleDialogOpen,
+      "the event schedule to save and close its editor");
+    let persistedEventSchedule = await waitFor(async () => {
+      const schedules = await readProjectSchedules();
+      return schedules.find((schedule) => schedule.title === "Investigate failing tests") || false;
+    }, "the event schedule to persist in the selected project");
+    assert.equal(persistedEventSchedule.cadence, "event");
+    assert.equal(persistedEventSchedule.trigger_event_type, "repo.test_run.completed");
+    assert.equal(persistedEventSchedule.status, "active");
+    assert.ok(persistedEventSchedule.event_source_mission_id);
+
+    await call("approval-ui-action", { operation: "pause-test-schedule" });
+    persistedEventSchedule = await waitFor(async () => {
+      const schedule = (await readProjectSchedules()).find((item) => item.id === persistedEventSchedule.id);
+      return schedule?.status === "paused" ? schedule : false;
+    }, "the packaged event schedule to pause");
+    await waitFor(async () => (await approvalUiState()).testScheduleButtons.includes("Resume schedule"),
+      "the Scheduled tasks view to show the paused control state");
+    await call("approval-ui-action", { operation: "resume-test-schedule" });
+    persistedEventSchedule = await waitFor(async () => {
+      const schedule = (await readProjectSchedules()).find((item) => item.id === persistedEventSchedule.id);
+      return schedule?.status === "active" ? schedule : false;
+    }, "the packaged event schedule to resume");
+    await waitFor(async () => (await approvalUiState()).testScheduleButtons.includes("Pause schedule"),
+      "the Scheduled tasks view to show the resumed control state");
+    await call("approval-ui-action", { operation: "cancel-test-schedule" });
+    persistedEventSchedule = await waitFor(async () => {
+      const schedule = (await readProjectSchedules()).find((item) => item.id === persistedEventSchedule.id);
+      return schedule?.status === "cancelled" ? schedule : false;
+    }, "the packaged event schedule to cancel");
+    assert.equal(persistedEventSchedule.status, "cancelled");
+    console.log("Packaged event scheduling created and persisted a local trigger, paused, resumed and cancelled it through the workspace UI.");
+
+    await call("approval-ui-action", { operation: "open-design-systems" });
+    await waitFor(async () => (await approvalUiState()).designSystemsViewVisible,
+      "the workspace Design systems view to open");
+    await call("approval-ui-action", { operation: "open-design-system-editor" });
+    const initialDesignDraft = await waitFor(async () => {
+      const state = await approvalUiState();
+      return state.designSystemEditorOpen && state.designSystemDraftName ? state.designSystemDraftName : false;
+    }, "the packaged design-system editor to open with a preset draft");
+    await call("approval-ui-action", { operation: "edit-design-system-name" });
+    assert.equal((await approvalUiState()).designSystemDraftName, "Discarded draft",
+      "the editor must accept draft changes before cancellation");
+    await call("approval-ui-action", { operation: "cancel-design-system-editor" });
+    await waitFor(async () => !(await approvalUiState()).designSystemEditorOpen,
+      "cancelling the design-system editor to close it");
+    await call("approval-ui-action", { operation: "open-design-system-editor" });
+    const reopenedDesignDraft = await waitFor(async () => {
+      const state = await approvalUiState();
+      return state.designSystemEditorOpen && state.designSystemDraftName ? state.designSystemDraftName : false;
+    }, "the design-system editor to reopen with a fresh draft");
+    assert.notEqual(reopenedDesignDraft, "Discarded draft",
+      "cancelled design-system edits must not leak into the next draft");
+    assert.equal(reopenedDesignDraft, initialDesignDraft,
+      "reopening the editor must restore the selected preset's starting values");
+    await call("approval-ui-action", { operation: "close-design-system-editor" });
+    await waitFor(async () => !(await approvalUiState()).designSystemEditorOpen,
+      "the design-system editor close control to close it");
+    console.log("Packaged Design systems acceptance confirmed that cancelling discards draft edits and reopening starts cleanly.");
+
+    const designSystemRuntimeBaseUrl = (await approvalUiState()).runtimeBaseUrl;
+    const readSavedDesignSystems = async () => {
+      const response = await fetch(`${designSystemRuntimeBaseUrl}/api/design-systems`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      const body = await response.json();
+      assert.equal(response.status, 200, `design system read failed: ${body.error || response.status}`);
+      return body.systems;
+    };
+    const readApprovalUiProject = async () => {
+      const response = await fetch(`${designSystemRuntimeBaseUrl}/api/projects`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      const body = await response.json();
+      assert.equal(response.status, 200, `project read failed: ${body.error || response.status}`);
+      return body.projects.find((project) => project.id === approvalUiProjectId);
+    };
+    await call("approval-ui-action", { operation: "open-design-system-editor" });
+    await waitFor(async () => (await approvalUiState()).designSystemEditorOpen,
+      "the design-system editor to open for a saved version");
+    await call("approval-ui-action", { operation: "name-design-system-for-save" });
+    await call("approval-ui-action", { operation: "save-design-system" });
+    const savedDesignSystem = await waitFor(async () => {
+      const system = (await readSavedDesignSystems()).find((item) => item.name === "Tribe Acceptance System");
+      const state = await approvalUiState();
+      return !state.designSystemEditorOpen && system && state.designSystemDetailVersion === "Your system · v1"
+        ? system : false;
+    }, "the first user-owned design-system version to save");
+    assert.equal(savedDesignSystem.version, 1);
+    assert.equal(savedDesignSystem.source, "user");
+    await call("approval-ui-action", { operation: "apply-design-system" });
+    const appliedVersionOne = await waitFor(async () => {
+      const project = await readApprovalUiProject();
+      return project?.designSystem?.id === savedDesignSystem.id
+        && project.designSystem.version === 1 ? project.designSystem : false;
+    }, "design-system version one to apply to the selected project");
+    assert.equal(appliedVersionOne.name, "Tribe Acceptance System");
+
+    await call("approval-ui-action", { operation: "open-edit-design-system" });
+    await waitFor(async () => (await approvalUiState()).designSystemEditorOpen,
+      "the saved design system to open for a new version");
+    await call("approval-ui-action", { operation: "name-design-system-v2" });
+    await call("approval-ui-action", { operation: "save-design-system" });
+    const savedDesignSystemV2 = await waitFor(async () => {
+      const system = (await readSavedDesignSystems()).find((item) => item.id === savedDesignSystem.id);
+      const state = await approvalUiState();
+      return !state.designSystemEditorOpen && system?.version === 2
+        && state.designSystemDetailVersion === "Your system · v2" ? system : false;
+    }, "the second immutable design-system version to save");
+    assert.equal(savedDesignSystemV2.name, "Tribe Acceptance System v2");
+    const pinnedVersionOne = await readApprovalUiProject();
+    assert.equal(pinnedVersionOne.designSystem.version, 1,
+      "saving a new library version must not mutate the project's pinned snapshot");
+    assert.equal(pinnedVersionOne.designSystem.name, "Tribe Acceptance System");
+    await call("approval-ui-action", { operation: "apply-design-system" });
+    const appliedVersionTwo = await waitFor(async () => {
+      const project = await readApprovalUiProject();
+      return project?.designSystem?.id === savedDesignSystem.id
+        && project.designSystem.version === 2 ? project.designSystem : false;
+    }, "design-system version two to apply to the selected project");
+    assert.equal(appliedVersionTwo.name, "Tribe Acceptance System v2");
+    assert.equal((await approvalUiState()).designSystemAppliedLabel,
+      "Currently using Tribe Acceptance System v2 · v2");
+    console.log("Packaged Design systems acceptance saved two immutable user versions, verified the project stayed pinned to version one, then applied version two.");
+
+    const exportedDesignSystem = await call("approval-ui-action", { operation: "export-design-system" });
+    assert.equal(exportedDesignSystem.exportedFile?.filename, "tribe-acceptance-system-v2.json");
+    const exportedSnapshot = JSON.parse(exportedDesignSystem.exportedFile.content);
+    assert.deepEqual(exportedSnapshot, savedDesignSystemV2,
+      "the downloaded JSON must preserve the selected immutable version snapshot");
+    console.log("Packaged Design systems acceptance downloaded the selected version as portable JSON and verified its filename and contents.");
+
+    await call("approval-ui-action", {
+      operation: "import-design-system",
+      data: exportedDesignSystem.exportedFile.content,
+    });
+    const importedDesignSystem = await waitFor(async () => {
+      const system = (await readSavedDesignSystems()).find((item) =>
+        item.name === "Tribe Acceptance System v2" && item.id !== savedDesignSystem.id,
+      );
+      const state = await approvalUiState();
+      return system && state.designSystemDetailName === "Tribe Acceptance System v2"
+        && state.designSystemDetailVersion === "Your system · v1" ? system : false;
+    }, "the exported design-system snapshot to import as a fresh user-owned system");
+    assert.equal(importedDesignSystem.version, 1);
+    assert.equal(importedDesignSystem.source, "user");
+    assert.deepEqual(importedDesignSystem.tokens, savedDesignSystemV2.tokens);
+    const projectAfterImport = await readApprovalUiProject();
+    assert.equal(projectAfterImport.designSystem.id, savedDesignSystem.id,
+      "importing a library copy must not change the project's applied system");
+    assert.equal(projectAfterImport.designSystem.version, 2);
+    console.log("Packaged Design systems acceptance re-imported the downloaded snapshot as a fresh version-one system without changing the project's applied copy.");
+
+    await call("approval-ui-action", { operation: "open-scheduled-tasks" });
+    await waitFor(async () => (await approvalUiState()).scheduleViewVisible,
+      "Scheduled tasks to reopen for event delivery acceptance");
+    await call("approval-ui-action", { operation: "open-new-schedule" });
+    await waitFor(async () => (await approvalUiState()).scheduleDialogOpen,
+      "the new schedule editor to open for live delivery acceptance");
+    await call("approval-ui-action", { operation: "open-cadence-selector" });
+    await waitFor(async () => (await approvalUiState()).scheduleOptionLabels.length === 8,
+      "the cadence options to appear for live delivery acceptance");
+    await call("approval-ui-action", { operation: "choose-event-cadence" });
+    await waitFor(async () => (await approvalUiState()).scheduleCadenceValue === "When an event occurs",
+      "the schedule cadence to switch to an event trigger");
+    await call("approval-ui-action", { operation: "fill-event-schedule" });
+    await call("approval-ui-action", { operation: "open-source-chat-selector" });
+    await waitFor(async () => (await approvalUiState()).scheduleOptionLabels.length > 0,
+      "the source chat choices to load for live delivery acceptance");
+    await call("approval-ui-action", { operation: "choose-source-chat", mode: sourceChatChoice });
+    await waitFor(async () => (await approvalUiState()).scheduleCreateEnabled,
+      "the local event schedule to become valid");
+    await call("approval-ui-action", { operation: "create-event-schedule" });
+    await waitFor(async () => !(await approvalUiState()).scheduleDialogOpen,
+      "the live-delivery event schedule to save");
+    const deliverySchedule = await waitFor(async () => {
+      const schedules = await readProjectSchedules();
+      return schedules.find((schedule) => schedule.title === "Local event delivery acceptance" && schedule.status === "active") || false;
+    }, "the active local event schedule to persist");
+    assert.equal(deliverySchedule.trigger_event_type, "repo.test_run.completed");
+    const python = process.platform === "win32"
+      ? resolve(root, "runtime/.venv/Scripts/python.exe")
+      : resolve(root, "runtime/.venv/bin/python");
+    const eventSeed = [
+      "import os",
+      "from pathlib import Path",
+      "from tribe_runtime.store import MissionStore",
+      "store = MissionStore(Path(os.environ['TRIBE_DATA_DIR']) / 'tribe.sqlite3')",
+      `store.append('repo.test_run.completed', 'user', ${JSON.stringify(deliverySchedule.event_source_mission_id)}, {'testCount': 1, 'passed': 0, 'failed': 1})`,
+    ].join("\n");
+    await runProcess(python, ["-c", eventSeed], {
+      cwd: root,
+      env: { ...safeEnv, TRIBE_DATA_DIR: safeEnv.TRIBE_ELECTRON_DATA_DIR, PYTHONPATH: resolve(root, "runtime") },
+      timeoutMs: 30_000,
+    });
+    const runtimeBaseUrl = (await approvalUiState()).runtimeBaseUrl;
+    const scheduleRunsFor = async (scheduleId, baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/schedules/${scheduleId}/runs`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      const body = await response.json();
+      assert.equal(response.status, 200, `event schedule run read failed: ${body.error || response.status}`);
+      return body;
+    };
+    const deliveredRuns = await waitFor(async () => {
+      const result = await scheduleRunsFor(deliverySchedule.id, runtimeBaseUrl);
+      return result.total === 1 && result.runs[0]?.source_event_sequence ? result : false;
+    }, "the local test-failure event to create one durable schedule run", 15_000);
+    assert.equal(deliveredRuns.runs[0].status === "queued" || deliveredRuns.runs[0].status === "running"
+      || deliveredRuns.runs[0].status === "failed" || deliveredRuns.runs[0].status === "completed", true,
+    "the delivered run must retain a valid durable lifecycle state");
+    console.log("Packaged local-event acceptance appended a project test-failure event and observed one durable schedule run linked to its source event.");
+
+    await call("approval-ui-action", { operation: "open-new-schedule" });
+    await waitFor(async () => (await approvalUiState()).scheduleDialogOpen,
+      "the schedule editor to open for GitHub Actions delivery acceptance");
+    await call("approval-ui-action", { operation: "open-cadence-selector" });
+    await waitFor(async () => (await approvalUiState()).scheduleOptionLabels.length === 8,
+      "the cadence options to appear for GitHub Actions delivery acceptance");
+    await call("approval-ui-action", { operation: "choose-event-cadence" });
+    await waitFor(async () => (await approvalUiState()).scheduleCadenceValue === "When an event occurs",
+      "the schedule cadence to switch to an external event trigger");
+    await call("approval-ui-action", { operation: "open-trigger-selector" });
+    await waitFor(async () => (await approvalUiState()).triggerOptions.length === 5,
+      "the external event choices to open");
+    await call("approval-ui-action", { operation: "choose-event-trigger", mode: "A GitHub Actions run fails" });
+    await waitFor(async () => (await approvalUiState()).githubRepositoryFieldVisible,
+      "the GitHub repository field to appear for the external event");
+    await call("approval-ui-action", { operation: "fill-github-event-schedule" });
+    await call("approval-ui-action", { operation: "open-source-chat-selector" });
+    await waitFor(async () => (await approvalUiState()).scheduleOptionLabels.length > 0,
+      "the source chat choices to load for GitHub Actions delivery acceptance");
+    await call("approval-ui-action", { operation: "choose-source-chat", mode: sourceChatChoice });
+    await waitFor(async () => (await approvalUiState()).scheduleCreateEnabled,
+      "the external event schedule to become valid");
+    await call("approval-ui-action", { operation: "create-event-schedule" });
+    await waitFor(async () => !(await approvalUiState()).scheduleDialogOpen,
+      "the GitHub Actions trigger to save");
+    const githubSchedule = await waitFor(async () => {
+      const schedules = await readProjectSchedules();
+      return schedules.find((schedule) => schedule.title === "GitHub Actions delivery acceptance" && schedule.status === "active") || false;
+    }, "the GitHub Actions trigger to persist");
+    assert.equal(githubSchedule.trigger_event_type, "github.workflow_run.failed");
+    assert.equal(githubSchedule.event_external_repository, "tribe-fixtures/sample");
+    const pollDue = [
+      "import os",
+      "from datetime import UTC, datetime, timedelta",
+      "from pathlib import Path",
+      "import sqlite3",
+      `database = Path(os.environ['TRIBE_DATA_DIR']) / 'tribe.sqlite3'`,
+      `with sqlite3.connect(database) as db: db.execute('UPDATE schedules SET event_external_next_poll_at=? WHERE id=?', ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), ${JSON.stringify(githubSchedule.id)}))`,
+    ].join("\n");
+    await runProcess(python, ["-c", pollDue], {
+      cwd: root,
+      env: { ...safeEnv, TRIBE_DATA_DIR: safeEnv.TRIBE_ELECTRON_DATA_DIR, PYTHONPATH: resolve(root, "runtime") },
+      timeoutMs: 30_000,
+    });
+    const githubRuns = await waitFor(async () => {
+      const result = await scheduleRunsFor(githubSchedule.id, runtimeBaseUrl);
+      return result.total === 1 && result.runs[0]?.source_event_sequence ? result : false;
+    }, "the GitHub Actions fixture poll to create one durable, linked schedule run", 20_000);
+    assert.equal(githubRuns.runs[0].status, "queued",
+      "the isolated external trigger must stay queued without invoking a model");
+    const persistedGithubSchedule = (await readProjectSchedules()).find((schedule) => schedule.id === githubSchedule.id);
+    assert.equal(persistedGithubSchedule.event_external_cursor, 84_501,
+      "the GitHub poll cursor must persist the observed workflow run ID");
+    assert.equal(persistedGithubSchedule.event_external_error, "",
+      "a successful external poll must clear provider errors");
+    console.log("Packaged GitHub Actions acceptance used a bounded fixture response, persisted its run-ID cursor, recorded a failure event and queued one durable investigation run without network or model calls.");
+  }
   const interactiveCoverage = safeEnv.TRIBE_BROWSER_E2E_INTERACTIVE === "1"
     ? ", live native approval/cancellation and confirmed local upload"
     : "";

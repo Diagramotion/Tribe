@@ -8,6 +8,7 @@ import { TabularArtifactPreview } from "../components/TabularArtifactPreview.jsx
 import { XlsxArtifactPreview } from "../components/XlsxArtifactPreview.jsx";
 import { PdfArtifactPreview } from "../components/PdfArtifactPreview.jsx";
 import { MediaArtifactPreview } from "../components/MediaArtifactPreview.jsx";
+import { NotebookPreview } from "../components/NotebookPreview.jsx";
 import { playableMediaKind } from "../domain/artifact-preview.js";
 
 function RepositoryTree({ entries, expandedPaths, directories, activePath, depth = 0, onToggle, onOpenFile }) {
@@ -63,6 +64,7 @@ export function RepositoryView({ artifact, project, missionId, agents = [], onBr
   const [fileTabs, setFileTabs] = useState([]);
   const [activeFilePath, setActiveFilePath] = useState("");
   const [markdownPreviewPaths, setMarkdownPreviewPaths] = useState(new Set());
+  const [tableSourcePaths, setTableSourcePaths] = useState(new Set());
   const repositoryImageCache = useRef(new Map());
   const resolveRepositoryImage = useCallback((path) => {
     if (!project.id) return Promise.resolve(null);
@@ -78,6 +80,7 @@ export function RepositoryView({ artifact, project, missionId, agents = [], onBr
   const [loadingDirectories, setLoadingDirectories] = useState(new Set());
   const [loadingFiles, setLoadingFiles] = useState(new Set());
   const activeExtension = activeFilePath.split(".").at(-1)?.toLowerCase();
+  const isNotebookFile = activeExtension === "ipynb";
   const defaultWordWrap = ["md", "mdx", "markdown", "rst", "txt"].includes(activeExtension);
   const wordWrap = Object.hasOwn(wordWrapByPath, activeFilePath) ? wordWrapByPath[activeFilePath] : defaultWordWrap;
   const [error, setError] = useState("");
@@ -313,6 +316,7 @@ export function RepositoryView({ artifact, project, missionId, agents = [], onBr
     setFileTabs([]);
     setActiveFilePath("");
     setMarkdownPreviewPaths(new Set());
+    setTableSourcePaths(new Set());
     setWordWrapByPath({});
     setError("");
     setLoadingRoot(Boolean(project.id));
@@ -334,6 +338,7 @@ export function RepositoryView({ artifact, project, missionId, agents = [], onBr
   if (artifact) {
     const extension = artifact.name.split(".").at(-1)?.toLowerCase();
     const markdownArtifact = ["md", "mdx", "markdown"].includes(extension) || artifact.type?.includes("markdown");
+    const notebookArtifact = extension === "ipynb" || artifact.type?.split(";", 1)[0]?.trim().toLowerCase() === "application/x-ipynb+json";
     const textArtifact = artifact.preview !== undefined && !artifact.previewDataUrl;
     const xlsxArtifact = extension === "xlsx" || artifact.type?.split(";", 1)[0]?.trim().toLowerCase() === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
     const pdfArtifact = extension === "pdf" || artifact.type?.split(";", 1)[0]?.trim().toLowerCase() === "application/pdf";
@@ -377,6 +382,8 @@ export function RepositoryView({ artifact, project, missionId, agents = [], onBr
           </figure>
           : artifact.tableText !== undefined && !tableSourceOpen
           ? <TabularArtifactPreview delimiter={artifact.tableDelimiter ?? ","} fileName={artifact.name} onViewSource={() => setTableSourceOpen(true)} text={artifact.tableText} />
+          : notebookArtifact && artifact.preview !== undefined && !artifact.previewTruncated
+          ? <NotebookPreview content={artifact.preview} missionId={missionId} onSaveNotebook={missionId ? saveNotebookCopy : undefined} path={artifact.name} projectId={project.id} />
           : artifact.preview !== undefined
           ? <section className="artifact-document">
             <div className="artifact-document-toolbar">
@@ -443,8 +450,15 @@ export function RepositoryView({ artifact, project, missionId, agents = [], onBr
   }
   const root = directories[""];
   const activeFile = fileTabs.find((item) => item.path === activeFilePath);
+  const refreshNotebook = useCallback(async () => {
+    if (!project.id || !activeFilePath) return;
+    const { entry: file } = await runtime.browseProject(project.id, activeFilePath);
+    setFileTabs((current) => current.map((item) => item.path === activeFilePath ? file : item));
+  }, [activeFilePath, project.id]);
   const isMarkdownFile = /\.(md|mdx|markdown)$/i.test(activeFilePath);
   const showMarkdownPreview = isMarkdownFile && markdownPreviewPaths.has(activeFilePath);
+  const isDelimitedFile = /\.(csv|tsv)$/i.test(activeFilePath);
+  const showTablePreview = isDelimitedFile && !tableSourcePaths.has(activeFilePath);
   async function toggleDirectory(path) {
     if (expandedPaths.has(path)) {
       setExpandedPaths((current) => { const next = new Set(current); next.delete(path); return next; });
@@ -477,6 +491,18 @@ export function RepositoryView({ artifact, project, missionId, agents = [], onBr
       setLoadingFiles((current) => { const next = new Set(current); next.delete(path); return next; });
     }
   }
+  async function saveNotebookCopy(name, content) {
+    if (!missionId) throw new Error("Open a chat before saving a shared notebook copy.");
+    const bytes = new TextEncoder().encode(content);
+    let binary = "";
+    for (let start = 0; start < bytes.length; start += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(start, start + 0x8000));
+    }
+    const result = await runtime.uploadArtifact(
+      missionId, name, "application/x-ipynb+json", btoa(binary),
+    );
+    await onArtifactSaved?.(result);
+  }
   function closeFile(path) {
     const tabIndex = fileTabs.findIndex((item) => item.path === path);
     const nextTabs = fileTabs.filter((item) => item.path !== path);
@@ -503,23 +529,36 @@ export function RepositoryView({ artifact, project, missionId, agents = [], onBr
                   <button aria-label={`Close ${fileName(file)}`} className="repository-file-tab-close" onClick={() => closeFile(file.path)} title={`Close ${fileName(file)}`} type="button"><X size={13} /></button>
                 </div>)}
               </div>
-              {isMarkdownFile && <button
-                aria-label={showMarkdownPreview ? "Show Markdown source" : "Show Markdown preview"}
-                aria-pressed={showMarkdownPreview}
+              {(isMarkdownFile || isDelimitedFile) && <button
+                aria-label={isDelimitedFile
+                  ? showTablePreview ? "Show table source" : "Show table preview"
+                  : showMarkdownPreview ? "Show Markdown source" : "Show Markdown preview"}
+                aria-pressed={isDelimitedFile ? showTablePreview : showMarkdownPreview}
                 className="repository-preview-toggle"
-                onClick={() => setMarkdownPreviewPaths((current) => {
-                  const next = new Set(current);
-                  if (next.has(activeFilePath)) next.delete(activeFilePath);
-                  else next.add(activeFilePath);
-                  return next;
-                })}
-                title={showMarkdownPreview ? "Show source" : "Show rendered Markdown"}
+                onClick={() => isDelimitedFile
+                  ? setTableSourcePaths((current) => {
+                    const next = new Set(current);
+                    if (next.has(activeFilePath)) next.delete(activeFilePath);
+                    else next.add(activeFilePath);
+                    return next;
+                  })
+                  : setMarkdownPreviewPaths((current) => {
+                    const next = new Set(current);
+                    if (next.has(activeFilePath)) next.delete(activeFilePath);
+                    else next.add(activeFilePath);
+                    return next;
+                  })}
+                title={isDelimitedFile
+                  ? showTablePreview ? "Show source" : "Show table preview"
+                  : showMarkdownPreview ? "Show source" : "Show rendered Markdown"}
                 type="button"
-              >{showMarkdownPreview ? <Code size={16} /> : <Eye size={16} />}</button>}
+              >{(isDelimitedFile ? showTablePreview : showMarkdownPreview) ? <Code size={16} /> : <Eye size={16} />}</button>}
             </div>
             <div className="repository-editor-content">
               {activeFile?.tooLarge ? <div className="repository-empty-editor">This file is larger than the 1 MB preview limit.</div>
                 : activeFile?.binary ? <div className="repository-empty-editor">Binary files can’t be previewed here.</div>
+                  : activeFile && isNotebookFile ? <NotebookPreview content={activeFile.content ?? ""} missionId={missionId} onRefreshNotebook={refreshNotebook} onSaveNotebook={missionId ? saveNotebookCopy : undefined} path={activeFile.path} projectId={project.id} />
+                  : activeFile && showTablePreview ? <TabularArtifactPreview delimiter={activeExtension === "tsv" ? "\t" : ","} fileName={fileName(activeFile)} onViewSource={() => setTableSourcePaths((current) => new Set(current).add(activeFilePath))} text={activeFile.content ?? ""} />
                   : activeFile && showMarkdownPreview ? <div className="repository-markdown-preview"><div className="message-markdown"><MarkdownContent onOpenRepositoryFile={(path) => void openFile(path)} onResolveRepositoryImage={resolveRepositoryImage} repositoryBasePath={activeFile.path}>{activeFile.content ?? ""}</MarkdownContent></div></div>
                     : activeFile ? <ReadOnlyCodeEditor content={activeFile.content ?? ""} path={activeFile.path} wrapLines={wordWrap} />
                     : <div className="repository-empty-editor"><FolderOpen size={26} /><span>{loadingFiles.size ? "Opening file…" : "Select a file to preview"}</span><small>Choose a file from the explorer to open it in a tab.</small></div>}

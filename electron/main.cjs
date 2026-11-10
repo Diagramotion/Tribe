@@ -32,6 +32,7 @@ const { normaliseBrowserSessionRecord, normaliseBrowserSessionStore, safeSession
 const { normaliseFileSelection, validateUploadTarget } = require("./browser-upload.cjs");
 const { authorizeBrowserAction, browserActionRequiresHandoff, classifyBrowserAction } = require("./browser-approvals.cjs");
 const { browserShortcutForInput } = require("./browser-shortcuts.cjs");
+const { readDesignReference } = require("./browser-design-reference.cjs");
 app.setName(process.env.TRIBE_BROWSER_E2E === "1" ? "Tribe Browser E2E" : "Tribe");
 if (process.env.TRIBE_ELECTRON_DATA_DIR) {
   const electronDataDirectory = path.resolve(process.env.TRIBE_ELECTRON_DATA_DIR);
@@ -327,6 +328,20 @@ function activeTabId(scope) { return activeBrowserTabs.get(scope) || ""; }
 
 function viewFor(scope, tabId = activeTabId(scope)) {
   return tabId ? browserViews.get(viewKey(scope, tabId)) : undefined;
+}
+
+async function extractActiveBrowserDesignReference(scope) {
+  if (typeof scope !== "string" || scope.length < 1 || scope.length > 256) {
+    throw new Error("A browser workspace scope is required.");
+  }
+  const tabId = activeTabId(scope);
+  const view = viewFor(scope, tabId);
+  if (!view || view.webContents.isDestroyed()) {
+    throw new Error("Open a page in Tribe Browser before capturing its styles.");
+  }
+  return readDesignReference(view.webContents, () =>
+    activeTabId(scope) === tabId && viewFor(scope, tabId) === view,
+  );
 }
 
 function browserHostIsVisible(host) {
@@ -1563,7 +1578,7 @@ function browserAutomationRequest(request, response) {
     response.end(JSON.stringify({ error: "method_not_allowed" }));
     return;
   }
-      const browserActions = `state|navigate|snapshot|screenshot|diagnostics|storage${e2e ? "|site-inventory|clear-site-data|new-tab|select-tab|close-tab|crash|agent-control|hold|shortcut|menu-state|menu-command|layout-state" : ""}|click|click-at|fill|upload|press|type|scroll|viewport|reload|back|forward`;
+      const browserActions = `state|navigate|snapshot|screenshot|diagnostics|storage${e2e ? "|site-inventory|clear-site-data|new-tab|select-tab|close-tab|crash|agent-control|hold|shortcut|menu-state|menu-command|layout-state|extract-design-reference|approval-ui-state|approval-ui-action" : ""}|click|click-at|fill|upload|press|type|scroll|viewport|reload|back|forward`;
   const match = new RegExp(`^/v1/browser/([a-zA-Z0-9-]{1,80})/(${browserActions})$`)
     .exec(new URL(request.url, "http://127.0.0.1").pathname);
   if (!match) {
@@ -1606,6 +1621,242 @@ function browserAutomationRequest(request, response) {
     try {
       if (!(e2e && action === "agent-control")) assertAgentControl();
       const payload = bytes ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
+      if (e2e && action === "extract-design-reference") {
+        const result = await mainWindow.webContents.executeJavaScript(
+          `(async () => window.tribeDesktopBrowser.extractDesignReference(${JSON.stringify(scope)}))()`,
+          true,
+        );
+        response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        response.end(JSON.stringify({ result }));
+        return;
+      }
+      if (e2e && action === "approval-ui-state") {
+        const result = await mainWindow.webContents.executeJavaScript(`(() => {
+          const dialog = document.querySelector(".project-settings-dialog");
+          const projectButtons = [...document.querySelectorAll(".explorer-project-button")];
+          const testScheduleRow = [...document.querySelectorAll(".command-run")]
+            .find((item) => item.querySelector(".command-run-meta strong")?.textContent.trim() === "Investigate failing tests");
+          return {
+            runtimeBaseUrl: window.tribeDesktop?.runtimeBaseUrl || "",
+            projectNames: projectButtons.map((button) => button.textContent.trim()),
+            sidebarCollapsed: document.querySelector(".app-shell")?.classList.contains("app-shell--sidebar-collapsed") ?? null,
+            projectVisible: projectButtons
+              .some((button) => button.querySelector("span")?.textContent.trim() === "Approval UI Acceptance"),
+            settingsOpen: Boolean(dialog),
+            activeSection: dialog?.querySelector('[role="tab"][aria-selected="true"]')?.id || "",
+            selectedMode: dialog?.querySelector('input[name="approval-mode"]:checked')?.value || "",
+            availableModes: [...(dialog?.querySelectorAll('input[name="approval-mode"]') || [])].map((input) => input.value),
+            modesEnabled: [...(dialog?.querySelectorAll('input[name="approval-mode"]') || [])].length === 3
+              && [...dialog.querySelectorAll('input[name="approval-mode"]')].every((input) => !input.disabled),
+            modeTitles: [...(dialog?.querySelectorAll(".approval-mode-copy strong") || [])].map((item) => item.textContent.trim()),
+            grantBoundaryVisible: Boolean(dialog && [...dialog.querySelectorAll("p")].some((item) => item.textContent.includes("cannot grant tools or access"))),
+            exactApprovalVisible: Boolean(dialog && [...dialog.querySelectorAll("p")].some((item) => item.textContent.includes("Exact approvals for destructive changes and external actions remain in place"))),
+            savedNotice: dialog?.querySelector('[role="status"]')?.textContent.trim() || "",
+            scheduleViewVisible: Boolean(document.querySelector(".schedule-view")),
+            scheduleDialogOpen: Boolean(document.querySelector(".schedule-dialog")),
+            scheduleCadenceValue: document.querySelector('.schedule-dialog button[aria-label="Repeat"]')?.textContent.trim() || "",
+            triggerValue: document.querySelector('.schedule-dialog button[aria-label="Trigger"]')?.textContent.trim() || "",
+            triggerOptions: [...document.querySelectorAll('.schedule-dialog [role="option"]')].map((item) => item.textContent.trim()),
+            scheduleOptionLabels: [...document.querySelectorAll('.schedule-dialog [role="option"]')].map((item) => item.textContent.trim()),
+            pathFilterVisible: Boolean(document.querySelector("#schedule-event-path-pattern")),
+            githubRepositoryFieldVisible: Boolean(document.querySelector("#schedule-event-github-repository")),
+            scheduleCreateEnabled: Boolean(document.querySelector(".schedule-dialog button[type=submit]:not(:disabled)")),
+            testScheduleButtons: [...(testScheduleRow?.querySelectorAll("button[aria-label]") || [])]
+              .map((button) => button.getAttribute("aria-label")),
+            designSystemsViewVisible: Boolean(document.querySelector(".design-systems-view")),
+            designSystemEditorOpen: Boolean(document.querySelector(".design-system-editor")),
+            designSystemDraftName: document.querySelector(".design-system-editor input")?.value || "",
+            designSystemDetailName: document.querySelector(".design-system-detail-heading h3")?.textContent.trim() || "",
+            designSystemDetailVersion: document.querySelector(".design-system-detail-heading .eyebrow")?.textContent.trim() || "",
+            designSystemSavedNames: [...document.querySelectorAll(".design-system-library .design-system-option strong")]
+              .map((item) => item.textContent.trim()),
+            designSystemAppliedLabel: document.querySelector(".design-system-apply > div:first-child span")?.textContent.trim() || "",
+          };
+        })()`);
+        response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        response.end(JSON.stringify({ result }));
+        return;
+      }
+      if (e2e && action === "approval-ui-action") {
+        const operation = String(payload.operation || "");
+        const mode = String(payload.mode || "");
+        const data = String(payload.data || "");
+        let exportedFile = null;
+        let exportDownload = null;
+        if (operation === "export-design-system") {
+          exportDownload = new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error("Design-system export did not download.")), 10_000);
+            mainWindow.webContents.session.once("will-download", (_event, item, contents) => {
+              if (contents !== mainWindow.webContents) {
+                clearTimeout(timer);
+                item.cancel();
+                reject(new Error("Unexpected download while verifying design-system export."));
+                return;
+              }
+              const filename = item.getFilename();
+              const filepath = path.join(app.getPath("temp"), `tribe-design-system-export-${crypto.randomUUID()}.json`);
+              item.setSavePath(filepath);
+              item.once("done", async (_doneEvent, state) => {
+                clearTimeout(timer);
+                if (state !== "completed") {
+                  reject(new Error(`Design-system export download ended with ${state}.`));
+                  return;
+                }
+                try {
+                  exportedFile = { filename, content: await fs.promises.readFile(filepath, "utf8") };
+                  await fs.promises.unlink(filepath);
+                  resolve(exportedFile);
+                } catch (error) {
+                  reject(error);
+                }
+              });
+            });
+          });
+        }
+        const dispatched = await mainWindow.webContents.executeJavaScript(`(() => {
+          const operation = ${JSON.stringify(operation)};
+          const mode = ${JSON.stringify(mode)};
+          const data = ${JSON.stringify(data)};
+          const projectMenu = [...document.querySelectorAll("button[aria-label]")]
+            .find((button) => button.getAttribute("aria-label") === "More actions for Approval UI Acceptance");
+          const projectSettings = [...document.querySelectorAll('button[role="menuitem"]')]
+            .find((button) => button.textContent.trim() === "Project settings");
+          const targets = {
+            "open-project-menu": projectMenu,
+            "open-project-settings": projectSettings,
+            "open-approvals-section": document.getElementById("project-settings-tab-approvals"),
+            "close-project-settings": document.querySelector('.project-settings-dialog button[aria-label="Close project settings"]'),
+            "save-approval-mode": document.querySelector(".approval-settings-form button[type=submit]"),
+            "open-scheduled-tasks": [...document.querySelectorAll(".sidebar-nav-group--workspace .nav-item")]
+              .find((button) => button.textContent.trim() === "Scheduled tasks" || button.title === "Scheduled tasks"),
+            "open-event-template": [...document.querySelectorAll(".schedule-template")]
+              .find((button) => button.querySelector("strong")?.textContent.trim() === "Investigate failing tests"),
+            "open-new-schedule": [...document.querySelectorAll(".schedule-heading-actions button")]
+              .find((button) => button.textContent.trim().includes("New scheduled task")),
+            "open-cadence-selector": document.querySelector('.schedule-dialog button[aria-label="Repeat"]'),
+            "choose-event-cadence": [...document.querySelectorAll('.schedule-dialog [role="option"]')]
+              .find((option) => option.textContent.trim() === "When an event occurs"),
+            "fill-event-schedule": document.querySelector(".schedule-dialog #schedule-title"),
+            "fill-github-event-schedule": document.querySelector(".schedule-dialog #schedule-title"),
+            "open-trigger-selector": document.querySelector('.schedule-dialog button[aria-label="Trigger"]'),
+            "open-source-chat-selector": document.querySelector('.schedule-dialog button[aria-label="Watch chat"], .schedule-dialog button[aria-label="Record events in chat"]'),
+            "cancel-schedule": [...(document.querySelector(".schedule-dialog")?.querySelectorAll("button") || [])]
+              .find((button) => button.textContent.trim() === "Cancel"),
+            "choose-source-chat": [...document.querySelectorAll('.schedule-dialog [role="option"]')]
+              .find((option) => option.textContent.trim() === mode && option.getAttribute("aria-disabled") !== "true"),
+            "create-event-schedule": document.querySelector(".schedule-dialog button[type=submit]"),
+            "pause-test-schedule": [...document.querySelectorAll(".command-run")]
+              .find((item) => item.querySelector(".command-run-meta strong")?.textContent.trim() === "Investigate failing tests")
+              ?.querySelector('button[aria-label="Pause schedule"]'),
+            "resume-test-schedule": [...document.querySelectorAll(".command-run")]
+              .find((item) => item.querySelector(".command-run-meta strong")?.textContent.trim() === "Investigate failing tests")
+              ?.querySelector('button[aria-label="Resume schedule"]'),
+            "cancel-test-schedule": [...document.querySelectorAll(".command-run")]
+              .find((item) => item.querySelector(".command-run-meta strong")?.textContent.trim() === "Investigate failing tests")
+              ?.querySelector('button[aria-label="Cancel schedule"]'),
+            "open-design-systems": [...document.querySelectorAll(".nav-item")]
+              .find((button) => button.textContent.trim() === "Design systems" || button.title === "Design systems"),
+            "open-design-system-editor": [...document.querySelectorAll(".design-systems-heading-actions button")]
+              .find((button) => button.textContent.trim() === "Create system"),
+            "open-edit-design-system": [...(document.querySelector(".design-system-detail-heading")?.querySelectorAll("button") || [])]
+              .find((button) => button.textContent.trim() === "Edit"),
+            "export-design-system": [...(document.querySelector(".design-system-detail-heading")?.querySelectorAll("button") || [])]
+              .find((button) => button.textContent.trim() === "Export"),
+            "save-design-system": document.querySelector(".design-system-editor button[type=submit]"),
+            "apply-design-system": document.querySelector(".design-system-apply button.button--primary"),
+            "import-design-system": document.querySelector('.design-systems-heading input[type="file"]'),
+            "cancel-design-system-editor": [...(document.querySelector(".design-system-editor")?.querySelectorAll("button") || [])]
+              .find((button) => button.textContent.trim() === "Cancel"),
+            "close-design-system-editor": document.querySelector('.design-system-editor button[aria-label="Close"]'),
+            "edit-design-system-name": document.querySelector(".design-system-editor input"),
+            "name-design-system-for-save": document.querySelector(".design-system-editor input"),
+            "name-design-system-v2": document.querySelector(".design-system-editor input"),
+            "choose-approval-mode": ["standard", "review_changes", "confirm_every_call"].includes(mode)
+              ? document.querySelector('input[name="approval-mode"][value="' + mode + '"]') : null,
+            "choose-event-trigger": ["A test run fails", "A repository file changes", "A chat completes", "An artifact is created", "A GitHub Actions run fails"].includes(mode)
+              ? [...document.querySelectorAll('.schedule-dialog [role="option"]')]
+                .find((option) => option.textContent.trim() === mode) : null,
+          };
+          const target = targets[operation];
+          if (!target || target.disabled) return false;
+          if (operation === "save-approval-mode") target.form?.requestSubmit();
+          else if (operation === "edit-design-system-name") {
+            const input = document.querySelector(".design-system-editor input");
+            if (!input) return false;
+            const previous = input.value;
+            input.value = "Discarded draft";
+            input._valueTracker?.setValue(previous);
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+          else if (operation === "name-design-system-for-save" || operation === "name-design-system-v2") {
+            const input = document.querySelector(".design-system-editor input");
+            if (!input) return false;
+            const previous = input.value;
+            input.value = operation === "name-design-system-v2" ? "Tribe Acceptance System v2" : "Tribe Acceptance System";
+            input._valueTracker?.setValue(previous);
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+          else if (operation === "import-design-system") {
+            const input = document.querySelector('.design-systems-heading input[type="file"]');
+            if (!input || !data) return false;
+            const file = new File([data], "tribe-acceptance-system.json", { type: "application/json" });
+            Object.defineProperty(input, "files", { configurable: true, value: [file] });
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+          else if (operation === "fill-event-schedule") {
+            const title = document.querySelector(".schedule-dialog #schedule-title");
+            const prompt = document.querySelector(".schedule-dialog textarea");
+            if (!title || !prompt) return false;
+            const update = (input, value) => {
+              const previous = input.value;
+              input.value = value;
+              input._valueTracker?.setValue(previous);
+              input.dispatchEvent(new Event("input", { bubbles: true }));
+              input.dispatchEvent(new Event("change", { bubbles: true }));
+            };
+            update(title, "Local event delivery acceptance");
+            update(prompt, "Investigate this synthetic failing test run.");
+          }
+          else if (operation === "fill-github-event-schedule") {
+            const title = document.querySelector(".schedule-dialog #schedule-title");
+            const prompt = document.querySelector(".schedule-dialog textarea");
+            const repository = document.querySelector(".schedule-dialog #schedule-event-github-repository");
+            if (!title || !prompt || !repository) return false;
+            const update = (input, value) => {
+              const previous = input.value;
+              input.value = value;
+              input._valueTracker?.setValue(previous);
+              input.dispatchEvent(new Event("input", { bubbles: true }));
+              input.dispatchEvent(new Event("change", { bubbles: true }));
+            };
+            update(title, "GitHub Actions delivery acceptance");
+            update(prompt, "Review the failing public workflow run.");
+            update(repository, "tribe-fixtures/sample");
+          }
+          else target.click();
+          return true;
+        })()`);
+        if (!dispatched) {
+          if (operation === "export-design-system") void exportDownload.catch(() => {});
+          response.writeHead(409, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          response.end(JSON.stringify({ error: "approval_ui_action_unavailable" }));
+          return;
+        }
+        if (operation === "export-design-system") {
+          try {
+            exportedFile = await exportDownload;
+          } catch (error) {
+            response.writeHead(500, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            response.end(JSON.stringify({ error: error.message || "design_system_export_failed" }));
+            return;
+          }
+        }
+        response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        response.end(JSON.stringify({ result: { dispatched: operation, exportedFile } }));
+        return;
+      }
       if (e2e && action === "agent-control") {
         const result = setBrowserAgentControlPaused(scope, payload.paused === true);
         response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
@@ -2327,6 +2578,9 @@ function registerIpc() {
     return publicBrowserState(scope);
   });
   ipcMain.handle("tribe:browser-state", (_event, { scope } = {}) => publish(scope));
+  ipcMain.handle("tribe:browser-extract-design-reference", (_event, { scope } = {}) =>
+    extractActiveBrowserDesignReference(scope),
+  );
   ipcMain.handle("tribe:browser-agent-control", (_event, { scope, paused } = {}) => {
     if (typeof scope !== "string" || scope.length < 1 || scope.length > 256) throw new Error("A browser workspace scope is required.");
     return setBrowserAgentControlPaused(scope, paused === true);

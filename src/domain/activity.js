@@ -35,9 +35,10 @@ function userFacingAgentText(value) {
 }
 
 export function timelineMessage(event, agentDefinitions = initialAgents) {
-  const isScheduled = event.type === "message.created" && event.payload.source === "schedule";
+  const isScheduled = event.type === "message.created"
+    && ["schedule", "event_trigger"].includes(event.payload.source);
   const actorType = event.actorId === "user" || isScheduled ? "human" : "agent";
-  const actor = isScheduled ? "Scheduled task" : actorType === "human"
+  const actor = isScheduled ? (event.payload.source === "event_trigger" ? "Event trigger" : "Scheduled task") : actorType === "human"
     ? "You"
     : agentDefinitions.find((agent) => agent.id === event.actorId)?.name ?? event.actorId;
   if (event.type === "message.created" || event.type === "agent.message.created") {
@@ -267,6 +268,12 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
   if (event.type === "artifact.created") {
     return { id: event.id, kind: "change", actor, time: formatTime(event.createdAt), text: `Shared artifact · ${event.payload.artifact.name}` };
   }
+  if (event.type === "experiment.run.recorded") {
+    const metricCount = event.payload.metricNames?.length ?? 0;
+    return { id: event.id, kind: "change", actor, actorId: event.actorId,
+      time: formatTime(event.createdAt),
+      text: `Recorded experiment run · ${event.payload.experimentName} · ${metricCount} metric${metricCount === 1 ? "" : "s"}` };
+  }
   if (event.type === "canvas.document.linked") {
     return { id: event.id, kind: "change", actor, time: formatTime(event.createdAt),
       text: `Linked a shared document · ${event.payload.title}`,
@@ -392,6 +399,14 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
   if (event.type === "project.usage_budget.updated") {
     const limit = event.payload.monthlyTokensLimit;
     return { id: event.id, kind: "change", actor: "You", time: formatTime(event.createdAt), text: limit == null ? "You removed the monthly model budget" : `You set the monthly model budget to ${Number(limit).toLocaleString()} tokens` };
+  }
+  if (event.type === "project.approval_policy.updated") {
+    const label = {
+      standard: "Standard",
+      review_changes: "Confirm changes",
+      confirm_every_call: "Confirm every tool call",
+    }[event.payload.mode] ?? "updated";
+    return { id: event.id, kind: "change", actor: "You", time: formatTime(event.createdAt), text: `You changed the project approval mode to ${label}` };
   }
   return null;
 }

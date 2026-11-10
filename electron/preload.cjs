@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld("tribeDesktopBrowser", {
   setBounds: (scope, bounds, visible) => ipcRenderer.invoke("tribe:browser-bounds", { scope, bounds, visible }),
   action: (scope, action) => ipcRenderer.invoke("tribe:browser-action", { scope, action }),
   state: (scope) => ipcRenderer.invoke("tribe:browser-state", { scope }),
+  extractDesignReference: (scope) => ipcRenderer.invoke("tribe:browser-extract-design-reference", { scope }),
   setAgentControlPaused: (scope, paused) => ipcRenderer.invoke("tribe:browser-agent-control", { scope, paused }),
   diagnostics: (scope, limit = 50) => ipcRenderer.invoke("tribe:browser-diagnostics", { scope, limit }),
   resolvePermission: (scope, id, decision) => ipcRenderer.invoke("tribe:browser-resolve-permission", { scope, id, decision }),

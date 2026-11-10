@@ -83,6 +83,97 @@ MAX_AUTOMATIC_PROVIDER_ATTEMPTS = 24
 MAX_INLINE_PROVIDER_RETRY_DELAY_SECONDS = 5
 
 
+def _design_system_context(system: Any) -> dict[str, Any] | None:
+    """Give agents bounded, selected-package guidance and representative examples."""
+    if not isinstance(system, dict):
+        return None
+    package_files = system.get("packageFiles") or []
+    package_by_path = {
+        item.get("path"): item.get("content")
+        for item in package_files
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+        and isinstance(item.get("content"), str) and not item["content"].startswith("data:")
+    }
+    manifest = system.get("manifest")
+    if not isinstance(manifest, dict):
+        try:
+            candidate = json.loads(package_by_path.get("manifest.json", ""))
+            manifest = candidate if isinstance(candidate, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            manifest = {}
+    preview_paths = []
+    preview = manifest.get("preview")
+    pages = preview.get("pages", []) if isinstance(preview, dict) else []
+    if isinstance(pages, list):
+        for page in pages:
+            path = page.get("path") if isinstance(page, dict) else None
+            if isinstance(path, str) and path.lower().endswith(".html") and path in package_by_path:
+                if path not in preview_paths:
+                    preview_paths.append(path)
+            if len(preview_paths) >= 2:
+                break
+
+    guidance_paths = []
+    manifest_files = manifest.get("files")
+    if isinstance(manifest_files, dict):
+        for field, paths in manifest_files.items():
+            if not re.search(r"pattern|guidance|guide|component", str(field), re.IGNORECASE):
+                continue
+            candidates = paths if isinstance(paths, list) else [paths]
+            for path in candidates:
+                if isinstance(path, str) and path in package_by_path and path not in guidance_paths:
+                    guidance_paths.append(path)
+    for path in package_by_path:
+        parts = path.lower().split("/")
+        suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        if len(parts) > 1 and any(part in {"pattern", "patterns", "guidance", "guide", "guides"} for part in parts[:-1]) \
+                and suffix in {"md", "html", "txt"} and path not in guidance_paths:
+            guidance_paths.append(path)
+        if len(guidance_paths) >= 3:
+            break
+    component_manifest_paths = []
+    declared_component_manifest = manifest.get("componentsManifest")
+    if isinstance(declared_component_manifest, str) and declared_component_manifest in package_by_path:
+        component_manifest_paths.append(declared_component_manifest)
+    if isinstance(manifest_files, dict):
+        for field, candidate in manifest_files.items():
+            if re.search(r"component.*manifest|manifest.*component|component.*index", str(field), re.IGNORECASE):
+                candidates = candidate if isinstance(candidate, list) else [candidate]
+                component_manifest_paths.extend(
+                    path for path in candidates
+                    if isinstance(path, str) and path in package_by_path and path not in component_manifest_paths
+                )
+    preferred = [
+        ("USAGE.md", 3_000), ("DESIGN.md", 7_000), ("tokens.css", 5_000),
+        ("manifest.json", 1_500), *((path, 3_000) for path in component_manifest_paths[:2]),
+        ("components.manifest.json", 3_000),
+        ("components.html", 3_000), ("source/evidence.md", 2_000),
+        *((path, 1_500) for path in guidance_paths[:3]),
+        *((path, 3_000) for path in preview_paths),
+    ]
+    files = []
+    budget = 36_000
+    seen = set()
+    for path, file_limit in preferred:
+        if path in seen:
+            continue
+        seen.add(path)
+        content = package_by_path.get(path)
+        if not isinstance(content, str) or budget <= 0:
+            continue
+        content = content[:min(file_limit, budget)]
+        budget -= len(content)
+        files.append({"path": path, "content": content})
+    return {
+        key: system.get(key)
+        for key in (
+            "id", "name", "description", "version", "tokens", "components",
+            "guidance", "references", "category", "tags", "license", "sourceUrl",
+        )
+        if key in system
+    } | ({"packageFiles": files} if files else {})
+
+
 def _provider_retry_delay(error: Exception, attempt: int) -> float | None:
     """Return a bounded delay only for provider failures safe to retry."""
     try:
@@ -1822,16 +1913,23 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
             return []
         return [{key: schedule[key] for key in (
             "id", "title", "prompt", "cadence", "cron_expression", "timezone", "delivery_time",
-            "target_mission_id", "target_mission_title", "next_run_at", "status",
+            "target_mission_id", "target_mission_title", "trigger_event_type",
+            "event_source_mission_id", "event_source_mission_title", "event_path_pattern",
+            "event_external_repository", "event_external_error",
+            "next_run_at", "status",
         )} for schedule in ctx.deps.store.schedules(project_id)]
 
     @agent.tool(sequential=True, defer_loading=True)
     def create_project_schedule(ctx: RunContext[AgentDependencies], title: str, prompt: str,
-                                cadence: Literal["once", "hourly", "daily", "weekdays", "weekly", "monthly", "cron"],
+                                cadence: Literal["once", "hourly", "daily", "weekdays", "weekly", "monthly", "cron", "event"],
                                 timezone: str | None = None, delivery_time: str = "09:00",
                                 run_at: str | None = None, cron_expression: str | None = None,
-                                target_mission_id: str | None = None) -> dict[str, Any]:
-        """Create a local schedule in this project, continuing this chat unless another project chat is selected."""
+                                target_mission_id: str | None = None,
+                                trigger_event_type: str | None = None,
+                                event_source_mission_id: str | None = None,
+                                event_path_pattern: str | None = None,
+                                event_external_repository: str | None = None) -> dict[str, Any]:
+        """Create a local project schedule, optionally filtered by a repository path pattern."""
         project_id = _schedule_project_id(ctx)
         if not project_id:
             return {"ok": False, "error": "project_schedule_requires_project_context"}
@@ -1840,12 +1938,19 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
             schedule = ctx.deps.store.create_schedule(
                 project_id, title, prompt, cadence, timezone, delivery_time, run_at, cron_expression or "",
                 target_mission_id if target_mission_id is not None else ctx.deps.mission_id,
+                trigger_event_type or "",
+                event_source_mission_id or "",
+                event_path_pattern or "",
+                0,
+                event_external_repository or "",
             )
         except ValueError as error:
             return {"ok": False, "error": str(error)}
         return {"ok": True, "schedule": {
             key: schedule[key] for key in (
                 "id", "title", "cadence", "cron_expression", "timezone", "target_mission_id",
+                "trigger_event_type", "event_source_mission_id", "event_path_pattern",
+                "event_external_repository",
                 "next_run_at", "status",
             )
         }}
@@ -1853,10 +1958,14 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
     @agent.tool(sequential=True, defer_loading=True)
     def edit_project_schedule(ctx: RunContext[AgentDependencies], schedule_id: str,
                                title: str, prompt: str,
-                               cadence: Literal["once", "hourly", "daily", "weekdays", "weekly", "monthly", "cron"],
+                               cadence: Literal["once", "hourly", "daily", "weekdays", "weekly", "monthly", "cron", "event"],
                                timezone: str | None = None, delivery_time: str = "09:00",
                                run_at: str | None = None, cron_expression: str | None = None,
-                               target_mission_id: str | None = None) -> dict[str, Any]:
+                               target_mission_id: str | None = None,
+                               trigger_event_type: str | None = None,
+                               event_source_mission_id: str | None = None,
+                               event_path_pattern: str | None = None,
+                               event_external_repository: str | None = None) -> dict[str, Any]:
         """Edit an idle schedule in this project; keep its timezone unless the user changes it."""
         project_id = _schedule_project_id(ctx)
         if not project_id:
@@ -1870,7 +1979,8 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
                 timezone = current["timezone"]
             schedule = ctx.deps.store.edit_schedule(
                 project_id, schedule_id, title, prompt, cadence, timezone, delivery_time, run_at,
-                cron_expression or "", target_mission_id,
+                cron_expression or "", target_mission_id, trigger_event_type, event_source_mission_id,
+                event_path_pattern, None, event_external_repository,
             )
         except ValueError as error:
             return {"ok": False, "error": str(error)}
@@ -1879,6 +1989,8 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
         return {"ok": True, "schedule": {
             key: schedule[key] for key in (
                 "id", "title", "cadence", "cron_expression", "timezone", "target_mission_id",
+                "trigger_event_type", "event_source_mission_id", "event_path_pattern",
+                "event_external_repository",
                 "next_run_at", "status",
             )
         }}
@@ -1965,6 +2077,78 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
         return profile_tabular_artifact(
             artifact["name"], artifact["media_type"], content, sheet_name, header_rows,
         )
+
+    @agent.tool(defer_loading=True)
+    def list_project_datasets(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
+        """List the local CSV and TSV files explicitly registered for analysis in this project."""
+        mission = ctx.deps.store.mission(ctx.deps.mission_id)
+        if not mission or not mission.get("project_id"):
+            raise ValueError("project_datasets_require_a_project_chat")
+        return {"datasets": ctx.deps.store.project_datasets(mission["project_id"])}
+
+    @agent.tool(defer_loading=True)
+    def profile_project_dataset(ctx: RunContext[AgentDependencies], relative_path: str) -> dict[str, Any]:
+        """Profile a registered project CSV or TSV; unregistered repository files are not accessible here."""
+        mission = ctx.deps.store.mission(ctx.deps.mission_id)
+        if not mission or not mission.get("project_id"):
+            raise ValueError("project_datasets_require_a_project_chat")
+        found = ctx.deps.store.project_dataset_content(mission["project_id"], relative_path)
+        if not found:
+            raise ValueError("dataset_not_registered_for_project")
+        name, content = found
+        return profile_tabular_artifact(name, "text/tab-separated-values" if name.lower().endswith(".tsv") else "text/csv", content)
+
+    @agent.tool(defer_loading=True)
+    def aggregate_project_dataset(
+        ctx: RunContext[AgentDependencies], relative_path: str, group_by: str,
+        aggregation: Literal["count", "sum", "mean", "min", "max", "quartiles"],
+        value_column: str = "", filter_column: str = "", filter_value: str = "",
+        limit: int = 25, date_bucket: Literal["day", "week", "month", "quarter", "year"] | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate a registered project CSV or TSV without opening other repository files."""
+        mission = ctx.deps.store.mission(ctx.deps.mission_id)
+        if not mission or not mission.get("project_id"):
+            raise ValueError("project_datasets_require_a_project_chat")
+        found = ctx.deps.store.project_dataset_content(mission["project_id"], relative_path)
+        if not found:
+            raise ValueError("dataset_not_registered_for_project")
+        name, content = found
+        media_type = "text/tab-separated-values" if name.lower().endswith(".tsv") else "text/csv"
+        return aggregate_tabular_artifact_content(
+            name, media_type, content, group_by=group_by, aggregation=aggregation,
+            value_column=value_column, filter_column=filter_column, filter_value=filter_value,
+            limit=limit, date_bucket=date_bucket or "",
+        )
+
+    @agent.tool(sequential=True, defer_loading=True)
+    def record_experiment_run(
+        ctx: RunContext[AgentDependencies], experiment_name: str, metrics: dict[str, Any],
+        parameters: dict[str, Any] | None = None, dataset_paths: list[str] | None = None,
+        model_path: str = "", notes: str = "",
+    ) -> dict[str, Any]:
+        """Record one immutable experiment result; dataset paths must be registered and model files must stay in this project. Small model files receive a SHA-256 fingerprint; large files retain size and path metadata."""
+        run = ctx.deps.store.record_experiment_run(
+            ctx.deps.mission_id, definition.id, experiment_name, metrics,
+            parameters=parameters or {}, dataset_paths=dataset_paths or [],
+            model_path=model_path, notes=notes,
+        )
+        return {key: run[key] for key in (
+            "experiment_name", "metrics", "parameters", "dataset_paths", "model_path",
+            "model_file_size_bytes", "model_sha256", "model_fingerprint_status", "notes", "created_at",
+        )}
+
+    @agent.tool(defer_loading=True)
+    def list_project_experiment_runs(ctx: RunContext[AgentDependencies]) -> dict[str, Any]:
+        """List recent experiment metrics recorded across chats in this project."""
+        mission = ctx.deps.store.mission(ctx.deps.mission_id)
+        if not mission or not mission.get("project_id"):
+            raise ValueError("experiments_require_a_project_chat")
+        runs = ctx.deps.store.project_experiment_runs(mission["project_id"], limit=100)
+        return {"runs": [{key: run[key] for key in (
+            "experiment_name", "metrics", "parameters", "dataset_paths", "model_path",
+            "model_file_size_bytes", "model_sha256", "model_fingerprint_status", "notes",
+            "created_by", "created_at", "mission_title",
+        )} for run in runs]}
 
     @agent.tool(defer_loading=True)
     def aggregate_tabular_artifact(
@@ -2632,6 +2816,7 @@ class PydanticAIProvider:
             "project": {
                 "name": project["name"], "goal": project["goal"],
                 "reference_files": project.get("referenceFiles", []),
+                "design_system": _design_system_context(project.get("designSystem")),
             },
             "mission": {"title": mission["title"], "goal": mission["goal"]},
             "project_team": event.get("projectTeam") or [{

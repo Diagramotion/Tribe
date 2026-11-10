@@ -100,6 +100,13 @@ function DiffCode({ source }) {
   })}</code>;
 }
 
+function MarkdownHeading({ level, node, children, ...props }) {
+  const { headingAnchors } = useContext(MarkdownRenderContext) ?? {};
+  const Tag = `h${level}`;
+  const id = headingAnchors?.[node?.position?.start?.line];
+  return <Tag {...props} id={id ?? props.id}>{children}</Tag>;
+}
+
 function repositoryPathForLink(href, basePath) {
   if (!href || !basePath || href.startsWith("#") || href.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(href)) return null;
   const pathname = href.split(/[?#]/, 1)[0];
@@ -168,6 +175,12 @@ const markdownComponents = {
   a: MarkdownLink,
   img: MarkdownImage,
   pre: MarkdownCodeBlock,
+  h1: (props) => <MarkdownHeading {...props} level={1} />,
+  h2: (props) => <MarkdownHeading {...props} level={2} />,
+  h3: (props) => <MarkdownHeading {...props} level={3} />,
+  h4: (props) => <MarkdownHeading {...props} level={4} />,
+  h5: (props) => <MarkdownHeading {...props} level={5} />,
+  h6: (props) => <MarkdownHeading {...props} level={6} />,
 };
 
 function containsMarkdownMath(source) {
@@ -198,7 +211,7 @@ function loadMarkdownMathPlugins() {
   return markdownMathPluginsPromise;
 }
 
-export function MarkdownContent({ children, onOpenRepositoryFile, onResolveRepositoryImage, repositoryBasePath, externalLinkTreatment = false, linkPreviewOnHover = false }) {
+export function MarkdownContent({ children, onOpenRepositoryFile, onResolveRepositoryImage, repositoryBasePath, externalLinkTreatment = false, linkPreviewOnHover = false, headingAnchors }) {
   const source = typeof children === "string" ? escapeCurrencyDelimiters(children) : children;
   const hasMath = typeof source === "string" && containsMarkdownMath(source);
   const [mathPlugins, setMathPlugins] = useState(null);
@@ -220,7 +233,8 @@ export function MarkdownContent({ children, onOpenRepositoryFile, onResolveRepos
     onOpenRepositoryFile,
     onResolveRepositoryImage,
     repositoryBasePath,
-  }), [externalLinkTreatment, linkPreviewOnHover, onOpenRepositoryFile, onResolveRepositoryImage, repositoryBasePath]);
+    headingAnchors,
+  }), [externalLinkTreatment, headingAnchors, linkPreviewOnHover, onOpenRepositoryFile, onResolveRepositoryImage, repositoryBasePath]);
   return <MarkdownRenderContext.Provider value={renderContext}>
     <ReactMarkdown
       components={markdownComponents}

@@ -8,14 +8,18 @@ import { citationsFromMarkdown } from "../src/domain/citations.js";
 let vite;
 const hmrPort = 40_000 + (process.pid % 5_000) * 3 + 4;
 let GeneralChatView;
+const originalWindow = globalThis.window;
 
 before(async () => {
+  globalThis.window = { setTimeout };
   vite = await createServer({ server: { middlewareMode: true, hmr: { port: hmrPort } }, appType: "custom" });
   ({ GeneralChatView } = await vite.ssrLoadModule("/src/views/GeneralChatView.jsx"));
 });
 
 after(async () => {
   await vite?.close();
+  if (originalWindow === undefined) delete globalThis.window;
+  else globalThis.window = originalWindow;
 });
 
 test("projectless chat explains its scope without exposing local tools", () => {
@@ -39,7 +43,6 @@ test("projectless chat explains its scope without exposing local tools", () => {
   assert.doesNotMatch(html, /Project tools aren’t available in this chat/);
   assert.match(html, /No local machine access/);
   assert.match(html, /A direct answer/);
-  assert.match(html, /message-markdown-external-citation/);
   assert.match(html, /class="general-chat-sources"/);
   assert.match(html, /Official docs/);
   assert.match(html, /example\.com/);

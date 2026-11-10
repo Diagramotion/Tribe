@@ -59,6 +59,7 @@ def build_capabilities(
     model_context_window: int | None = None,
     model_max_output_tokens: int | None = None,
     tool_permissions: tuple[str, ...] | None = None,
+    approval_mode: str | None = None,
     image_generator=None,
     after_model_response=None,
     context_pruning_enabled: bool = False,
@@ -95,6 +96,20 @@ def build_capabilities(
 
     root = workspace.root.resolve()
     approved_calls = approved_tool_call_ids if approved_tool_call_ids is not None else set()
+    approval_mode = approval_mode or workspace.store.project_approval_policy_for_mission(
+        workspace.mission_id
+    )
+    if approval_mode not in {"standard", "review_changes", "confirm_every_call"}:
+        approval_mode = "standard"
+
+    change_tools = {
+        "write_file", "edit_file", "create_directory", "write_repository_file",
+        "run_command", "start_command", "run_repository_tests",
+    }
+    exact_approval_tools = {
+        "request_file_deletion_approval", "delete_repository_file",
+        "request_isolated_integration", "integrate_isolated_changes",
+    }
 
     def mcp_action(tool_name: str) -> tuple[str, str] | None:
         if tool_name in BROWSER_ACTION_TOOLS:
@@ -125,8 +140,10 @@ def build_capabilities(
         risky_executables = {
             "rm", "rmdir", "del", "erase", "remove-item", "format", "mkfs", "dd",
             "shutdown", "reboot", "curl", "wget", "ssh", "scp", "sftp", "ftp",
-            "rsync", "npx", "uvx", "gh", "aws", "az", "gcloud", "terraform",
+            "rsync", "npx", "uvx", "gh", "aws", "az", "gcloud", "terraform", "jupyter",
         }
+        if "nbconvert" in arguments or "jupyter" in arguments:
+            return True
         if executable in risky_executables:
             return True
         if executable in {"bash", "sh", "zsh", "powershell", "pwsh", "cmd"}:
@@ -163,15 +180,36 @@ def build_capabilities(
             return [redact_mcp_arguments(item) for item in value]
         return value
 
+    def redact_approval_arguments(tool_name: str, value: object) -> object:
+        redacted = redact_mcp_arguments(value)
+        action = mcp_action(tool_name)
+        if action != ("browser", tool_name.removeprefix("browser_")) or not isinstance(value, dict):
+            return redacted
+        try:
+            host = urlsplit(value.get("url", "")).hostname if isinstance(value.get("url"), str) else None
+        except ValueError:
+            host = None
+        return {
+            key: (host or "[website host omitted]" if key == "url" and isinstance(item, str)
+                  else f"[text omitted · {len(item)} characters]"
+                  if key in {"value", "text", "selector", "name"} and isinstance(item, str)
+                  else item)
+            for key, item in redacted.items()
+        }
+
     async def require_action_approval(ctx, *, call, tool_def, args):
         _assert_harness_workspace_is_current(tool_def.name, root, workspace.root)
         if tool_def.name in {"run_command", "start_command"}:
             workspace._require_work_claim()
         mcp_tool = mcp_action(tool_def.name)
         is_web_action = tool_def.name in web_action_names
-        if tool_def.name not in {"run_command", "start_command"} and mcp_tool is None and not is_web_action:
-            return args
         if call.tool_call_id in approved_calls:
+            return args
+        if approval_mode == "confirm_every_call" and tool_def.name not in exact_approval_tools:
+            raise ApprovalRequired({"reason": "This project asks for approval before every agent tool call."})
+        if approval_mode == "review_changes" and tool_def.name in change_tools:
+            raise ApprovalRequired({"reason": "This project asks for approval before file changes and command runs."})
+        if tool_def.name not in {"run_command", "start_command"} and mcp_tool is None and not is_web_action:
             return args
         if is_web_action and project_id and workspace.store.has_access_grant(
             workspace.mission_id, project_id, "public_web_read",
@@ -204,26 +242,43 @@ def build_capabilities(
                     args = {}
             mcp_tool = mcp_action(call.tool_name)
             command = command_text(args)
-            if mcp_tool:
+            if approval_mode == "confirm_every_call" and call.tool_name not in exact_approval_tools:
+                title = "Confirm agent action"
+                summary = (getattr(ctx.deps, "tool_call_summaries", None) or {}).get(
+                    call.tool_call_id, {}
+                ).get("summary")
+                target = summary or "Agent tool call"
+                if mcp_tool == ("browser", call.tool_name.removeprefix("browser_")):
+                    target = "Browser session"
+                safe_args = redact_approval_arguments(call.tool_name, args)
+                details = (
+                    "This project asks you to approve every agent tool call before it runs.\n\n"
+                    f"Requested action: {call.tool_name}\n"
+                    f"Arguments:\n{json.dumps(safe_args, indent=2, ensure_ascii=False)[:6000]}\n\n"
+                    "Approval applies once to this exact call."
+                )
+            elif call.tool_name in change_tools and approval_mode == "review_changes":
+                command_tools = {"run_command", "start_command", "run_repository_tests"}
+                is_command = call.tool_name in command_tools
+                title = "Approve command" if is_command else "Review project change"
+                summary = (getattr(ctx.deps, "tool_call_summaries", None) or {}).get(
+                    call.tool_call_id, {}
+                ).get("summary")
+                target = summary or (f"Run command in {root}" if is_command else "Project files")
+                safe_args = redact_mcp_arguments(args)
+                details = (
+                    "The project approval mode requires confirmation before this change.\n\n"
+                    f"Requested action: {call.tool_name}\n"
+                    f"Arguments:\n{json.dumps(safe_args, indent=2, ensure_ascii=False)[:6000]}\n\n"
+                    "Approval applies once to this exact call."
+                )
+            elif mcp_tool:
                 server_name, tool_name = mcp_tool
                 title = (f"Use browser · {tool_name.replace('_', ' ')}" if server_name == "browser"
                          else f"Run MCP action {server_name}.{tool_name}")
                 target = ("Browser session" if server_name == "browser"
                           else f"MCP server {server_name} · {tool_name}")
-                redacted_args = redact_mcp_arguments(args)
-                if server_name == "browser":
-                    target_url = args.get("url") if isinstance(args, dict) else None
-                    try:
-                        safe_host = urlsplit(target_url).hostname if isinstance(target_url, str) else None
-                    except ValueError:
-                        safe_host = None
-                    redacted_args = {
-                        key: (safe_host or "[website host omitted]" if key == "url" and isinstance(value, str)
-                              else f"[text omitted · {len(value)} characters]"
-                              if key in {"value", "text", "selector", "name"} and isinstance(value, str)
-                              else value)
-                        for key, value in redacted_args.items()
-                    }
+                redacted_args = redact_approval_arguments(call.tool_name, args)
                 exact_action = json.dumps(redacted_args, indent=2, ensure_ascii=False)[:8000]
                 details = (
                     f"Exact {('browser action' if server_name == 'browser' else 'MCP tool')}: {server_name}.{tool_name}\nArguments:\n{exact_action}\n\n"
@@ -255,7 +310,7 @@ def build_capabilities(
                 tool_call_id=call.tool_call_id, tool_name=call.tool_name,
                 tool_arguments=({key: ("[redacted]" if key in {"url", "value", "text", "selector", "name"}
                                        else value) for key, value in args.items()}
-                                if mcp_tool and server_name == "browser" and isinstance(args, dict)
+                                if mcp_tool and mcp_tool[0] == "browser" and isinstance(args, dict)
                                 else args if isinstance(args, dict) else {}),
                 message_history=ModelMessagesTypeAdapter.dump_json(
                     sanitized_browser_messages(ctx.messages)

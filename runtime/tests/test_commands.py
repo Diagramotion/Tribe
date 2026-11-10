@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import signal
 import socket
@@ -106,6 +107,177 @@ class BackgroundCommandLaunchTests(unittest.TestCase):
         self.assertEqual(BackgroundCommandRunner.parse("make check"), ["make", "check"])
         with self.assertRaisesRegex(ValueError, "allowed_executable"):
             BackgroundCommandRunner.parse("echo unsafe")
+
+    def test_jupyter_is_an_allowed_command_and_prefers_project_environment(self) -> None:
+        self.assertEqual(
+            BackgroundCommandRunner.parse("jupyter nbconvert --to notebook"),
+            ["jupyter", "nbconvert", "--to", "notebook"],
+        )
+        with tempfile.TemporaryDirectory(prefix="tribe-jupyter-env-") as directory:
+            root = Path(directory)
+            local = root / ".venv" / "bin" / "jupyter"
+            local.parent.mkdir(parents=True)
+            local.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            local.chmod(0o755)
+            (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+            with patch("tribe_runtime.commands.shutil.which", side_effect=lambda name: name if name == str(local) else "/usr/bin/jupyter"):
+                self.assertEqual(BackgroundCommandRunner._resolve_executable("jupyter", root), str(local))
+            (root / "uv.lock").unlink()
+            with patch("tribe_runtime.commands.shutil.which", return_value="/usr/bin/jupyter"):
+                self.assertIsNone(BackgroundCommandRunner._resolve_executable("jupyter", root))
+
+    def test_jupyter_can_use_a_selected_locked_project_environment(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tribe-jupyter-select-") as directory:
+            root = Path(directory)
+            local = root / ".venv" / "bin" / "jupyter"
+            alternate = root / "venv" / "bin" / "jupyter"
+            for script in (local, alternate):
+                script.parent.mkdir(parents=True, exist_ok=True)
+                script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                script.chmod(0o755)
+            (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname = 'sample'\nversion = '0.1.0'\n", encoding="utf-8")
+
+            def find_executable(name: str) -> str | None:
+                if name in {str(local), str(alternate)}:
+                    return name
+                return "/usr/local/bin/uv" if name == "uv" else None
+
+            with patch("tribe_runtime.commands.shutil.which", side_effect=find_executable):
+                self.assertEqual(BackgroundCommandRunner._resolve_executable("jupyter", root, "venv"), str(alternate))
+                self.assertEqual(BackgroundCommandRunner._resolve_executable("jupyter", root, ".venv"), str(local))
+                self.assertEqual(BackgroundCommandRunner.notebook_environments(root), [
+                    {"id": ".venv", "label": ".venv", "locked": True, "lockfile": "uv.lock", "uvSetupAvailable": True, "pipenvSetupAvailable": False, "poetrySetupAvailable": False, "jupyterAvailable": True},
+                    {"id": "venv", "label": "venv", "locked": True, "lockfile": "uv.lock", "uvSetupAvailable": True, "pipenvSetupAvailable": False, "poetrySetupAvailable": False, "jupyterAvailable": True},
+                ])
+                self.assertIsNone(BackgroundCommandRunner._resolve_executable("jupyter", root, "elsewhere"))
+
+    def test_uv_notebook_setup_is_confined_to_the_project_venv(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tribe-jupyter-setup-") as directory:
+            root = Path(directory)
+            (root / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+            store = Mock()
+            store.mission.return_value = {"id": "mission-1", "project_id": "project-1", "status": "active"}
+            store.project_repository.return_value = root
+            store.project_command_tools.return_value = []
+            store.create_background_run.return_value = {"id": "run-1"}
+            process = Mock(pid=4321, stdout=io.StringIO(""), returncode=0)
+            process.poll.return_value = 0
+            runner = BackgroundCommandRunner(store)
+            with patch.object(runner, "_create_process_job", return_value=None), \
+                    patch("tribe_runtime.commands.shutil.which", return_value="/usr/local/bin/uv"), \
+                    patch("tribe_runtime.commands.subprocess.Popen", return_value=process) as popen:
+                runner.start("mission-1", ["uv", "add", "--dev", "jupyter"], notebook_setup_environment=".venv", notebook_setup_manager="uv")
+
+            self.assertEqual(popen.call_args.kwargs["cwd"], root)
+            self.assertEqual(popen.call_args.kwargs["env"]["UV_PROJECT_ENVIRONMENT"], str(root / ".venv"))
+            with self.assertRaisesRegex(ValueError, "notebook_setup_environment_invalid"):
+                runner.start("mission-1", ["uv", "add", "--dev", "jupyter"], notebook_setup_environment="venv", notebook_setup_manager="uv")
+
+    def test_pipenv_environment_detects_project_local_setup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tribe-pipenv-detect-") as directory:
+            root = Path(directory)
+            (root / "Pipfile").write_text("[packages]\n", encoding="utf-8")
+            (root / "Pipfile.lock").write_text("{}\n", encoding="utf-8")
+            with patch("tribe_runtime.commands.shutil.which", side_effect=lambda name: "/usr/bin/pipenv" if name == "pipenv" else None):
+                environments = BackgroundCommandRunner.notebook_environments(root)
+            self.assertTrue(environments[0]["pipenvSetupAvailable"])
+            self.assertFalse(environments[1]["pipenvSetupAvailable"])
+
+    def test_pipenv_notebook_setup_is_confined_to_the_project_venv(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tribe-jupyter-pipenv-") as directory:
+            root = Path(directory)
+            (root / "Pipfile").write_text("[packages]\n", encoding="utf-8")
+            (root / "Pipfile.lock").write_text("{}\n", encoding="utf-8")
+            store = Mock()
+            store.mission.return_value = {"id": "mission-1", "project_id": "project-1", "status": "active"}
+            store.project_repository.return_value = root
+            store.project_command_tools.return_value = []
+            store.create_background_run.return_value = {"id": "run-1"}
+            process = Mock(pid=4321, stdout=io.StringIO(""), returncode=0)
+            process.poll.return_value = 0
+            runner = BackgroundCommandRunner(store)
+            with patch.object(runner, "_create_process_job", return_value=None), \
+                    patch("tribe_runtime.commands.shutil.which", return_value="/usr/local/bin/pipenv"), \
+                    patch("tribe_runtime.commands.subprocess.Popen", return_value=process) as popen:
+                runner.start("mission-1", ["pipenv", "install", "--dev", "jupyter"],
+                             notebook_setup_environment=".venv", notebook_setup_manager="pipenv")
+
+            self.assertEqual(popen.call_args.kwargs["cwd"], root)
+            self.assertEqual(popen.call_args.kwargs["env"]["PIPENV_VENV_IN_PROJECT"], "1")
+            with self.assertRaisesRegex(ValueError, "notebook_setup_environment_invalid"):
+                runner.start("mission-1", ["pipenv", "install", "--dev", "jupyter"],
+                             notebook_setup_environment="venv", notebook_setup_manager="pipenv")
+
+    def test_poetry_environment_detects_project_local_setup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tribe-jupyter-poetry-detect-") as directory:
+            root = Path(directory)
+            (root / "pyproject.toml").write_text("[tool.poetry]\nname='sample'\n", encoding="utf-8")
+            (root / "poetry.lock").write_text("package = []\n", encoding="utf-8")
+            with patch("tribe_runtime.commands.shutil.which", side_effect=lambda name: "/usr/bin/poetry" if name == "poetry" else None):
+                environments = BackgroundCommandRunner.notebook_environments(root)
+            self.assertTrue(environments[0]["poetrySetupAvailable"])
+            self.assertFalse(environments[1]["poetrySetupAvailable"])
+
+    def test_poetry_notebook_setup_is_confined_to_the_project_venv(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tribe-jupyter-poetry-setup-") as directory:
+            root = Path(directory)
+            (root / "pyproject.toml").write_text("[tool.poetry]\nname='sample'\n", encoding="utf-8")
+            (root / "poetry.lock").write_text("package = []\n", encoding="utf-8")
+            store = Mock()
+            store.mission.return_value = {"id": "mission-1", "project_id": "project-1", "status": "active"}
+            store.project_repository.return_value = root
+            store.project_command_tools.return_value = []
+            store.create_background_run.return_value = {"id": "run-1"}
+            process = Mock(pid=4321, stdout=io.StringIO(""), returncode=0)
+            process.poll.return_value = 0
+            runner = BackgroundCommandRunner(store)
+            with patch.object(runner, "_create_process_job", return_value=None), patch(
+                "tribe_runtime.commands.shutil.which", return_value="/usr/local/bin/poetry"
+            ), patch("tribe_runtime.commands.subprocess.Popen", return_value=process) as popen:
+                runner.start("mission-1", ["poetry", "add", "--group", "dev", "jupyter"],
+                             notebook_setup_environment=".venv", notebook_setup_manager="poetry")
+
+            self.assertEqual(popen.call_args.kwargs["cwd"], root)
+            self.assertEqual(popen.call_args.kwargs["env"]["POETRY_VIRTUALENVS_IN_PROJECT"], "1")
+            with self.assertRaisesRegex(ValueError, "notebook_setup_environment_invalid"):
+                runner.start("mission-1", ["poetry", "add", "--group", "dev", "jupyter"],
+                             notebook_setup_environment="venv", notebook_setup_manager="poetry")
+
+    def test_notebook_execution_ignores_pixi_and_conda_environments(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tribe-jupyter-unsupported-envs-") as directory:
+            root = Path(directory)
+            (root / "pixi.toml").write_text("[workspace]\nname=sample\n", encoding="utf-8")
+            (root / "pixi.lock").write_text("version: 6\n", encoding="utf-8")
+            (root / "conda-lock.yml").write_text("version: 1\n", encoding="utf-8")
+
+            environments = BackgroundCommandRunner.notebook_environments(root)
+
+            self.assertEqual([item["id"] for item in environments], [".venv", "venv"])
+            self.assertTrue(all(not item["locked"] for item in environments))
+            self.assertIsNone(BackgroundCommandRunner._resolve_executable("jupyter", root, "pixi:default"))
+            self.assertIsNone(BackgroundCommandRunner._resolve_executable("jupyter", root, "conda:project"))
+
+    def test_notebook_setup_rejects_a_venv_symlink_outside_the_project(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tribe-jupyter-symlink-") as directory:
+            root = Path(directory)
+            project = root / "repo"
+            project.mkdir()
+            external_environment = root / "external"
+            external_environment.mkdir()
+            (project / ".venv").symlink_to(external_environment, target_is_directory=True)
+            (project / "Pipfile").write_text("[packages]\n", encoding="utf-8")
+            (project / "Pipfile.lock").write_text("{}\n", encoding="utf-8")
+            store = Mock()
+            store.mission.return_value = {"id": "mission-1", "project_id": "project-1", "status": "active"}
+            store.project_repository.return_value = project
+            store.project_command_tools.return_value = []
+            runner = BackgroundCommandRunner(store)
+            with patch("tribe_runtime.commands.shutil.which", return_value="/usr/local/bin/pipenv"):
+                with self.assertRaisesRegex(ValueError, "notebook_setup_environment_invalid"):
+                    runner.start("mission-1", ["pipenv", "install", "--dev", "jupyter"],
+                                 notebook_setup_environment=".venv", notebook_setup_manager="pipenv")
 
     def test_project_approved_executable_can_be_parsed(self) -> None:
         self.assertEqual(
