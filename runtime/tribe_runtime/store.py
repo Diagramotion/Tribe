@@ -5383,7 +5383,7 @@ class MissionStore:
                 if event_trigger is None:
                     if row["created_at"] < scan_start:
                         continue
-                elif event_trigger != trigger_sequence:
+                elif str(event_trigger) != str(trigger_sequence):
                     continue
                 call_id = payload.get("toolCallId")
                 if not isinstance(call_id, str) or not call_id:
@@ -5469,7 +5469,7 @@ class MissionStore:
             if event_trigger is None:
                 if row["created_at"] < scan_start:
                     continue
-            elif event_trigger != trigger_sequence:
+            elif str(event_trigger) != str(trigger_sequence):
                 continue
             call_id = payload.get("toolCallId")
             if not isinstance(call_id, str) or not call_id:
@@ -5503,7 +5503,7 @@ class MissionStore:
             # replaying a possibly side-effecting call from an older run.
             event_trigger = payload.get("triggerSequence")
             if ((event_trigger is None and row["created_at"] >= scan_start)
-                    or event_trigger == trigger_sequence):
+                    or (event_trigger is not None and str(event_trigger) == str(trigger_sequence))):
                 return True
         return False
 
