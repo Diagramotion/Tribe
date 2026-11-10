@@ -1346,4 +1346,8 @@ try {
   await new Promise((resolveClose) => embeddedServer.close(() => resolveClose()));
   await new Promise((resolveClose) => blockedServer.close(() => resolveClose()));
   await fs.rm(temporaryRoot, { recursive: true, force: true });
+  if (process.platform === "win32") {
+    await Promise.all([process.stdout, process.stderr].map((stream) => new Promise((resolveFlush) => stream.write("", resolveFlush))));
+    process.exit(process.exitCode ?? 0);
+  }
 }
