@@ -2,7 +2,7 @@
 
 ## Product direction
 
-- Product target: reach or exceed Sarathi's feature breadth while improving durability, extensibility, and usability. Build in Tribe; keep `Sarathi` read-only as a reference. Treat feature parity as an ongoing delivery goal, not a claim that the current prototype is complete.
+- Product target: reach or exceed Sarathi's feature breadth while improving durability, extensibility, and usability. Build in Tribe; treat Sarathi as a read-only reference. Treat feature parity as an ongoing delivery goal, not a claim that the current prototype is complete.
 - Prefer current Pydantic AI and its composable Harness capabilities for provider loops, filesystem, shell, skills, MCP, and other standard agent functions. Use PydanticAI's `provider:model` identifiers and its supported LiteLLM gateway integration instead of handcrafting model-provider adapters. Keep Tribe-specific mission events, shared planning, role consumers, exact approvals, and repository policy in Tribe. Do not use composites that introduce hidden orchestration or unrestricted access where they conflict with Tribe's event topology and permission model. Use Codex and Claude as usability and feature benchmarks only; Tribe's model execution uses provider APIs or local model endpoints.
 - Keep only frequent, low-risk tools eagerly available. Mark specialised Tribe tools, Pydantic AI Harness capabilities, and MCP tools for deferred loading so Pydantic AI tool search reveals schemas on demand. Keep selected skills discoverable while loading their instructions only when needed.
 - Keep a visible capability map against Sarathi and implement in dependency order. Do not declare parity until each capability is implemented, exercised, and surfaced in the UI.
