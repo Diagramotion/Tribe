@@ -201,19 +201,22 @@ async function stopDesktop() {
     child.kill("SIGTERM");
   }
   await Promise.race([exited, delay(15_000)]);
-  if (child.exitCode === null) {
-    if (process.platform === "win32") {
-      try {
-        execFileSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
-          stdio: "ignore", windowsHide: true, timeout: 5_000,
-        });
-      } catch { /* The app may have exited between the timeout and taskkill. */ }
-    } else {
-      child.kill("SIGKILL");
-    }
+  if (process.platform === "win32") {
+    killWindowsProcessTree(child);
+    await Promise.race([new Promise((resolveExit) => child.once("exit", resolveExit)), delay(2_000)]);
+  } else if (child.exitCode === null) {
+    child.kill("SIGKILL");
     await Promise.race([new Promise((resolveExit) => child.once("exit", resolveExit)), delay(2_000)]);
   }
   assert.notEqual(child.exitCode, null, "the disposable desktop app must exit before its restart");
+}
+
+function killWindowsProcessTree(child) {
+  try {
+    execFileSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+      stdio: "ignore", windowsHide: true, timeout: 5_000,
+    });
+  } catch { /* The app may have exited between the timeout and taskkill. */ }
 }
 
 function runProcess(command, args, { cwd, env, input = "", timeoutMs = 300_000 }) {
@@ -1311,7 +1314,14 @@ try {
   process.exitCode = 1;
 } finally {
   for (const child of [desktop, vite, runtime]) {
-    if (!child || child.exitCode !== null) continue;
+    if (!child) continue;
+    if (process.platform === "win32") {
+      killWindowsProcessTree(child);
+      await Promise.race([new Promise((resolveClose) => child.once("exit", resolveClose)), delay(5_000)]);
+      if (child.exitCode === null) child.kill("SIGKILL");
+      continue;
+    }
+    if (child.exitCode !== null) continue;
     child.kill("SIGTERM");
     await Promise.race([new Promise((resolveClose) => child.once("exit", resolveClose)), delay(5_000)]);
     if (child.exitCode === null) child.kill("SIGKILL");
