@@ -19,7 +19,7 @@ dependencies = [
     "opencv-python-headless>=4.10,<5",
     "pyyaml>=6,<7",
     "smriti-mcp>=0.1.5,<0.2",
-    "tzlocal>=5.3.1,<5.4",
+    "tzlocal>=5.3.1,<5.5",
     "tzdata>=2024.1; platform_system == 'Windows'",
 ]
 
