@@ -5362,13 +5362,12 @@ class MissionStore:
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
-                """SELECT event_type,payload,created_at FROM events WHERE mission_id=? AND actor_id=?
-                   AND event_type IN
+                """SELECT event_type,payload FROM events WHERE mission_id=? AND actor_id=?
+                   AND created_at>=? AND event_type IN
                    ('agent.tool.started','agent.tool.completed','agent.tool.interrupted',
                     'repo.file.write.started','repo.file.changed') ORDER BY sequence""",
-                (mission_id, agent_id),
+                (mission_id, agent_id, _recovery_scan_start(started_at)),
             ).fetchall()
-            scan_start = _recovery_scan_start(started_at)
             writes_started: set[str] = set()
             writes_completed: set[str] = set()
             write_intents: dict[str, dict[str, Any]] = {}
@@ -5380,10 +5379,7 @@ class MissionStore:
                 except (TypeError, json.JSONDecodeError):
                     continue
                 event_trigger = payload.get("triggerSequence")
-                if event_trigger is None:
-                    if row["created_at"] < scan_start:
-                        continue
-                elif str(event_trigger) != str(trigger_sequence):
+                if event_trigger is not None and str(event_trigger) != str(trigger_sequence):
                     continue
                 call_id = payload.get("toolCallId")
                 if not isinstance(call_id, str) or not call_id:
@@ -5451,13 +5447,12 @@ class MissionStore:
                                             trigger_sequence: int, started_at: str) -> bool:
         with self._connect() as db:
             rows = db.execute(
-                """SELECT event_type,payload,created_at FROM events WHERE mission_id=? AND actor_id=?
-                   AND event_type IN
+                """SELECT event_type,payload FROM events WHERE mission_id=? AND actor_id=?
+                   AND created_at>=? AND event_type IN
                    ('agent.tool.started','agent.tool.completed','agent.tool.interrupted')
                    ORDER BY sequence""",
-                (mission_id, agent_id),
+                (mission_id, agent_id, _recovery_scan_start(started_at)),
             ).fetchall()
-        scan_start = _recovery_scan_start(started_at)
         started: set[str] = set()
         settled: set[str] = set()
         for row in rows:
@@ -5466,10 +5461,7 @@ class MissionStore:
             except (TypeError, json.JSONDecodeError):
                 continue
             event_trigger = payload.get("triggerSequence")
-            if event_trigger is None:
-                if row["created_at"] < scan_start:
-                    continue
-            elif str(event_trigger) != str(trigger_sequence):
+            if event_trigger is not None and str(event_trigger) != str(trigger_sequence):
                 continue
             call_id = payload.get("toolCallId")
             if not isinstance(call_id, str) or not call_id:
@@ -5487,13 +5479,12 @@ class MissionStore:
         """Return whether replaying this run from its trigger could repeat a tool effect."""
         with self._connect() as db:
             rows = db.execute(
-                """SELECT payload,created_at FROM events WHERE mission_id=? AND actor_id=?
-                   AND event_type IN
+                """SELECT payload FROM events WHERE mission_id=? AND actor_id=?
+                   AND created_at>=? AND event_type IN
                    ('agent.tool.started','agent.tool.completed','agent.tool.interrupted')
                    ORDER BY sequence""",
-                (mission_id, agent_id),
+                (mission_id, agent_id, _recovery_scan_start(started_at)),
             ).fetchall()
-        scan_start = _recovery_scan_start(started_at)
         for row in rows:
             try:
                 payload = json.loads(row["payload"])
@@ -5502,8 +5493,7 @@ class MissionStore:
             # Legacy rows without a trigger are ambiguous. Fail closed rather than
             # replaying a possibly side-effecting call from an older run.
             event_trigger = payload.get("triggerSequence")
-            if ((event_trigger is None and row["created_at"] >= scan_start)
-                    or (event_trigger is not None and str(event_trigger) == str(trigger_sequence))):
+            if event_trigger is None or str(event_trigger) == str(trigger_sequence):
                 return True
         return False
 
