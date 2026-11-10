@@ -360,7 +360,11 @@ try {
     delete packagedEnv.TRIBE_DEV_ORIGIN;
     delete packagedEnv.TRIBE_ELECTRON_VITE_PORT;
     packagedEnv.TRIBE_BROWSER_API_TOKEN = browserApiToken;
-    desktopLaunch = { command: path.resolve(root, packagedAppPath), args: [], env: packagedEnv };
+    desktopLaunch = {
+      command: path.resolve(root, packagedAppPath),
+      args: process.platform === "darwin" ? ["--disable-gpu"] : [],
+      env: packagedEnv,
+    };
   } else {
     const viteCli = resolve(root, "node_modules/vite/bin/vite.js");
     const electronExecutable = resolve(root, "node_modules/electron/dist", process.platform === "win32"
