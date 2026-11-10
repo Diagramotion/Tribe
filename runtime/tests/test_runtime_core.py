@@ -7715,6 +7715,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
 
         with patch.object(runtime_server, "STORE", self.store), patch.object(runtime_server, "SUPERVISOR") as supervisor:
             http = runtime_server.LocalHTTPServer(("127.0.0.1", 0), runtime_server.Handler)
+            http.daemon_threads = False
             thread = threading.Thread(target=http.serve_forever, daemon=True)
             thread.start()
             try:
@@ -7944,6 +7945,9 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                 self.assertEqual(result["mission"]["goal"], "Deliver a bounded implementation")
                 supervisor.start_mission.assert_called_with(result["mission"]["id"], initial_launch=True)
             finally:
+                # Wake any disconnected SSE handlers so server_close can join them
+                # before the temporary database directory is removed.
+                self.store.append("message.created", "user", self.mission["id"], {"text": "End stream test"})
                 http.shutdown()
                 http.server_close()
                 thread.join(timeout=3)
