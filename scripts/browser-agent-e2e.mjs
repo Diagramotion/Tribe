@@ -224,10 +224,11 @@ function killWindowsProcessTree(child) {
     "$descendants = [System.Collections.Generic.List[int]]::new()",
     "while ($pending.Count -gt 0) { $parent = $pending.Dequeue(); foreach ($process in $processes) { if ($process.ParentProcessId -eq $parent) { $descendants.Add([int]$process.ProcessId); $pending.Enqueue([int]$process.ProcessId) } } }",
     "for ($index = $descendants.Count - 1; $index -ge 0; $index--) { Stop-Process -Id $descendants[$index] -Force -ErrorAction SilentlyContinue }",
+    "if ($descendants.Count -gt 0) { Wait-Process -Id $descendants.ToArray() -Timeout 15 -ErrorAction SilentlyContinue }",
   ].join("; ");
   try {
     execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-      stdio: "ignore", windowsHide: true, timeout: 15_000,
+      stdio: "ignore", windowsHide: true, timeout: 20_000,
     });
   } catch { /* Best-effort cleanup; the CI step reports a timeout if handles remain. */ }
 }
