@@ -485,4 +485,9 @@ class BackgroundCommandRunner:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            except PermissionError:
+                # Some hosted macOS runners deny a second group signal after the
+                # graceful termination has already stopped its descendants.
+                if process.poll() is None:
+                    process.kill()
 

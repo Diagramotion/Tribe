@@ -40,7 +40,7 @@ if (process.env.TRIBE_ELECTRON_DATA_DIR) {
   app.setPath("userData", electronDataDirectory);
 }
 let browserApiPort = Number(process.env.TRIBE_BROWSER_API_PORT || 0);
-let browserApiToken = "";
+let browserApiToken = process.env.TRIBE_BROWSER_API_TOKEN || "";
 delete process.env.TRIBE_BROWSER_API_TOKEN;
 delete process.env.TRIBE_BROWSER_API_PORT;
 
@@ -1578,7 +1578,7 @@ function browserAutomationRequest(request, response) {
     response.end(JSON.stringify({ error: "method_not_allowed" }));
     return;
   }
-      const browserActions = `state|navigate|snapshot|screenshot|diagnostics|storage${e2e ? "|site-inventory|clear-site-data|new-tab|select-tab|close-tab|crash|agent-control|hold|shortcut|menu-state|menu-command|layout-state|extract-design-reference|approval-ui-state|approval-ui-action" : ""}|click|click-at|fill|upload|press|type|scroll|viewport|reload|back|forward`;
+      const browserActions = `state|navigate|snapshot|screenshot|diagnostics|storage${e2e ? "|site-inventory|clear-site-data|new-tab|select-tab|close-tab|crash|agent-control|hold|shortcut|menu-state|menu-command|layout-state|extract-design-reference|approval-ui-state|approval-ui-action|quit" : ""}|click|click-at|fill|upload|press|type|scroll|viewport|reload|back|forward`;
   const match = new RegExp(`^/v1/browser/([a-zA-Z0-9-]{1,80})/(${browserActions})$`)
     .exec(new URL(request.url, "http://127.0.0.1").pathname);
   if (!match) {
@@ -1621,6 +1621,12 @@ function browserAutomationRequest(request, response) {
     try {
       if (!(e2e && action === "agent-control")) assertAgentControl();
       const payload = bytes ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
+      if (e2e && action === "quit") {
+        response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        response.once("finish", () => setTimeout(() => app.quit(), 100));
+        response.end(JSON.stringify({ result: true }));
+        return;
+      }
       if (e2e && action === "extract-design-reference") {
         const result = await mainWindow.webContents.executeJavaScript(
           `(async () => window.tribeDesktopBrowser.extractDesignReference(${JSON.stringify(scope)}))()`,
@@ -2439,7 +2445,7 @@ async function startPackagedServices() {
     if (!Number.isInteger(browserApiPort) || browserApiPort < 1 || browserApiPort > 65535) {
       throw new Error("The packaged browser test needs a reserved local API port.");
     }
-    browserApiToken = await readBrowserApiToken();
+    if (!browserApiToken) browserApiToken = await readBrowserApiToken();
     if (browserApiToken.length < 32) throw new Error("The packaged browser test needs its one-time local API token.");
   } else {
     browserApiPort = await reserveLocalPort();
@@ -2878,7 +2884,7 @@ async function createMainWindow() {
 
 app.whenReady().then(async () => {
   if (app.isPackaged) await startPackagedServices();
-  else browserApiToken = await readBrowserApiToken();
+  else if (!browserApiToken) browserApiToken = await readBrowserApiToken();
   installMacApplicationMenu();
   registerIpc();
   startBrowserAutomationServer();

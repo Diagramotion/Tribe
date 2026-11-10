@@ -194,13 +194,43 @@ async function stopDesktop() {
   if (!desktop || desktop.exitCode !== null) return;
   const child = desktop;
   const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
-  child.kill("SIGTERM");
+  try {
+    const response = await request("quit");
+    assert.equal(response.status, 200, "the disposable desktop app must accept its authenticated shutdown request");
+  } catch {
+    child.kill("SIGTERM");
+  }
   await Promise.race([exited, delay(15_000)]);
-  if (child.exitCode === null) {
+  if (process.platform === "win32") {
+    killWindowsProcessTree(child);
+    await Promise.race([new Promise((resolveExit) => child.once("exit", resolveExit)), delay(2_000)]);
+  } else if (child.exitCode === null) {
     child.kill("SIGKILL");
     await Promise.race([new Promise((resolveExit) => child.once("exit", resolveExit)), delay(2_000)]);
   }
   assert.notEqual(child.exitCode, null, "the disposable desktop app must exit before its restart");
+}
+
+function killWindowsProcessTree(child) {
+  try {
+    execFileSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+      stdio: "ignore", windowsHide: true, timeout: 5_000,
+    });
+  } catch { /* The root process may have exited while its descendants remain. */ }
+
+  const script = [
+    "$processes = Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId",
+    `$pending = [System.Collections.Generic.Queue[int]]::new(); $pending.Enqueue(${child.pid})`,
+    "$descendants = [System.Collections.Generic.List[int]]::new()",
+    "while ($pending.Count -gt 0) { $parent = $pending.Dequeue(); foreach ($process in $processes) { if ($process.ParentProcessId -eq $parent) { $descendants.Add([int]$process.ProcessId); $pending.Enqueue([int]$process.ProcessId) } } }",
+    "for ($index = $descendants.Count - 1; $index -ge 0; $index--) { Stop-Process -Id $descendants[$index] -Force -ErrorAction SilentlyContinue }",
+    "if ($descendants.Count -gt 0) { Wait-Process -Id $descendants.ToArray() -Timeout 15 -ErrorAction SilentlyContinue }",
+  ].join("; ");
+  try {
+    execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      stdio: "ignore", windowsHide: true, timeout: 20_000,
+    });
+  } catch { /* Best-effort cleanup; the CI step reports a timeout if handles remain. */ }
 }
 
 function runProcess(command, args, { cwd, env, input = "", timeoutMs = 300_000 }) {
@@ -346,17 +376,32 @@ try {
     delete packagedEnv.TRIBE_DEV_URL;
     delete packagedEnv.TRIBE_DEV_ORIGIN;
     delete packagedEnv.TRIBE_ELECTRON_VITE_PORT;
-    desktopLaunch = { command: path.resolve(root, packagedAppPath), args: [], env: packagedEnv };
+    packagedEnv.TRIBE_BROWSER_API_TOKEN = browserApiToken;
+    desktopLaunch = {
+      command: path.resolve(root, packagedAppPath),
+      args: process.platform === "darwin" ? ["--disable-gpu"] : [],
+      env: packagedEnv,
+    };
   } else {
     const viteCli = resolve(root, "node_modules/vite/bin/vite.js");
     const electronExecutable = resolve(root, "node_modules/electron/dist", process.platform === "win32"
       ? "electron.exe"
       : process.platform === "darwin" ? "Electron.app/Contents/MacOS/Electron" : "electron");
+    try {
+      await fs.access(electronExecutable);
+    } catch {
+      const electronInstaller = resolve(root, "node_modules/electron/install.js");
+      await runProcess(process.execPath, [electronInstaller], { cwd: root, env: safeEnv, timeoutMs: 300_000 });
+      await fs.access(electronExecutable);
+    }
     vite = startProcess(process.execPath, [viteCli, "--host", "127.0.0.1", "--port", String(devPort), "--strictPort"]);
     await waitFor(async () => {
       try { return (await fetch(safeEnv.TRIBE_DEV_URL)).ok; } catch { return false; }
     }, "Vite to become ready");
-    desktopLaunch = { command: electronExecutable, args: ["."], env: safeEnv };
+    desktopLaunch = {
+      command: electronExecutable, args: ["."],
+      env: { ...safeEnv, TRIBE_BROWSER_API_TOKEN: browserApiToken },
+    };
   }
   launchDesktop();
 
@@ -725,8 +770,8 @@ try {
   assert.equal(reloadedPixel.viewportSize.userAgentData.highEntropy.model, "Pixel 7");
   const responsive = await call("viewport", { tabId, viewport: "responsive", allowedDomains: ["127.0.0.1"] });
   assert.equal(responsive.viewport, "responsive");
-  assert.ok(responsive.viewportSize.width > 412);
-  assert.ok(responsive.viewportSize.height > 600);
+  assert.equal(responsive.viewportSize.width, baseline.viewportSize.width);
+  assert.equal(responsive.viewportSize.height, baseline.viewportSize.height);
   assert.equal(responsive.viewportSize.maxTouchPoints, baseline.viewportSize.maxTouchPoints);
   assert.equal(responsive.viewportSize.touch, false);
   const reducedMotionSnapshot = await call("snapshot", { tabId, allowedDomains: ["127.0.0.1"] });
@@ -1283,7 +1328,14 @@ try {
   process.exitCode = 1;
 } finally {
   for (const child of [desktop, vite, runtime]) {
-    if (!child || child.exitCode !== null) continue;
+    if (!child) continue;
+    if (process.platform === "win32") {
+      killWindowsProcessTree(child);
+      await Promise.race([new Promise((resolveClose) => child.once("exit", resolveClose)), delay(5_000)]);
+      if (child.exitCode === null) child.kill("SIGKILL");
+      continue;
+    }
+    if (child.exitCode !== null) continue;
     child.kill("SIGTERM");
     await Promise.race([new Promise((resolveClose) => child.once("exit", resolveClose)), delay(5_000)]);
     if (child.exitCode === null) child.kill("SIGKILL");
@@ -1295,4 +1347,8 @@ try {
   await new Promise((resolveClose) => embeddedServer.close(() => resolveClose()));
   await new Promise((resolveClose) => blockedServer.close(() => resolveClose()));
   await fs.rm(temporaryRoot, { recursive: true, force: true });
+  if (process.platform === "win32") {
+    await Promise.all([process.stdout, process.stderr].map((stream) => new Promise((resolveFlush) => stream.write("", resolveFlush))));
+    process.exit(process.exitCode ?? 0);
+  }
 }

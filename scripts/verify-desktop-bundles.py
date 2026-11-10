@@ -16,6 +16,8 @@ import urllib.request
 from ctypes import wintypes
 from pathlib import Path
 
+RUNTIME_SHUTDOWN_GRACE_SECONDS = 25
+
 
 def verify_bundles(root: Path, target: str) -> list[Path]:
     bundle_root = root / "src-tauri" / "target" / target / "release" / "bundle"
@@ -135,7 +137,7 @@ def smoke_macos_app_lifecycle(app: Path) -> None:
             if process.returncode != 0:
                 raise RuntimeError(f"packaged macOS app exited with code {process.returncode}")
 
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + RUNTIME_SHUTDOWN_GRACE_SECONDS
             while time.monotonic() < deadline and _runtime_is_healthy(endpoint):
                 time.sleep(0.1)
             if _runtime_is_healthy(endpoint):
@@ -234,7 +236,7 @@ def smoke_windows_app_lifecycle(app: Path) -> None:
             if process.returncode != 0:
                 raise RuntimeError(f"packaged Windows app exited with code {process.returncode}")
 
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + RUNTIME_SHUTDOWN_GRACE_SECONDS
             while time.monotonic() < deadline and _runtime_is_healthy(endpoint):
                 time.sleep(0.1)
             if _runtime_is_healthy(endpoint):

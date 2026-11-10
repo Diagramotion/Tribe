@@ -47,6 +47,7 @@ fn main() {
                 .env("TRIBE_DATA_DIR", data_dir.as_os_str())
                 .env("TRIBE_AGENT_DIR", agent_dir.as_os_str())
                 .env("TRIBE_PORT", runtime_port().to_string())
+                .set_process_group(true)
                 .spawn()
                 .map_err(|error| {
                     eprintln!("Tribe runtime sidecar failed to start: {error}");

@@ -64,6 +64,14 @@ def now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _recovery_scan_start(started_at: str) -> str:
+    """Allow a small wall-clock skew when scanning durable events after a crash."""
+    try:
+        return (datetime.fromisoformat(started_at) - timedelta(seconds=1)).isoformat()
+    except (TypeError, ValueError):
+        return started_at
+
+
 _CRON_MONTHS = {name: index for index, name in enumerate(
     ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"), 1,
 )}
@@ -5358,7 +5366,7 @@ class MissionStore:
                    AND created_at>=? AND event_type IN
                    ('agent.tool.started','agent.tool.completed','agent.tool.interrupted',
                     'repo.file.write.started','repo.file.changed') ORDER BY sequence""",
-                (mission_id, agent_id, started_at),
+                (mission_id, agent_id, _recovery_scan_start(started_at)),
             ).fetchall()
             writes_started: set[str] = set()
             writes_completed: set[str] = set()
@@ -5371,7 +5379,7 @@ class MissionStore:
                 except (TypeError, json.JSONDecodeError):
                     continue
                 event_trigger = payload.get("triggerSequence")
-                if event_trigger is not None and event_trigger != trigger_sequence:
+                if event_trigger is not None and str(event_trigger) != str(trigger_sequence):
                     continue
                 call_id = payload.get("toolCallId")
                 if not isinstance(call_id, str) or not call_id:
@@ -5443,7 +5451,7 @@ class MissionStore:
                    AND created_at>=? AND event_type IN
                    ('agent.tool.started','agent.tool.completed','agent.tool.interrupted')
                    ORDER BY sequence""",
-                (mission_id, agent_id, started_at),
+                (mission_id, agent_id, _recovery_scan_start(started_at)),
             ).fetchall()
         started: set[str] = set()
         settled: set[str] = set()
@@ -5453,7 +5461,7 @@ class MissionStore:
             except (TypeError, json.JSONDecodeError):
                 continue
             event_trigger = payload.get("triggerSequence")
-            if event_trigger is not None and event_trigger != trigger_sequence:
+            if event_trigger is not None and str(event_trigger) != str(trigger_sequence):
                 continue
             call_id = payload.get("toolCallId")
             if not isinstance(call_id, str) or not call_id:
@@ -5475,7 +5483,7 @@ class MissionStore:
                    AND created_at>=? AND event_type IN
                    ('agent.tool.started','agent.tool.completed','agent.tool.interrupted')
                    ORDER BY sequence""",
-                (mission_id, agent_id, started_at),
+                (mission_id, agent_id, _recovery_scan_start(started_at)),
             ).fetchall()
         for row in rows:
             try:
@@ -5485,7 +5493,7 @@ class MissionStore:
             # Legacy rows without a trigger are ambiguous. Fail closed rather than
             # replaying a possibly side-effecting call from an older run.
             event_trigger = payload.get("triggerSequence")
-            if event_trigger is None or event_trigger == trigger_sequence:
+            if event_trigger is None or str(event_trigger) == str(trigger_sequence):
                 return True
         return False
 
@@ -7848,7 +7856,7 @@ class MissionStore:
     def work_items(self, mission_id: str) -> list[dict[str, Any]]:
         with self._connect() as db:
             return [self._work_item(db, row) for row in db.execute(
-                "SELECT * FROM work_items WHERE mission_id = ? ORDER BY created_at, id", (mission_id,))]
+                "SELECT * FROM work_items WHERE mission_id = ? ORDER BY created_at, rowid", (mission_id,))]
 
     def release_work_claim(self, mission_id: str, agent_id: str, work_item_id: str,
                            reason: str) -> dict[str, Any] | None:

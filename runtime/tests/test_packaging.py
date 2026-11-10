@@ -191,9 +191,10 @@ class DesktopBundleTests(unittest.TestCase):
             nsis.parent.mkdir(parents=True)
             msi.write_bytes(b"msi")
             nsis.write_bytes(b"nsis")
-            self.assertEqual(
-                verify_bundles(root, "x86_64-pc-windows-msvc"), [msi, nsis],
-            )
+            with patch("sys.platform", "linux"):
+                self.assertEqual(
+                    verify_bundles(root, "x86_64-pc-windows-msvc"), [msi, nsis],
+                )
 
     def test_windows_build_rejects_a_missing_installer_format(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tribe-incomplete-bundle-") as directory:
