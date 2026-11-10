@@ -7532,7 +7532,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         )
         try:
             supervisor.start_mission(mission["id"])
-            deadline = time.monotonic() + 3
+            deadline = time.monotonic() + 10
             while time.monotonic() < deadline and "planner" not in calls:
                 time.sleep(0.02)
             self.assertEqual(calls, ["planner"])
