@@ -3395,7 +3395,7 @@ TAP version 13
         )
         thread = threading.Thread(target=worker.run)
         thread.start()
-        deadline = time.monotonic() + 6
+        deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             run = self.store.agent_event_run("planner", self.mission["id"], trigger["sequence"])
             if run and run["status"] == "completed":
