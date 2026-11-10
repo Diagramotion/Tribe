@@ -8763,7 +8763,7 @@ class ScheduleCase(RuntimeCase):
         recovered_path = self.repository / "src" / "recovered.py"
         recovered_path.parent.mkdir(parents=True, exist_ok=True)
         recovered_content = "completed before process restart\n"
-        recovered_path.write_text(recovered_content, encoding="utf-8")
+        recovered_path.write_text(recovered_content, encoding="utf-8", newline="\n")
         expected_hash = hashlib.sha256(recovered_content.encode("utf-8")).hexdigest()
         self.store.append("agent.tool.started", "builder", self.mission["id"], {
             "toolName": "write_file", "toolCallId": "write-after-crash",
@@ -8949,7 +8949,7 @@ store.append("repo.file.write.started", "builder", {self.mission["id"]!r}, {{
 }})
 target = Path({str(repository_file)!r})
 target.parent.mkdir(parents=True, exist_ok=True)
-with target.open("w", encoding="utf-8") as handle:
+with target.open("w", encoding="utf-8", newline="\\n") as handle:
     handle.write(content)
     handle.flush()
     os.fsync(handle.fileno())
