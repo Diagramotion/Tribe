@@ -4,6 +4,7 @@ import hashlib
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from tribe_runtime.store import MissionStore
@@ -91,7 +92,7 @@ class ExperimentRunStoreTests(unittest.TestCase):
             store.record_experiment_run(
                 mission["id"], "builder", "legacy", {"accuracy": 0.8}, model_path="model.bin",
             )
-            with sqlite3.connect(database) as db:
+            with closing(sqlite3.connect(database)) as db, db:
                 for column in ("model_fingerprint_status", "model_sha256", "model_file_size_bytes"):
                     db.execute(f"ALTER TABLE experiment_runs DROP COLUMN {column}")
                 db.execute("PRAGMA user_version = 46")

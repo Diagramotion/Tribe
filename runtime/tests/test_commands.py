@@ -115,26 +115,36 @@ class BackgroundCommandLaunchTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory(prefix="tribe-jupyter-env-") as directory:
             root = Path(directory)
-            local = root / ".venv" / "bin" / "jupyter"
+            scripts = "Scripts" if os.name == "nt" else "bin"
+            executable = "jupyter.exe" if os.name == "nt" else "jupyter"
+            local = root / ".venv" / scripts / executable
             local.parent.mkdir(parents=True)
-            local.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            local.chmod(0o755)
+            local.write_bytes(b"test executable")
+            if os.name != "nt":
+                local.chmod(0o755)
             (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
-            with patch("tribe_runtime.commands.shutil.which", side_effect=lambda name: name if name == str(local) else "/usr/bin/jupyter"):
+            fallback = r"C:\\Python\\Scripts\\jupyter.exe" if os.name == "nt" else "/usr/bin/jupyter"
+            with patch(
+                "tribe_runtime.commands.shutil.which",
+                side_effect=lambda name: name if name == str(local) else fallback,
+            ):
                 self.assertEqual(BackgroundCommandRunner._resolve_executable("jupyter", root), str(local))
             (root / "uv.lock").unlink()
-            with patch("tribe_runtime.commands.shutil.which", return_value="/usr/bin/jupyter"):
+            with patch("tribe_runtime.commands.shutil.which", return_value=fallback):
                 self.assertIsNone(BackgroundCommandRunner._resolve_executable("jupyter", root))
 
     def test_jupyter_can_use_a_selected_locked_project_environment(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tribe-jupyter-select-") as directory:
             root = Path(directory)
-            local = root / ".venv" / "bin" / "jupyter"
-            alternate = root / "venv" / "bin" / "jupyter"
+            script_dir = "Scripts" if os.name == "nt" else "bin"
+            executable = "jupyter.exe" if os.name == "nt" else "jupyter"
+            local = root / ".venv" / script_dir / executable
+            alternate = root / "venv" / script_dir / executable
             for script in (local, alternate):
                 script.parent.mkdir(parents=True, exist_ok=True)
-                script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-                script.chmod(0o755)
+                script.write_bytes(b"test executable")
+                if os.name != "nt":
+                    script.chmod(0o755)
             (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
             (root / "pyproject.toml").write_text("[project]\nname = 'sample'\nversion = '0.1.0'\n", encoding="utf-8")
 
