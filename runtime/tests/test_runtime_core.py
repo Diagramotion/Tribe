@@ -8773,9 +8773,10 @@ class ScheduleCase(RuntimeCase):
             "toolCallId": "write-after-crash", "triggerSequence": event["sequence"],
             "path": "src/recovered.py", "sha256": expected_hash, "change": "created",
         })
-        self.assertEqual(self.store.reconcile_completed_repository_writes(
+        reconciled_count = self.store.reconcile_completed_repository_writes(
             "builder", self.mission["id"], event["sequence"], started_at,
-        ), 2)
+        )
+        self.assertEqual(reconciled_count, 2, msg=f"recovery events: {self.store.events_after(self.mission['id'], 0)}")
         activity = self.store.events_after(self.mission["id"], event["sequence"])
         reconciled = next(
             item for item in activity if item["type"] == "agent.tool.completed"
@@ -8967,7 +8968,10 @@ os._exit(23)
         reclaimed = restarted_store.begin_agent_event("builder", self.mission["id"], event["sequence"])
 
         self.assertEqual(recovered, 1)
-        self.assertEqual(run["status"], "retrying")
+        self.assertEqual(
+            run["status"], "retrying",
+            msg=f"recovered run: {run}; events: {restarted_store.events_after(self.mission['id'], event['sequence'])}",
+        )
         self.assertTrue(reclaimed["claimed"])
         self.assertTrue(reclaimed["resume_checkpoint"])
         self.assertEqual(reclaimed["attempts"], 2)
