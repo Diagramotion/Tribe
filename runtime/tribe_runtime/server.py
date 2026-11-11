@@ -218,7 +218,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             safe_host = f"[{host}]" if ":" in host else host
             safe_origin = f"{parsed.scheme}://{safe_host}:{port}"
-        if re.fullmatch(r"[A-Za-z0-9:/.\\[\\]-]+", safe_origin) is None:
+        if re.fullmatch(r"[A-Za-z0-9:/.\x5B\x5D-]+", safe_origin) is None:
             return
         self.send_header("Access-Control-Allow-Origin", safe_origin)
         self.send_header("Vary", "Origin")
