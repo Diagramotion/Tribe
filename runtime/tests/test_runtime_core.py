@@ -2264,6 +2264,14 @@ TAP version 13
             self.store.add_artifact("../outside", "payload.txt", "text/plain", "user", b"blocked")
         with self.assertRaisesRegex(ValueError, "mission_not_found"):
             self.store.add_artifact("missing-mission", "payload.txt", "text/plain", "user", b"blocked")
+        artifact, _ = self.store.add_artifact(
+            self.mission["id"], "payload.txt", "text/plain", "user", b"contained"
+        )
+        artifact_root = (self.store.data_dir / "artifacts").resolve()
+        stored_path = Path(artifact["path"]).resolve()
+        self.assertEqual(stored_path.parent, artifact_root)
+        self.assertTrue(stored_path.is_file())
+        self.assertFalse((artifact_root / self.mission["id"]).exists())
 
     def test_workspace_backup_restores_shared_artifact_content_portably(self) -> None:
         self.store.append("message.created", "user", self.mission["id"], {"text": "Keep this event"})
