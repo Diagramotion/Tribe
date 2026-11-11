@@ -1,9 +1,29 @@
 import assert from "node:assert/strict";
+import { preparePackagePreview, sanitizePackageSvg } from "../src/domain/design-system-preview-sanitizer.js";
 import test, { after, before } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 import { addDesignSystemPackageFile, DESIGN_SYSTEM_PALETTE_STEPS, DESIGN_SYSTEM_PRESETS, MAX_DESIGN_SYSTEM_IMPORT_BYTES, compareDesignSystemSnapshots, contrastRatio, designSystemFromReference, designSystemGuideHeadings, designSystemPreviewThemeAttributes, designSystemPreviewThemeOptions, designSystemTokenCss, designSystemTokenJson, extractStaticThemeDeclarations, generateColourScale, generateDesignPalettes, mergeDesignSystemReferenceCapture, packageDesignTokenFile, packageTokensFromCss, parseDesignSystemImport, parseDesignSystemPackage, parseDesignSystemPackageLibrary, removeDesignSystemPackageFile, syncPackageTokens, validateDesignSystemPackageFilePath } from "../src/domain/design-systems.js";
+
+test("package previews parse HTML and remove executable markup and external navigation", () => {
+  const result = preparePackagePreview('<html class="theme"><head><link rel="stylesheet" href="./theme.css"><style>body{color:red}</style><script>alert(1)</script></head><body onload="alert(2)"><a href="javascript:alert(3)">safe text</a><img src="https://evil.test/x.png" onerror="alert(4)"><iframe src="https://evil.test"></iframe></body></html>', {
+    fixturePath: "preview.html",
+    theme: { className: "dark", value: "dark" },
+    resolveStylesheet: (href) => href === "./theme.css" ? "body{background:black}" : "",
+    resolveImage: () => "",
+  });
+  assert.match(result.body, /safe text/);
+  assert.doesNotMatch(result.body, /script|iframe|javascript:|onload=|onerror=|evil\.test/);
+  assert.deepEqual(result.styles, ["body{background:black}", "body{color:red}"]);
+  assert.match(result.htmlAttributes, /class="theme dark"/);
+});
+
+test("package SVG sanitisation removes script, external references and dangerous CSS URLs", () => {
+  const svg = sanitizePackageSvg('<svg xmlns="http://www.w3.org/2000/svg" onload="x"><script>x</script><foreignObject><iframe src="https://evil.test"></iframe></foreignObject><a href="javascript:x" onclick="x"><path style="fill:url(https://evil.test/a)"/></a></svg>');
+  assert.match(svg, /<svg/);
+  assert.doesNotMatch(svg, /script|foreignObject|iframe|javascript:|onclick=|onload=|evil\.test|url\(/i);
+});
 
 let vite;
 let DesignSystemsView;

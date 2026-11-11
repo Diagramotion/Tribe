@@ -2259,6 +2259,12 @@ TAP version 13
             ["Keep this event"],
         )
 
+    def test_artifact_store_rejects_unsafe_or_unknown_mission_ids(self) -> None:
+        with self.assertRaisesRegex(ValueError, "mission_id_invalid"):
+            self.store.add_artifact("../outside", "payload.txt", "text/plain", "user", b"blocked")
+        with self.assertRaisesRegex(ValueError, "mission_not_found"):
+            self.store.add_artifact("missing-mission", "payload.txt", "text/plain", "user", b"blocked")
+
     def test_workspace_backup_restores_shared_artifact_content_portably(self) -> None:
         self.store.append("message.created", "user", self.mission["id"], {"text": "Keep this event"})
         artifact, _ = self.store.add_artifact(

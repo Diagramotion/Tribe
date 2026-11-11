@@ -8104,6 +8104,11 @@ class MissionStore:
 
     def add_artifact(self, mission_id: str, name: str, media_type: str, created_by: str,
                      content: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not isinstance(mission_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", mission_id):
+            raise ValueError("mission_id_invalid")
+        with self._connect() as db:
+            if not db.execute("SELECT 1 FROM missions WHERE id = ?", (mission_id,)).fetchone():
+                raise ValueError("mission_not_found")
         artifact_id = str(uuid.uuid4())
         safe_name = Path(name).name.strip()[:255]
         if not safe_name or len(content) > 10_000_000:

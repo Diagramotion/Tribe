@@ -197,10 +197,62 @@ class Handler(BaseHTTPRequestHandler):
 
     def _cors_headers(self) -> None:
         origin = self.headers.get("Origin")
-        if origin and self._local_origin():
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
-            self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-PDF-Page-Count")
+        if not origin or any(ord(character) < 0x20 or ord(character) == 0x7F for character in origin):
+            return
+        parsed = urlparse(origin)
+        if parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            return
+        if not self._local_origin():
+            return
+        try:
+            port = parsed.port
+        except ValueError:
+            return
+        host = (parsed.hostname or "").lower()
+        try:
+            port = parsed.port
+        except ValueError:
+            return
+        safe_origins = {
+            ("http", "localhost", 4173): "http://localhost:4173",
+            ("http", "localhost", 4174): "http://localhost:4174",
+            ("http", "localhost", 5173): "http://localhost:5173",
+            ("http", "localhost", 5174): "http://localhost:5174",
+            ("http", "127.0.0.1", 4173): "http://127.0.0.1:4173",
+            ("http", "127.0.0.1", 4174): "http://127.0.0.1:4174",
+            ("http", "127.0.0.1", 5173): "http://127.0.0.1:5173",
+            ("http", "127.0.0.1", 5174): "http://127.0.0.1:5174",
+            ("http", "::1", 4173): "http://[::1]:4173",
+            ("http", "::1", 4174): "http://[::1]:4174",
+            ("http", "::1", 5173): "http://[::1]:5173",
+            ("http", "::1", 5174): "http://[::1]:5174",
+            ("http", "terminal.local", 4173): "http://terminal.local:4173",
+            ("http", "terminal.local", 4174): "http://terminal.local:4174",
+            ("http", "terminal.local", 5173): "http://terminal.local:5173",
+            ("http", "terminal.local", 5174): "http://terminal.local:5174",
+        }
+        safe_origin = safe_origins.get((parsed.scheme, host, port))
+        if safe_origin is None:
+            if parsed.scheme == "tauri" and host == "localhost" and port is None:
+                safe_origin = "tauri://localhost"
+            elif host == "tauri.localhost" and parsed.scheme == "https" and port is None:
+                safe_origin = "https://tauri.localhost"
+            elif host == "tauri.localhost" and parsed.scheme == "http" and port is None:
+                safe_origin = "http://tauri.localhost"
+            else:
+                configured_dev_origin = os.environ.get("TRIBE_DEV_ORIGIN", "").rstrip("/")
+                if (
+                    configured_dev_origin
+                    and origin.rstrip("/") == configured_dev_origin
+                    and parsed.scheme == "http"
+                    and host in {"localhost", "127.0.0.1", "::1"}
+                ):
+                    safe_origin = configured_dev_origin
+                else:
+                    return
+        self.send_header("Access-Control-Allow-Origin", safe_origin)
+        self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-PDF-Page-Count")
 
     def _body(self) -> dict:
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
