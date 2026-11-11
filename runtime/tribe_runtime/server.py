@@ -22,7 +22,7 @@ import time
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from .agent_runtime import AgentSupervisor
 from .agents import (
@@ -220,6 +220,7 @@ class Handler(BaseHTTPRequestHandler):
             safe_origin = f"{parsed.scheme}://{safe_host}:{port}"
         if re.fullmatch(r"[A-Za-z0-9:/.\x5B\x5D-]+", safe_origin) is None:
             return
+        safe_origin = quote(safe_origin, safe="/:[]")
         self.send_header("Access-Control-Allow-Origin", safe_origin)
         self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-PDF-Page-Count")
