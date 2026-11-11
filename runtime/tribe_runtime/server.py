@@ -218,6 +218,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             safe_host = f"[{host}]" if ":" in host else host
             safe_origin = f"{parsed.scheme}://{safe_host}:{port}"
+        if re.fullmatch(r"[A-Za-z0-9:/\\.\\[\\]-]+", safe_origin) is None:
+            return
         self.send_header("Access-Control-Allow-Origin", safe_origin)
         self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-PDF-Page-Count")
