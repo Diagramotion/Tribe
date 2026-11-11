@@ -3144,7 +3144,7 @@ export function App() {
         </div>}
 
         <div className="tab-content">{requiresProject && !project.id ? <section className="empty-workspace">
-          <span className="eyebrow">A local workspace for engineering work</span>
+          <span className="eyebrow">A local workspace for AI teams</span>
           <h2>Start with a project folder</h2>
           <p>Choose an existing folder, including an empty one, or clone a Git repository. Your project and chat history stay on this device.</p>
           <button className="button button--primary" onClick={(event) => openProjectCreate(event.currentTarget)} type="button"><FolderSimple size={16} /> Add a project</button>
