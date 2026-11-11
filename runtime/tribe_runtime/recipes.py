@@ -360,12 +360,12 @@ def list_recipe_versions(builtin_dir: Path, user_dir: Path, recipe_id: str) -> l
             int(match.group(1)) for path in history.glob("v*.md")
             if (match := re.fullmatch(r"v(\d+)\.md", path.name))
         )
-    for path in (
-        _contained_path(user_dir, f"{recipe_id}.md"),
-        _contained_path(builtin_dir, f"{recipe_id}.md"),
+    for path, source in (
+        (_contained_path(user_dir, f"{recipe_id}.md"), "user"),
+        (_contained_path(builtin_dir, f"{recipe_id}.md"), "builtin"),
     ):
         if path.is_file():
-            versions.add(_parse(path, "user" if path.parent == user_dir else "builtin").version)
+            versions.add(_parse(path, source).version)
     return sorted(versions, reverse=True)
 
 
