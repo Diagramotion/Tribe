@@ -22,7 +22,7 @@ import time
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .agent_runtime import AgentSupervisor
 from .agents import (
@@ -209,18 +209,44 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return
         host = (parsed.hostname or "").lower()
-        if parsed.scheme == "tauri" and host == "localhost" and port is None:
-            safe_origin = "tauri://localhost"
-        elif host == "tauri.localhost" and parsed.scheme in {"http", "https"} and port is None:
-            safe_origin = f"{parsed.scheme}://tauri.localhost"
-        else:
-            if not port:
-                return
-            safe_host = f"[{host}]" if ":" in host else host
-            safe_origin = f"{parsed.scheme}://{safe_host}:{port}"
-        if re.fullmatch(r"[A-Za-z0-9:/.\x5B\x5D-]+", safe_origin) is None:
-            return
-        safe_origin = quote(safe_origin, safe="/:[]")
+        port = parsed.port
+        safe_origins = {
+            ("http", "localhost", 4173): "http://localhost:4173",
+            ("http", "localhost", 4174): "http://localhost:4174",
+            ("http", "localhost", 5173): "http://localhost:5173",
+            ("http", "localhost", 5174): "http://localhost:5174",
+            ("http", "127.0.0.1", 4173): "http://127.0.0.1:4173",
+            ("http", "127.0.0.1", 4174): "http://127.0.0.1:4174",
+            ("http", "127.0.0.1", 5173): "http://127.0.0.1:5173",
+            ("http", "127.0.0.1", 5174): "http://127.0.0.1:5174",
+            ("http", "::1", 4173): "http://[::1]:4173",
+            ("http", "::1", 4174): "http://[::1]:4174",
+            ("http", "::1", 5173): "http://[::1]:5173",
+            ("http", "::1", 5174): "http://[::1]:5174",
+            ("http", "terminal.local", 4173): "http://terminal.local:4173",
+            ("http", "terminal.local", 4174): "http://terminal.local:4174",
+            ("http", "terminal.local", 5173): "http://terminal.local:5173",
+            ("http", "terminal.local", 5174): "http://terminal.local:5174",
+        }
+        safe_origin = safe_origins.get((parsed.scheme, host, port))
+        if safe_origin is None:
+            if parsed.scheme == "tauri" and host == "localhost" and port is None:
+                safe_origin = "tauri://localhost"
+            elif host == "tauri.localhost" and parsed.scheme == "https" and port is None:
+                safe_origin = "https://tauri.localhost"
+            elif host == "tauri.localhost" and parsed.scheme == "http" and port is None:
+                safe_origin = "http://tauri.localhost"
+            else:
+                configured_dev_origin = os.environ.get("TRIBE_DEV_ORIGIN", "").rstrip("/")
+                if (
+                    configured_dev_origin
+                    and origin.rstrip("/") == configured_dev_origin
+                    and parsed.scheme == "http"
+                    and host in {"localhost", "127.0.0.1", "::1"}
+                ):
+                    safe_origin = configured_dev_origin
+                else:
+                    return
         self.send_header("Access-Control-Allow-Origin", safe_origin)
         self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-PDF-Page-Count")
