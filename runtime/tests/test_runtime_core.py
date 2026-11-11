@@ -5565,7 +5565,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertEqual(agent.repository_access, "read_only")
         self.assertEqual(loaded.repository_access, "read_only")
         self.assertEqual(loaded.capabilities, ("repository_read",))
-        stored_definition = directory / loaded.file_name
+        stored_definition = next(directory.glob("*.md"))
         self.assertIn("repository_access: read_only", stored_definition.read_text())
         self.assertIn('capabilities: ["repository_read"]',
                       stored_definition.read_text())
@@ -5928,7 +5928,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertEqual(agent.name, 'Security: "Audit"')
         self.assertIn("Inspect trust boundaries", agent.instructions)
         self.assertEqual(agent.model, "anthropic:claude-sonnet-4-5")
-        stored_definition = directory / discover_agents(directory)[0].file_name
+        stored_definition = next(directory.glob("*.md"))
         self.assertIn('model: "anthropic:claude-sonnet-4-5"', stored_definition.read_text())
         self.assertNotEqual(stored_definition.name, f"{agent.id}.md")
         self.assertEqual({item.id for item in definitions},
@@ -8035,7 +8035,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                     result = json.loads(response.read())
                 self.assertEqual(response.status, 201)
                 self.assertEqual(result["agent"]["id"], "security_auditor")
-                saved_definition = user_directory / discover_agents(user_directory)[0].file_name
+                saved_definition = next(user_directory.glob("*.md"))
                 self.assertTrue(saved_definition.is_file())
                 self.assertEqual(supervisor.registered.id, "security_auditor")
 
@@ -8054,7 +8054,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                     updated = json.loads(response.read())
                 self.assertEqual(response.status, 200)
                 self.assertEqual(updated["agent"]["name"], "Security and privacy auditor")
-                updated_definition = user_directory / discover_agents(user_directory)[0].file_name
+                updated_definition = next(user_directory.glob("*.md"))
                 self.assertIn("data handling", updated_definition.read_text())
                 self.assertEqual(supervisor.updated.id, "security_auditor")
 
