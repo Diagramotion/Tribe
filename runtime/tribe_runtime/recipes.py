@@ -109,8 +109,10 @@ def _load_frontmatter(source: str, path: Path) -> dict[str, object]:
 
 @contextmanager
 def _recipe_lock(user_dir: Path):
+    user_dir.mkdir(parents=True, exist_ok=True)
+    lock_directory = user_dir / ".locks"
+    lock_directory.mkdir(parents=True, exist_ok=True)
     lock_path = _contained_path(user_dir, ".locks", "workflows.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
     with _RECIPE_LOCKS_GUARD:
         thread_lock = _RECIPE_LOCKS.setdefault(lock_path, threading.RLock())
     with thread_lock:
