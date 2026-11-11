@@ -53,7 +53,67 @@ jobs:
         run: npm run test:sites
       - name: UI projection tests
         run: npm run test:ui
-      - run: npm run tauri -- build --bundles ${{ matrix.bundles }} --target ${{ matrix.target }}
+      - name: Prepare macOS signing and notarization
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY KEYCHAIN_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing required GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
+
+          keychain_path="$RUNNER_TEMP/tribe-signing.keychain-db"
+          certificate_path="$RUNNER_TEMP/tribe-developer-id.p12"
+          api_key_path="$RUNNER_TEMP/Tribe-NotaryKey.p8"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$certificate_path"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" | base64 -D > "$api_key_path"
+          chmod 600 "$certificate_path" "$api_key_path"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$certificate_path" -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security default-keychain -d user -s "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" \
+            "$HOME/Library/Keychains/login.keychain-db" /Library/Keychains/System.keychain
+          security find-identity -v -p codesigning "$keychain_path" \
+            | grep -Fq "\"$APPLE_SIGNING_IDENTITY\"" || {
+              echo "::error::The configured identity is not present in the imported Developer ID certificate."
+              exit 1
+            }
+          echo "APPLE_API_KEY_PATH=$api_key_path" >> "$GITHUB_ENV"
+      - name: Build desktop bundle for CI
+        if: runner.os != 'macOS' || !startsWith(github.ref, 'refs/tags/v')
+        run: npm run tauri -- build --bundles ${{ matrix.bundles }} --target ${{ matrix.target }}
+      - name: Build and notarize macOS release app
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: npm run tauri -- build --bundles ${{ matrix.bundles }} --target ${{ matrix.target }}
+      - name: Remove macOS signing credentials
+        if: always() && runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/tribe-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/tribe-developer-id.p12" "$RUNNER_TEMP/Tribe-NotaryKey.p8"
       - name: Verify desktop bundle and app lifecycle
         run: python scripts/verify-desktop-bundles.py --target ${{ matrix.target }}
       - name: Native shell tests (macOS)
