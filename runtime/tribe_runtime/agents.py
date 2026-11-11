@@ -78,7 +78,8 @@ def discover_agents(directory: Path) -> list[AgentDefinition]:
     """Load Markdown role definitions, failing clearly on an invalid registry entry."""
     agents = []
     identifiers: set[str] = set()
-    for path in sorted(directory.glob("*.md")):
+    for candidate in sorted(directory.glob("*.md")):
+        path = _contained_agent_path(directory, candidate.name)
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeDecodeError) as error:
@@ -258,6 +259,7 @@ def _contained_agent_path(directory: Path, name: str) -> Path:
     if not candidate.is_relative_to(root):
         raise ValueError("agent_definition_path_invalid")
     return candidate
+
 
 def write_agent_definition(directory: Path, agent_id: str, name: str, role: str,
                            instructions: str, model: str = "",
