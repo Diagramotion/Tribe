@@ -34,6 +34,25 @@ class WorkflowVersionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "workflow_path_invalid"):
                 get_recipe(builtins, users, "outside-flow")
 
+    def test_workflow_lock_rejects_a_locks_directory_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            users = root / "users"
+            outside = root / "outside"
+            users.mkdir()
+            outside.mkdir()
+            try:
+                (users / ".locks").symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "workflow_path_invalid"):
+                save_recipe(
+                    users, "safe-flow", "Safe flow", "A local workflow.", "Guide.",
+                    root / "builtins",
+                )
+            self.assertEqual(list(outside.iterdir()), [])
+
     def test_agent_discovery_rejects_symlinks_outside_the_library(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
