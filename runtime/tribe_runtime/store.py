@@ -8113,8 +8113,17 @@ class MissionStore:
         safe_name = Path(name).name.strip()[:255]
         if not safe_name or len(content) > 10_000_000:
             raise ValueError("artifact name or size is invalid")
-        stored_path = self.data_dir / "artifacts" / mission_id / artifact_id
-        stored_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_root = self.data_dir / "artifacts"
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        artifact_root = artifact_root.resolve(strict=True)
+        mission_directory = (artifact_root / mission_id).resolve()
+        if not mission_directory.is_relative_to(artifact_root):
+            raise ValueError("artifact_path_invalid")
+        mission_directory.mkdir(parents=True, exist_ok=True)
+        mission_directory = mission_directory.resolve(strict=True)
+        if not mission_directory.is_relative_to(artifact_root):
+            raise ValueError("artifact_path_invalid")
+        stored_path = mission_directory / artifact_id
         temporary_path = stored_path.with_suffix(".tmp")
         temporary_path.write_bytes(content)
         artifact = {"id": artifact_id, "mission_id": mission_id, "name": safe_name,
