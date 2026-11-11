@@ -18,6 +18,15 @@ _RECIPE_LOCKS_GUARD = threading.Lock()
 _RECIPE_LOCKS: dict[Path, threading.RLock] = {}
 
 
+def _contained_path(root: Path, *parts: str) -> Path:
+    """Resolve a workflow path and reject symlinks or names escaping its root."""
+    resolved_root = root.resolve()
+    candidate = resolved_root.joinpath(*parts).resolve()
+    if not candidate.is_relative_to(resolved_root):
+        raise ValueError("workflow_path_invalid")
+    return candidate
+
+
 class WorkflowVersionConflict(ValueError):
     def __init__(self, current_version: int | None):
         super().__init__("workflow_version_conflict")
@@ -55,7 +64,7 @@ def _load_frontmatter(source: str, path: Path) -> dict[str, object]:
 
 @contextmanager
 def _recipe_lock(user_dir: Path, recipe_id: str):
-    lock_path = (user_dir / ".locks" / f"{recipe_id}.lock").resolve()
+    lock_path = _contained_path(user_dir, ".locks", f"{recipe_id}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with _RECIPE_LOCKS_GUARD:
         thread_lock = _RECIPE_LOCKS.setdefault(lock_path, threading.RLock())
@@ -309,7 +318,8 @@ def list_recipes(builtin_dir: Path, user_dir: Path) -> list[WorkflowRecipe]:
     for directory, source in ((builtin_dir, "builtin"), (user_dir, "user")):
         if not directory.is_dir():
             continue
-        for path in sorted(directory.glob("*.md")):
+        for candidate in sorted(directory.glob("*.md")):
+            path = _contained_path(directory, candidate.name)
             recipe = _parse(path, source)
             recipes[recipe.id] = recipe
     return sorted(recipes.values(), key=lambda recipe: (recipe.source != "builtin", recipe.title.casefold()))
@@ -324,15 +334,15 @@ def get_recipe(builtin_dir: Path, user_dir: Path, recipe_id: str,
     ):
         return None
     if version is None:
-        user_path = user_dir / f"{recipe_id}.md"
+        user_path = _contained_path(user_dir, f"{recipe_id}.md")
         if user_path.is_file():
             return _parse(user_path, "user")
-        builtin_path = builtin_dir / f"{recipe_id}.md"
+        builtin_path = _contained_path(builtin_dir, f"{recipe_id}.md")
         return _parse(builtin_path, "builtin") if builtin_path.is_file() else None
-    versioned = user_dir / ".versions" / recipe_id / f"v{version}.md"
+    versioned = _contained_path(user_dir, ".versions", recipe_id, f"v{version}.md")
     if versioned.is_file():
         return _parse(versioned, "user")
-    builtin = builtin_dir / f"{recipe_id}.md"
+    builtin = _contained_path(builtin_dir, f"{recipe_id}.md")
     if builtin.is_file():
         recipe = _parse(builtin, "builtin")
         return recipe if recipe.version == version else None
@@ -344,13 +354,16 @@ def list_recipe_versions(builtin_dir: Path, user_dir: Path, recipe_id: str) -> l
     if not isinstance(recipe_id, str) or not RECIPE_ID.fullmatch(recipe_id):
         return []
     versions: set[int] = set()
-    history = user_dir / ".versions" / recipe_id
+    history = _contained_path(user_dir, ".versions", recipe_id)
     if history.is_dir():
         versions.update(
             int(match.group(1)) for path in history.glob("v*.md")
             if (match := re.fullmatch(r"v(\d+)\.md", path.name))
         )
-    for path in (user_dir / f"{recipe_id}.md", builtin_dir / f"{recipe_id}.md"):
+    for path in (
+        _contained_path(user_dir, f"{recipe_id}.md"),
+        _contained_path(builtin_dir, f"{recipe_id}.md"),
+    ):
         if path.is_file():
             versions.add(_parse(path, "user" if path.parent == user_dir else "builtin").version)
     return sorted(versions, reverse=True)
@@ -457,8 +470,8 @@ def _save_recipe_unlocked(user_dir: Path, recipe_id: str, title: str, descriptio
         f"{instructions}\n"
     )
     user_dir.mkdir(parents=True, exist_ok=True)
-    path = user_dir / f"{recipe_id}.md"
-    descriptor, temporary_path = tempfile.mkstemp(prefix=f".{recipe_id}-", suffix=".md", dir=user_dir)
+    path = _contained_path(user_dir, f"{recipe_id}.md")
+    descriptor, temporary_path = tempfile.mkstemp(prefix=".workflow-", suffix=".md", dir=user_dir)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as target:
             target.write(content)
@@ -466,13 +479,13 @@ def _save_recipe_unlocked(user_dir: Path, recipe_id: str, title: str, descriptio
             os.fsync(target.fileno())
         recipe = _parse(Path(temporary_path), "user")
         history.mkdir(parents=True, exist_ok=True)
-        version_path = history / f"v{version}.md"
+        version_path = _contained_path(history, f"v{version}.md")
         if version_path.exists():
             if version_path.read_text(encoding="utf-8") != content:
                 raise ValueError("workflow_version_is_immutable")
         else:
             version_descriptor, version_temporary = tempfile.mkstemp(
-                prefix=f".v{version}-", suffix=".md", dir=history,
+                prefix=".workflow-version-", suffix=".md", dir=history,
             )
             try:
                 with os.fdopen(version_descriptor, "w", encoding="utf-8") as target:
