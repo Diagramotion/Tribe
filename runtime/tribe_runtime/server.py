@@ -204,16 +204,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._local_origin():
             return
+        try:
+            port = parsed.port
+        except ValueError:
+            return
         host = (parsed.hostname or "").lower()
-        if parsed.scheme == "tauri" and host == "localhost":
+        if parsed.scheme == "tauri" and host == "localhost" and port is None:
             safe_origin = "tauri://localhost"
-        elif host == "tauri.localhost" and parsed.scheme in {"http", "https"} and parsed.port is None:
+        elif host == "tauri.localhost" and parsed.scheme in {"http", "https"} and port is None:
             safe_origin = f"{parsed.scheme}://tauri.localhost"
         else:
-            try:
-                port = parsed.port
-            except ValueError:
-                return
             if not port:
                 return
             safe_host = f"[{host}]" if ":" in host else host
