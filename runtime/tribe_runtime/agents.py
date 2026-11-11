@@ -294,7 +294,7 @@ def update_agent_definition(directory: Path, agent_id: str, name: str, role: str
     )
     if identifier != agent_id:
         raise ValueError("agent id cannot be changed")
-    path = directory / f"{identifier}.md"
+    path = _contained_agent_path(directory, f"{identifier}.md")
     if not path.is_file():
         raise ValueError("user_agent_not_found")
     temporary = _contained_agent_path(directory, f".agent-{uuid.uuid4().hex}.tmp")
