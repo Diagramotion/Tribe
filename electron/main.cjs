@@ -1629,6 +1629,7 @@ function browserAutomationRequest(request, response) {
       }
       if (e2e && action === "extract-design-reference") {
         const scopeBase64 = Buffer.from(JSON.stringify(scope), "utf8").toString("base64");
+        if (!/^[A-Za-z0-9+/]*={0,2}$/.test(scopeBase64)) throw new Error("Invalid encoded browser scope");
         const result = await mainWindow.webContents.executeJavaScript(
           `(async () => { const bytes = Uint8Array.from(atob("${scopeBase64}"), (value) => value.charCodeAt(0)); return window.tribeDesktopBrowser.extractDesignReference(JSON.parse(new TextDecoder().decode(bytes))); })()`,
           true,
