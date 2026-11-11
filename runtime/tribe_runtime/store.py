@@ -1882,11 +1882,13 @@ class MissionStore:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
-        artifact_directory = (self.data_dir / "artifacts" / mission_id)
-        try:
-            artifact_directory.rmdir()
-        except OSError:
-            pass
+        artifact_root = (self.data_dir / "artifacts").resolve()
+        artifact_directory = (artifact_root / mission["id"]).resolve()
+        if artifact_directory.is_relative_to(artifact_root):
+            try:
+                artifact_directory.rmdir()
+            except OSError:
+                pass
         return {"id": mission_id, "title": mission["title"]}
 
     def delete_project(self, project_id: str) -> dict[str, Any] | None:
