@@ -328,7 +328,7 @@ def archive_agent_definition(directory: Path, agent_id: str) -> Path:
     archive_directory = _contained_agent_path(directory, "archive")
     archive_directory.mkdir(parents=True, exist_ok=True)
     destination = _contained_agent_path(
-        archive_directory, f"{agent_id}-{uuid.uuid4().hex[:8]}.md",
+        archive_directory, f"{uuid.uuid4().hex}.md",
     )
     source.replace(destination)
     return destination
