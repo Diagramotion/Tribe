@@ -209,7 +209,10 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return
         host = (parsed.hostname or "").lower()
-        port = parsed.port
+        try:
+            port = parsed.port
+        except ValueError:
+            return
         safe_origins = {
             ("http", "localhost", 4173): "http://localhost:4173",
             ("http", "localhost", 4174): "http://localhost:4174",
