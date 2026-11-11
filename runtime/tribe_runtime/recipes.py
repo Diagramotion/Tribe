@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 import threading
+import uuid
 from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -25,6 +26,50 @@ def _contained_path(root: Path, *parts: str) -> Path:
     if not candidate.is_relative_to(resolved_root):
         raise ValueError("workflow_path_invalid")
     return candidate
+
+
+def _iter_recipe_files(directory: Path):
+    if not directory.is_dir():
+        return
+    for candidate in sorted(directory.glob("*.md")):
+        yield _contained_path(directory, candidate.name)
+
+
+def _iter_history_files(user_dir: Path):
+    history_root = user_dir / ".versions"
+    if not history_root.is_dir():
+        return
+    for directory in sorted(history_root.iterdir()):
+        if not directory.is_dir():
+            continue
+        history = _contained_path(history_root, directory.name)
+        for candidate in sorted(history.glob("v*.md")):
+            yield _contained_path(history, candidate.name)
+
+
+def _find_recipe_path(directory: Path, recipe_id: str, source: str) -> Path | None:
+    for path in _iter_recipe_files(directory):
+        if _parse(path, source).id == recipe_id:
+            return path
+    return None
+
+
+def _find_history_directory(user_dir: Path, recipe_id: str) -> Path | None:
+    history_root = user_dir / ".versions"
+    if not history_root.is_dir():
+        return None
+    for directory in sorted(history_root.iterdir()):
+        if not directory.is_dir():
+            continue
+        history = _contained_path(history_root, directory.name)
+        for candidate in sorted(history.glob("v*.md")):
+            path = _contained_path(history, candidate.name)
+            try:
+                if _parse(path, "user").id == recipe_id:
+                    return history
+            except (OSError, ValueError):
+                continue
+    return None
 
 
 class WorkflowVersionConflict(ValueError):
@@ -63,8 +108,8 @@ def _load_frontmatter(source: str, path: Path) -> dict[str, object]:
 
 
 @contextmanager
-def _recipe_lock(user_dir: Path, recipe_id: str):
-    lock_path = _contained_path(user_dir, ".locks", f"{recipe_id}.lock")
+def _recipe_lock(user_dir: Path):
+    lock_path = _contained_path(user_dir, ".locks", "workflows.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with _RECIPE_LOCKS_GUARD:
         thread_lock = _RECIPE_LOCKS.setdefault(lock_path, threading.RLock())
@@ -318,8 +363,7 @@ def list_recipes(builtin_dir: Path, user_dir: Path) -> list[WorkflowRecipe]:
     for directory, source in ((builtin_dir, "builtin"), (user_dir, "user")):
         if not directory.is_dir():
             continue
-        for candidate in sorted(directory.glob("*.md")):
-            path = _contained_path(directory, candidate.name)
+        for path in _iter_recipe_files(directory):
             recipe = _parse(path, source)
             recipes[recipe.id] = recipe
     return sorted(recipes.values(), key=lambda recipe: (recipe.source != "builtin", recipe.title.casefold()))
@@ -333,19 +377,19 @@ def get_recipe(builtin_dir: Path, user_dir: Path, recipe_id: str,
         isinstance(version, bool) or not isinstance(version, int) or version < 1
     ):
         return None
-    if version is None:
-        user_path = _contained_path(user_dir, f"{recipe_id}.md")
-        if user_path.is_file():
-            return _parse(user_path, "user")
-        builtin_path = _contained_path(builtin_dir, f"{recipe_id}.md")
-        return _parse(builtin_path, "builtin") if builtin_path.is_file() else None
-    versioned = _contained_path(user_dir, ".versions", recipe_id, f"v{version}.md")
-    if versioned.is_file():
-        return _parse(versioned, "user")
-    builtin = _contained_path(builtin_dir, f"{recipe_id}.md")
-    if builtin.is_file():
-        recipe = _parse(builtin, "builtin")
-        return recipe if recipe.version == version else None
+    for path in _iter_recipe_files(user_dir):
+        recipe = _parse(path, "user")
+        if recipe.id == recipe_id and (version is None or recipe.version == version):
+            return recipe
+    if version is not None:
+        for path in _iter_history_files(user_dir):
+            recipe = _parse(path, "user")
+            if recipe.id == recipe_id and recipe.version == version:
+                return recipe
+    for path in _iter_recipe_files(builtin_dir):
+        recipe = _parse(path, "builtin")
+        if recipe.id == recipe_id and (version is None or recipe.version == version):
+            return recipe
     return None
 
 
@@ -354,17 +398,13 @@ def list_recipe_versions(builtin_dir: Path, user_dir: Path, recipe_id: str) -> l
     if not isinstance(recipe_id, str) or not RECIPE_ID.fullmatch(recipe_id):
         return []
     versions: set[int] = set()
-    history = _contained_path(user_dir, ".versions", recipe_id)
-    if history.is_dir():
-        versions.update(
-            int(match.group(1)) for path in history.glob("v*.md")
-            if (match := re.fullmatch(r"v(\d+)\.md", path.name))
-        )
-    for path, source in (
-        (_contained_path(user_dir, f"{recipe_id}.md"), "user"),
-        (_contained_path(builtin_dir, f"{recipe_id}.md"), "builtin"),
-    ):
-        if path.is_file():
+    for path in _iter_history_files(user_dir):
+        recipe = _parse(path, "user")
+        if recipe.id == recipe_id:
+            versions.add(recipe.version)
+    for directory, source in ((user_dir, "user"), (builtin_dir, "builtin")):
+        path = _find_recipe_path(directory, recipe_id, source)
+        if path is not None:
             versions.add(_parse(path, source).version)
     return sorted(versions, reverse=True)
 
@@ -378,7 +418,7 @@ def save_recipe(user_dir: Path, recipe_id: str, title: str, description: str,
                 expected_version: object = _EXPECTED_VERSION_UNSET) -> WorkflowRecipe:
     if not isinstance(recipe_id, str) or not RECIPE_ID.fullmatch(recipe_id):
         raise ValueError("recipe_id_must_be_2_to_64_lowercase_letters_digits_underscore_or_hyphen")
-    with _recipe_lock(user_dir, recipe_id):
+    with _recipe_lock(user_dir):
         return _save_recipe_unlocked(
             user_dir, recipe_id, title, description, instructions, builtin_dir,
             stages, objective, rules, tags, initial_stage, terminal_stages, transitions,
@@ -409,11 +449,10 @@ def _save_recipe_unlocked(user_dir: Path, recipe_id: str, title: str, descriptio
         current_version = current.version if current else 0
         if expected_version != current_version:
             raise WorkflowVersionConflict(current.version if current else None)
-    history = user_dir / ".versions" / recipe_id
     historical_versions = [
-        int(match.group(1))
-        for candidate in history.glob("v*.md") if (match := re.fullmatch(r"v(\d+)\.md", candidate.name))
-    ] if history.is_dir() else []
+        recipe.version for candidate in _iter_history_files(user_dir)
+        if (recipe := _parse(candidate, "user")).id == recipe_id
+    ]
     saved_stages = _normalise_stages(
         stages if stages is not None else list(current.stages) if current else [],
         graph_transitions=transitions,
@@ -470,7 +509,12 @@ def _save_recipe_unlocked(user_dir: Path, recipe_id: str, title: str, descriptio
         f"{instructions}\n"
     )
     user_dir.mkdir(parents=True, exist_ok=True)
-    path = _contained_path(user_dir, f"{recipe_id}.md")
+    path = _find_recipe_path(user_dir, recipe_id, "user")
+    if path is None:
+        path = _contained_path(user_dir, f"{uuid.uuid4().hex}.md")
+    history = _find_history_directory(user_dir, recipe_id)
+    if history is None:
+        history = _contained_path(user_dir / ".versions", uuid.uuid4().hex)
     descriptor, temporary_path = tempfile.mkstemp(prefix=".workflow-", suffix=".md", dir=user_dir)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as target:

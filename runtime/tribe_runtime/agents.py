@@ -271,7 +271,9 @@ def write_agent_definition(directory: Path, agent_id: str, name: str, role: str,
         agent_id, name, role, instructions, model, repository_access, effort, tool_permissions
     )
     directory.mkdir(parents=True, exist_ok=True)
-    path = _contained_agent_path(directory, f"{identifier}.md")
+    if any(agent.id == identifier for agent in discover_agents(directory)):
+        raise ValueError(f"agent id {identifier!r} already exists in the user library")
+    path = _contained_agent_path(directory, f"{uuid.uuid4().hex}.md")
     try:
         with path.open("x", encoding="utf-8", newline="\n") as definition_file:
             definition_file.write(content)
@@ -296,9 +298,12 @@ def update_agent_definition(directory: Path, agent_id: str, name: str, role: str
     )
     if identifier != agent_id:
         raise ValueError("agent id cannot be changed")
-    path = _contained_agent_path(directory, f"{identifier}.md")
-    if not path.is_file():
+    definition = next(
+        (agent for agent in discover_agents(directory) if agent.id == identifier), None,
+    )
+    if definition is None:
         raise ValueError("user_agent_not_found")
+    path = _contained_agent_path(directory, definition.file_name)
     temporary = _contained_agent_path(directory, f".agent-{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("x", encoding="utf-8", newline="\n") as definition_file:
@@ -314,9 +319,12 @@ def archive_agent_definition(directory: Path, agent_id: str) -> Path:
     """Move a user role out of the active library without destroying its Markdown source."""
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,49}", agent_id):
         raise ValueError("invalid_agent_id")
-    source = _contained_agent_path(directory, f"{agent_id}.md")
-    if not source.is_file():
+    definition = next(
+        (agent for agent in discover_agents(directory) if agent.id == agent_id), None,
+    )
+    if definition is None:
         raise ValueError("user_agent_not_found")
+    source = _contained_agent_path(directory, definition.file_name)
     archive_directory = _contained_agent_path(directory, "archive")
     archive_directory.mkdir(parents=True, exist_ok=True)
     destination = _contained_agent_path(
