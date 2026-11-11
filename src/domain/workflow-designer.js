@@ -72,26 +72,71 @@ export function parseWorkflowFlowText(source, currentStages = []) {
     if (!definitions.has(id)) definitions.set(id, title || id);
     else if (title) definitions.set(id, title);
   };
-  const parseNode = (token) => {
-    const match = token.trim().match(/^([a-zA-Z0-9_-]+)(?:\[([\s\S]*?)\]|\(\[([\s\S]*?)\]\))?$/);
-    if (!match) return null;
-    const id = match[1];
-    let label = match[2] ?? match[3] ?? "";
+  const skipSpaces = (line, offset) => { while (offset < line.length && /\s/.test(line[offset])) offset += 1; return offset; };
+  const readNode = (line, offset) => {
+    const start = offset;
+    while (offset < line.length && /[a-zA-Z0-9_-]/.test(line[offset])) offset += 1;
+    if (offset === start) return null;
+    const id = line.slice(start, offset);
+    let label = "";
+    if (line[offset] === "[") {
+      const end = line.indexOf("]", offset + 1);
+      if (end < 0) return null;
+      label = line.slice(offset + 1, end);
+      offset = end + 1;
+    } else if (line.startsWith("([", offset)) {
+      const end = line.indexOf("])" , offset + 2);
+      if (end < 0) return null;
+      label = line.slice(offset + 2, end);
+      offset = end + 2;
+    }
+    return { id, label, offset };
+  };
+  const decodeLabel = (id, rawLabel) => {
+    let label = rawLabel;
     try { if (label.startsWith('"') || label.startsWith("'")) label = JSON.parse(label.startsWith("'") ? `"${label.slice(1, -1).replaceAll('"', '\\"')}"` : label); }
     catch { errors.push(`Could not read the label for “${id}”.`); }
     return { id, label: String(label) };
   };
-  const linePattern = /^\s*([a-zA-Z0-9_-]+)(?:\[([\s\S]*?)\]|\(\[([\s\S]*?)\]\))?\s*-->(?:\|((?:\\.|[^|])*)\|)?\s*([a-zA-Z0-9_-]+)(?:\[([\s\S]*?)\]|\(\[([\s\S]*?)\]\))?\s*$/;
+  const parseNode = (line) => {
+    const node = readNode(line, skipSpaces(line, 0));
+    if (!node || skipSpaces(line, node.offset) !== line.length) return null;
+    return decodeLabel(node.id, node.label);
+  };
+  const parseEdge = (line) => {
+    let offset = skipSpaces(line, 0);
+    const from = readNode(line, offset);
+    if (!from) return null;
+    offset = skipSpaces(line, from.offset);
+    if (!line.startsWith("-->", offset)) return null;
+    offset = skipSpaces(line, offset + 3);
+    let when = "";
+    if (line[offset] === "|") {
+      offset += 1;
+      let branch = "";
+      let closed = false;
+      while (offset < line.length) {
+        if (line[offset] === "\\" && line[offset + 1] === "|") { branch += "|"; offset += 2; }
+        else if (line[offset] === "|") { offset += 1; closed = true; break; }
+        else branch += line[offset++];
+      }
+      if (!closed) return null;
+      when = branch.trim();
+    }
+    offset = skipSpaces(line, offset);
+    const to = readNode(line, offset);
+    if (!to || skipSpaces(line, to.offset) !== line.length) return null;
+    return { from: decodeLabel(from.id, from.label), to: decodeLabel(to.id, to.label), when };
+  };
   for (const [lineIndex, raw] of String(source ?? "").split(/\r?\n/).entries()) {
     const line = raw.trim();
     if (!line || line.startsWith("%%") || /^flowchart\s+(TD|TB|LR|RL|BT)$/i.test(line)) continue;
-    const match = line.match(linePattern);
-    if (match) {
-      const from = { id: match[1], label: match[2] ?? match[3] ?? "" };
-      const to = { id: match[5], label: match[6] ?? match[7] ?? "" };
+    const parsedEdge = parseEdge(line);
+    if (parsedEdge) {
+      const { from, to } = parsedEdge;
       ensureNode(from.id, from.label);
       ensureNode(to.id, to.label);
-      edges.push({ from: from.id, to: to.id, when: (match[4] ?? "").replaceAll("\\|", "|").trim() });
+      edges.push({ from: from.id, to: to.id, when: parsedEdge.when });
       continue;
     }
     const node = parseNode(line);

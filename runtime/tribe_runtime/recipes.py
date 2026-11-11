@@ -317,6 +317,12 @@ def list_recipes(builtin_dir: Path, user_dir: Path) -> list[WorkflowRecipe]:
 
 def get_recipe(builtin_dir: Path, user_dir: Path, recipe_id: str,
                version: int | None = None) -> WorkflowRecipe | None:
+    if not isinstance(recipe_id, str) or not RECIPE_ID.fullmatch(recipe_id):
+        return None
+    if version is not None and (
+        isinstance(version, bool) or not isinstance(version, int) or version < 1
+    ):
+        return None
     if version is None:
         user_path = user_dir / f"{recipe_id}.md"
         if user_path.is_file():
@@ -335,6 +341,8 @@ def get_recipe(builtin_dir: Path, user_dir: Path, recipe_id: str,
 
 def list_recipe_versions(builtin_dir: Path, user_dir: Path, recipe_id: str) -> list[int]:
     """Return every immutable version available for one workflow."""
+    if not isinstance(recipe_id, str) or not RECIPE_ID.fullmatch(recipe_id):
+        return []
     versions: set[int] = set()
     history = user_dir / ".versions" / recipe_id
     if history.is_dir():

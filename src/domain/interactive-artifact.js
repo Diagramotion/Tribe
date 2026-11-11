@@ -1,3 +1,10 @@
+import {
+  parseHtmlDocument,
+  prependTrustedHeadMarkup,
+  sanitizeMarkupTree,
+  serializeMarkup,
+} from "./markup-sanitizer.js";
+
 export function secureInteractiveDocument(source) {
   const policy = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'; worker-src 'none'; manifest-src 'none">`;
   const styles = `<style>
@@ -60,16 +67,8 @@ Object.defineProperty(window, "tribe", { configurable: false, writable: false, v
   window.setTimeout(reportHeight, 0);
 })();
 </script>`;
-  const html = source
-    .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?refresh[^>]*>/gi, "")
-    .replace(/<(?:iframe|frame|object|embed)\b[^>]*>[\s\S]*?<\/(?:iframe|frame|object|embed)\s*>/gi, "")
-    .replace(/<(?:iframe|frame|object|embed)\b[^>]*\/?\s*>/gi, "")
-    .replace(/<base\b[^>]*>/gi, "");
-  if (/<head(?:\s[^>]*)?>/i.test(html)) {
-    return html.replace(/<head(?:\s[^>]*)?>/i, (head) => `${head}${policy}${styles}${bridge}`);
-  }
-  if (/<html(?:\s[^>]*)?>/i.test(html)) {
-    return html.replace(/<html(?:\s[^>]*)?>/i, (root) => `${root}<head>${policy}${styles}${bridge}</head>`);
-  }
-  return `<!doctype html><head>${policy}${styles}${bridge}</head><body>${html}</body>`;
+  const document = parseHtmlDocument(source);
+  sanitizeMarkupTree(document, { removeLinks: true, removeNavigation: true, removeSources: true });
+  prependTrustedHeadMarkup(document, `${policy}${styles}${bridge}`);
+  return serializeMarkup(document);
 }

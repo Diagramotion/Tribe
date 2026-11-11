@@ -6,6 +6,12 @@ from tribe_runtime.recipes import WorkflowVersionConflict, get_recipe, list_reci
 
 
 class WorkflowVersionTests(unittest.TestCase):
+    def test_recipe_read_helpers_reject_path_segments(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertIsNone(get_recipe(root / "builtins", root / "users", "../outside"))
+            self.assertEqual(list_recipe_versions(root / "builtins", root / "users", "../../outside"), [])
+
     def test_expected_version_is_checked_inside_the_workflow_save_lock(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

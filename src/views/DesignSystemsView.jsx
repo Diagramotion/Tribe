@@ -4,6 +4,7 @@ import { MarkdownContent } from "../components/MarkdownContent.jsx";
 import { SelectControl } from "../components/SelectControl.jsx";
 import { addDesignSystemPackageFile, DESIGN_SYSTEM_PRESETS, DESIGN_SYSTEM_VIEWPORTS, MAX_DESIGN_SYSTEM_IMPORT_BYTES, MAX_DESIGN_SYSTEM_SNAPSHOT_BYTES, compareDesignSystemSnapshots, contrastRatio, designSystemFromReference, designSystemGuideHeadings, designSystemPreviewThemeAttributes, designSystemPreviewThemeOptions, designSystemTokenCss, designSystemTokenJson, extractStaticThemeDeclarations, generateColourScale, generateDesignPalettes, mergeDesignSystemReferenceCapture, packageTokenInventory, packageTokensFromCss, parseDesignSystemImport, parseDesignSystemPackage, parseDesignSystemPackageLibrary, removeDesignSystemPackageFile, syncPackageTokens, validateDesignSystemPackageFilePath } from "../domain/design-systems.js";
 import { runtime } from "../api/runtime.js";
+import { preparePackagePreview, sanitizePackageSvg } from "../domain/design-system-preview-sanitizer.js";
 
 const viewportIcons = { wide: Desktop, tablet: DeviceTablet, mobile: DeviceMobile };
 const colorLabels = [
@@ -247,15 +248,9 @@ function packageLogo(system) {
 }
 
 function packageSvgDataUrl(asset) {
-  if (!asset || typeof asset.content !== "string" || asset.content.length > 150_000 || !/<svg\b/i.test(asset.content)) return "";
-  const svg = asset.content
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
-    .replace(/<foreignObject\b[^>]*>[\s\S]*?<\/foreignObject\s*>/gi, "")
-    .replace(/\s+on[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
-    .replace(/\s+(?:href|xlink:href)\s*=\s*(["'])(?!#)[\s\S]*?\1/gi, "")
-    .replace(/url\(\s*(["']?)#([\w.-]+)\1\s*\)/gi, "url(#$2)")
-    .replace(/url\([^)]*\)/gi, "none")
-    .replace(/@import[^;]*;/gi, "");
+  if (!asset || typeof asset.content !== "string" || asset.content.length > 150_000) return "";
+  const svg = sanitizePackageSvg(asset.content);
+  if (!svg) return "";
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
@@ -343,39 +338,20 @@ function packagePreview(system, path, themeOverride = "") {
   const tokenCss = system.packageFiles?.find((item) => item.path === "tokens.css")?.content ?? "";
   const cssBudget = { remaining: 1_000_000 };
   const css = packageCss(system, tokenCss, "tokens.css", new Set(["tokens.css"]), 0, cssBudget);
-  const linkedStyles = [];
-  let source = applyPackagePreviewTheme(fixture.content, designSystemPreviewThemeAttributes(system, themeOverride))
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
-    .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe\s*>/gi, "")
-    .replace(/\s+on[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "");
-  source = source.replace(/\s+(?:href|xlink:href|target|ping|action|formaction)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
-  source = source.replace(/<link\b([^>]*)>/gi, (tag, attributes) => {
-    const rel = attributes.match(/\brel\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
-    const href = attributes.match(/\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
-    if (!rel?.slice(1).find(Boolean)?.toLowerCase().split(/\s+/).includes("stylesheet")) return "";
-    const asset = packageAsset(system, fixture.path, href?.slice(1).find(Boolean));
-    if (!asset?.path.toLowerCase().endsWith(".css")) return "";
-    linkedStyles.push(packageCss(system, asset.content, asset.path, new Set([asset.path]), 0, cssBudget));
-    return "";
+  const theme = designSystemPreviewThemeAttributes(system, themeOverride);
+  const prepared = preparePackagePreview(fixture.content, {
+    fixturePath: fixture.path,
+    theme,
+    resolveStylesheet: (href) => {
+      const asset = packageAsset(system, fixture.path, href);
+      return asset?.path.toLowerCase().endsWith(".css")
+        ? packageCss(system, asset.content, asset.path, new Set([asset.path]), 0, cssBudget)
+        : "";
+    },
+    resolveImage: (src) => packageLogoDataUrl(packageAsset(system, fixture.path, src)),
   });
-  source = source
-    .replace(/<object\b[^>]*>[\s\S]*?<\/object\s*>/gi, "")
-    .replace(/<(?:object|embed|base)\b[^>]*>/gi, "")
-    .replace(/<meta\b(?=[^>]*http-equiv\s*=\s*["']?refresh)[^>]*>/gi, "");
-  source = source.replace(/<img\b([^>]*?)\bsrc\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))([^>]*)>/gi, (tag, before, _quoted, double, single, bare, after) => {
-    const asset = packageAsset(system, fixture.path, double ?? single ?? bare);
-    const dataUrl = packageLogoDataUrl(asset);
-    const withoutSource = `${before}${after}`;
-    return dataUrl ? `<img${withoutSource} src="${dataUrl}">` : `<img${withoutSource}>`;
-  });
-  const themeAttributes = designSystemPreviewThemeAttributes(system, themeOverride);
-  const body = source.match(/<body\b[^>]*>([\s\S]*?)<\/body\s*>/i)?.[1] ?? source.replace(/<head\b[^>]*>[\s\S]*?<\/head\s*>/gi, "");
-  const fixtureStyles = [
-    ...linkedStyles,
-    ...[...source.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi)]
-      .map((match) => packageCss(system, match[1], fixture.path, new Set(), 0, cssBudget)),
-  ].join("\n");
-  return `<!doctype html><html${packageRootAttributes(source, "html", themeAttributes)}><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:"><style>${css}\n${fixtureStyles}\nbody{margin:0;min-height:100vh}*{box-sizing:border-box}</style></head><body${packageRootAttributes(source, "body", themeAttributes)}>${body}</body></html>`;
+  const fixtureStyles = prepared.styles.map((style) => packageCss(system, style, fixture.path, new Set(), 0, cssBudget)).join("\n");
+  return `<!doctype html><html${prepared.htmlAttributes}><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:"><style>${css}\n${fixtureStyles}\nbody{margin:0;min-height:100vh}*{box-sizing:border-box}</style></head><body${prepared.bodyAttributes}>${prepared.body}</body></html>`;
 }
 
 export default function DesignSystemsView({ projects = [], onProjectDesignSystemChanged }) {

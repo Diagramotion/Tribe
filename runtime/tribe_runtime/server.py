@@ -197,10 +197,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def _cors_headers(self) -> None:
         origin = self.headers.get("Origin")
-        if origin and self._local_origin():
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
-            self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-PDF-Page-Count")
+        if not origin or any(ord(character) < 0x20 or ord(character) == 0x7F for character in origin):
+            return
+        parsed = urlparse(origin)
+        if parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            return
+        if not self._local_origin():
+            return
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme == "tauri" and host == "localhost":
+            safe_origin = "tauri://localhost"
+        elif host == "tauri.localhost" and parsed.scheme in {"http", "https"} and parsed.port is None:
+            safe_origin = f"{parsed.scheme}://tauri.localhost"
+        else:
+            try:
+                port = parsed.port
+            except ValueError:
+                return
+            if not port:
+                return
+            safe_host = f"[{host}]" if ":" in host else host
+            safe_origin = f"{parsed.scheme}://{safe_host}:{port}"
+        self.send_header("Access-Control-Allow-Origin", safe_origin)
+        self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Expose-Headers", "Content-Disposition, X-PDF-Page-Count")
 
     def _body(self) -> dict:
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
