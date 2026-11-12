@@ -93,7 +93,7 @@ Download the latest release for **Apple Silicon macOS** or **64-bit Windows**:
 
 **[View Tribe releases](https://github.com/Diagramotion/Tribe/releases/latest)**
 
-The macOS download is a zipped `.app`; Windows downloads include MSI and NSIS installers. Releases include SHA-256 checksums. Desktop installers are currently unsigned, so macOS Gatekeeper or Windows SmartScreen may show an initial trust prompt. Review the checksum and source before installing.
+The macOS download is a zipped `.app`; Windows downloads include MSI and NSIS installers. Releases include SHA-256 checksums. New macOS releases are signed with a Developer ID certificate and notarised; Windows installers remain unsigned and may show a SmartScreen trust prompt. Previously published releases are not changed retroactively. See [macOS release signing](docs/releases/macos-signing.md) for the release workflow requirements.
 
 The release contains the Tauri desktop application and local Python runtime. A managed Chromium browser is developed in a separate Electron shell and is not included in these Tauri downloads.
 
