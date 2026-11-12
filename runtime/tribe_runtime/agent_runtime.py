@@ -3052,9 +3052,11 @@ class PydanticAIProvider:
                     # before the model gets a chance to answer it.
                     input_tokens_limit=input_token_limit,
                     output_tokens_limit=output_token_limit, total_tokens_limit=token_limit,
-                    # Ollama explicitly rejects token counting before the request.
-                    # Its usage limits still apply to provider-reported usage after each response.
-                    count_tokens_before_request=not active_model.lower().startswith("ollama:"),
+                    # Ollama and OpenRouter do not support pre-request token counting.
+                    # Their usage limits still apply to provider-reported usage after each response.
+                    count_tokens_before_request=not active_model.lower().startswith((
+                        "ollama:", "openrouter:",
+                    )),
                 ),
             }
             if (isinstance(model_output_limit, int) and not isinstance(model_output_limit, bool)

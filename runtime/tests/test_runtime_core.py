@@ -2259,6 +2259,20 @@ TAP version 13
             ["Keep this event"],
         )
 
+    def test_artifact_store_rejects_unsafe_or_unknown_mission_ids(self) -> None:
+        with self.assertRaisesRegex(ValueError, "mission_id_invalid"):
+            self.store.add_artifact("../outside", "payload.txt", "text/plain", "user", b"blocked")
+        with self.assertRaisesRegex(ValueError, "mission_not_found"):
+            self.store.add_artifact("missing-mission", "payload.txt", "text/plain", "user", b"blocked")
+        artifact, _ = self.store.add_artifact(
+            self.mission["id"], "payload.txt", "text/plain", "user", b"contained"
+        )
+        artifact_root = (self.store.data_dir / "artifacts").resolve()
+        stored_path = Path(artifact["path"]).resolve()
+        self.assertEqual(stored_path.parent, artifact_root)
+        self.assertTrue(stored_path.is_file())
+        self.assertFalse((artifact_root / self.mission["id"]).exists())
+
     def test_workspace_backup_restores_shared_artifact_content_portably(self) -> None:
         self.store.append("message.created", "user", self.mission["id"], {"text": "Keep this event"})
         artifact, _ = self.store.add_artifact(
@@ -5559,9 +5573,10 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertEqual(agent.repository_access, "read_only")
         self.assertEqual(loaded.repository_access, "read_only")
         self.assertEqual(loaded.capabilities, ("repository_read",))
-        self.assertIn("repository_access: read_only", (directory / "auditor.md").read_text())
+        stored_definition = next(directory.glob("*.md"))
+        self.assertIn("repository_access: read_only", stored_definition.read_text())
         self.assertIn('capabilities: ["repository_read"]',
-                      (directory / "auditor.md").read_text())
+                      stored_definition.read_text())
         with self.assertRaisesRegex(ValueError, "unknown capability"):
             write_agent_definition(
                 directory, "unknown_tool", "Bad role", "Test", "Invalid permissions.",
@@ -5921,7 +5936,9 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertEqual(agent.name, 'Security: "Audit"')
         self.assertIn("Inspect trust boundaries", agent.instructions)
         self.assertEqual(agent.model, "anthropic:claude-sonnet-4-5")
-        self.assertIn('model: "anthropic:claude-sonnet-4-5"', (directory / f"{agent.id}.md").read_text())
+        stored_definition = next(directory.glob("*.md"))
+        self.assertIn('model: "anthropic:claude-sonnet-4-5"', stored_definition.read_text())
+        self.assertNotEqual(stored_definition.name, f"{agent.id}.md")
         self.assertEqual({item.id for item in definitions},
                          {"planner", "builder", "reviewer", "security_auditor"})
         with self.assertRaisesRegex(ValueError, "already exists"):
@@ -5979,6 +5996,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
 
         self.assertTrue(archived_path.is_file())
         self.assertIn("Inspect changes", archived_path.read_text(encoding="utf-8"))
+        self.assertNotIn(agent.id, archived_path.name)
         self.assertEqual(discover_agents(directory), [])
         self.assertFalse((directory / "security_auditor.md").exists())
 
@@ -8025,7 +8043,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                     result = json.loads(response.read())
                 self.assertEqual(response.status, 201)
                 self.assertEqual(result["agent"]["id"], "security_auditor")
-                self.assertTrue((user_directory / "security_auditor.md").is_file())
+                saved_definition = next(user_directory.glob("*.md"))
+                self.assertTrue(saved_definition.is_file())
                 self.assertEqual(supervisor.registered.id, "security_auditor")
 
                 updated_body = json.dumps({
@@ -8043,7 +8062,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                     updated = json.loads(response.read())
                 self.assertEqual(response.status, 200)
                 self.assertEqual(updated["agent"]["name"], "Security and privacy auditor")
-                self.assertIn("data handling", (user_directory / "security_auditor.md").read_text())
+                updated_definition = next(user_directory.glob("*.md"))
+                self.assertIn("data handling", updated_definition.read_text())
                 self.assertEqual(supervisor.updated.id, "security_auditor")
 
                 message_request = urllib.request.Request(

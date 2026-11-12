@@ -49,6 +49,12 @@ test("interactive HTML drops refresh, base and embedded browsing elements", () =
   assert.doesNotMatch(secured, /<(?:iframe|object|embed)\b/i);
 });
 
+test("interactive HTML parses markup before removing event handlers and navigation", () => {
+  const secured = secureInteractiveDocument('<svg><script>alert(1)</script><a href="javascript:alert(1)" onclick="alert(2)">x</a></svg><img src=x onerror=alert(3)><iframe srcdoc="<script>alert(4)</script>"></iframe>');
+  assert.match(secured, /<script>alert\(1\)<\/script>/);
+  assert.doesNotMatch(secured, /javascript:|onclick=|onerror=|srcdoc=|<iframe\b|alert\(4\)/i);
+});
+
 test("interactive app settings start off and disclose the frame-navigation limit", () => {
   const html = renderToStaticMarkup(React.createElement(InteractiveAccessView, {
     projectName: "Example",

@@ -29,11 +29,11 @@ jobs:
             bundles: msi,nsis
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -53,7 +53,67 @@ jobs:
         run: npm run test:sites
       - name: UI projection tests
         run: npm run test:ui
-      - run: npm run tauri -- build --bundles ${{ matrix.bundles }} --target ${{ matrix.target }}
+      - name: Prepare macOS signing and notarization
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY KEYCHAIN_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing required GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
+
+          keychain_path="$RUNNER_TEMP/tribe-signing.keychain-db"
+          certificate_path="$RUNNER_TEMP/tribe-developer-id.p12"
+          api_key_path="$RUNNER_TEMP/Tribe-NotaryKey.p8"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$certificate_path"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" | base64 -D > "$api_key_path"
+          chmod 600 "$certificate_path" "$api_key_path"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$certificate_path" -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security default-keychain -d user -s "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" \
+            "$HOME/Library/Keychains/login.keychain-db" /Library/Keychains/System.keychain
+          security find-identity -v -p codesigning "$keychain_path" \
+            | grep -Fq "\"$APPLE_SIGNING_IDENTITY\"" || {
+              echo "::error::The configured identity is not present in the imported Developer ID certificate."
+              exit 1
+            }
+          echo "APPLE_API_KEY_PATH=$api_key_path" >> "$GITHUB_ENV"
+      - name: Build desktop bundle for CI
+        if: runner.os != 'macOS' || !startsWith(github.ref, 'refs/tags/v')
+        run: npm run tauri -- build --bundles ${{ matrix.bundles }} --target ${{ matrix.target }}
+      - name: Build and notarize macOS release app
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: npm run tauri -- build --bundles ${{ matrix.bundles }} --target ${{ matrix.target }}
+      - name: Remove macOS signing credentials
+        if: always() && runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/tribe-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/tribe-developer-id.p12" "$RUNNER_TEMP/Tribe-NotaryKey.p8"
       - name: Verify desktop bundle and app lifecycle
         run: python scripts/verify-desktop-bundles.py --target ${{ matrix.target }}
       - name: Native shell tests (macOS)
@@ -92,11 +152,11 @@ jobs:
           if (-not $msi -or -not $nsis) { throw "Expected both MSI and NSIS installers." }
           Copy-Item $msi.FullName (Join-Path $releaseDirectory "Tribe-$env:RELEASE_VERSION-windows-x64.msi")
           Copy-Item $nsis.FullName (Join-Path $releaseDirectory "Tribe-$env:RELEASE_VERSION-windows-x64-setup.exe")
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tribe-${{ matrix.target }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/**
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: tribe-release-${{ matrix.target }}
@@ -111,7 +171,7 @@ jobs:
       actions: read
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download verified desktop installers
         env:
           GH_TOKEN: ${{ github.token }}
@@ -152,11 +212,11 @@ jobs:
             package-app: release/electron/win-unpacked/Tribe.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -180,7 +240,7 @@ jobs:
           TRIBE_BROWSER_E2E_PACKAGED_APP: ${{ matrix.package-app }}
           TRIBE_BROWSER_E2E_AUTO_UPLOAD: "1"
           TRIBE_BROWSER_E2E_SKIP_APPROVAL: "1"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tribe-electron-${{ matrix.target }}
           path: release/electron/**

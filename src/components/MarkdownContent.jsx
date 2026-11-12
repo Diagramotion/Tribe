@@ -184,9 +184,22 @@ const markdownComponents = {
 };
 
 function containsMarkdownMath(source) {
-  return /\$\$[\s\S]+?\$\$|(?<!\\)\$(?!\$|\s)(?:\\.|[^$\n])+?(?<!\s)\$(?!\d)/.test(source);
+  let displayStart = -1;
+  let inlineStart = -1;
+  for (let index = 0; index < source.length; index += 1) {
+    if (source[index] === "\\") { index += 1; continue; }
+    if (source.startsWith("$$", index)) {
+      if (displayStart >= 0 && index > displayStart) return true;
+      displayStart = index + 2;
+      index += 1;
+      continue;
+    }
+    if (source[index] !== "$") continue;
+    if (inlineStart >= 0 && index > inlineStart && !/\s/.test(source[index - 1] ?? "") && !/\d/.test(source[index + 1] ?? "")) return true;
+    if (inlineStart < 0 && !/\s/.test(source[index + 1] ?? "")) inlineStart = index + 1;
+  }
+  return false;
 }
-
 function escapeCurrencyDelimiters(source) {
   const codeSegments = [];
   let placeholder = "__TRIBE_MARKDOWN_CODE_";

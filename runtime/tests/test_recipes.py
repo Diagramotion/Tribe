@@ -2,10 +2,96 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from tribe_runtime.agents import discover_agents
 from tribe_runtime.recipes import WorkflowVersionConflict, get_recipe, list_recipe_versions, save_recipe
 
 
 class WorkflowVersionTests(unittest.TestCase):
+    def test_recipe_read_helpers_reject_path_segments(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertIsNone(get_recipe(root / "builtins", root / "users", "../outside"))
+            self.assertEqual(list_recipe_versions(root / "builtins", root / "users", "../../outside"), [])
+
+    def test_recipe_discovery_rejects_symlinks_outside_the_library(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            builtins = root / "builtins"
+            users = root / "users"
+            builtins.mkdir()
+            users.mkdir()
+            outside = root / "outside.md"
+            outside.write_text(
+                "---\nid: outside-flow\ntitle: Outside\ndescription: External workflow\n"
+                "version: 1\n---\nUse external guidance.\n",
+                encoding="utf-8",
+            )
+            try:
+                (users / "linked.md").symlink_to(outside)
+            except OSError as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "workflow_path_invalid"):
+                get_recipe(builtins, users, "outside-flow")
+
+    def test_workflow_lock_rejects_a_locks_directory_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            users = root / "users"
+            outside = root / "outside"
+            users.mkdir()
+            outside.mkdir()
+            try:
+                (users / ".locks").symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "workflow_path_invalid"):
+                save_recipe(
+                    users, "safe-flow", "Safe flow", "A local workflow.", "Guide.",
+                    root / "builtins",
+                )
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_agent_discovery_rejects_symlinks_outside_the_library(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            library = root / "agents"
+            library.mkdir()
+            outside = root / "outside.md"
+            outside.write_text(
+                "---\nid: auditor\nname: Auditor\nrole: Review\n---\nReview evidence.\n",
+                encoding="utf-8",
+            )
+            try:
+                (library / "linked.md").symlink_to(outside)
+            except OSError as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "agent_definition_path_invalid"):
+                discover_agents(library)
+
+    def test_agent_archive_rejects_an_archive_symlink_outside_the_library(self):
+        from tribe_runtime.agents import archive_agent_definition, write_agent_definition
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            library = root / "agents"
+            outside = root / "outside"
+            outside.mkdir()
+            definition = write_agent_definition(
+                library, "auditor", "Auditor", "Review", "Review evidence.",
+            )
+            try:
+                (library / "archive").symlink_to(outside, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "agent_definition_path_invalid"):
+                archive_agent_definition(library, definition.id)
+            self.assertTrue(any(library.glob("*.md")))
+            self.assertEqual(list(outside.iterdir()), [])
+
     def test_expected_version_is_checked_inside_the_workflow_save_lock(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

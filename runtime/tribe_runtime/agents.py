@@ -78,7 +78,8 @@ def discover_agents(directory: Path) -> list[AgentDefinition]:
     """Load Markdown role definitions, failing clearly on an invalid registry entry."""
     agents = []
     identifiers: set[str] = set()
-    for path in sorted(directory.glob("*.md")):
+    for candidate in sorted(directory.glob("*.md")):
+        path = _contained_agent_path(directory, candidate.name)
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeDecodeError) as error:
@@ -251,6 +252,22 @@ def _render_agent_definition(agent_id: str, name: str, role: str,
             effort, content, capabilities)
 
 
+def _contained_agent_path(directory: Path, name: str) -> Path:
+    """Resolve an agent file and reject paths or symlinks escaping its library."""
+    root = directory.resolve()
+    candidate = (root / name).resolve()
+    if not candidate.is_relative_to(root):
+        raise ValueError("agent_definition_path_invalid")
+    return candidate
+
+
+def _find_agent_path(directory: Path, agent_id: str) -> Path | None:
+    for definition in discover_agents(directory):
+        if definition.id == agent_id:
+            return _contained_agent_path(directory, definition.source)
+    return None
+
+
 def write_agent_definition(directory: Path, agent_id: str, name: str, role: str,
                            instructions: str, model: str = "",
                            repository_access: str = "workspace_write",
@@ -261,7 +278,9 @@ def write_agent_definition(directory: Path, agent_id: str, name: str, role: str,
         agent_id, name, role, instructions, model, repository_access, effort, tool_permissions
     )
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{identifier}.md"
+    if any(agent.id == identifier for agent in discover_agents(directory)):
+        raise ValueError(f"agent id {identifier!r} already exists in the user library")
+    path = _contained_agent_path(directory, f"{uuid.uuid4().hex}.md")
     try:
         with path.open("x", encoding="utf-8", newline="\n") as definition_file:
             definition_file.write(content)
@@ -286,10 +305,10 @@ def update_agent_definition(directory: Path, agent_id: str, name: str, role: str
     )
     if identifier != agent_id:
         raise ValueError("agent id cannot be changed")
-    path = directory / f"{identifier}.md"
-    if not path.is_file():
+    path = _find_agent_path(directory, identifier)
+    if path is None:
         raise ValueError("user_agent_not_found")
-    temporary = directory / f".{identifier}-{uuid.uuid4().hex}.tmp"
+    temporary = _contained_agent_path(directory, f".agent-{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("x", encoding="utf-8", newline="\n") as definition_file:
             definition_file.write(content)
@@ -304,14 +323,14 @@ def archive_agent_definition(directory: Path, agent_id: str) -> Path:
     """Move a user role out of the active library without destroying its Markdown source."""
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,49}", agent_id):
         raise ValueError("invalid_agent_id")
-    source = directory / f"{agent_id}.md"
-    if not source.is_file():
+    source = _find_agent_path(directory, agent_id)
+    if source is None:
         raise ValueError("user_agent_not_found")
-    archive_directory = directory / "archive"
+    archive_directory = _contained_agent_path(directory, "archive")
     archive_directory.mkdir(parents=True, exist_ok=True)
-    if not archive_directory.resolve(strict=True).is_relative_to(directory.resolve(strict=True)):
-        raise ValueError("agent_archive_path_invalid")
-    destination = archive_directory / f"{agent_id}-{uuid.uuid4().hex[:8]}.md"
+    destination = _contained_agent_path(
+        archive_directory, f"{uuid.uuid4().hex}.md",
+    )
     source.replace(destination)
     return destination
 

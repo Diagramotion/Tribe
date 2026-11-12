@@ -1882,11 +1882,13 @@ class MissionStore:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
-        artifact_directory = (self.data_dir / "artifacts" / mission_id)
-        try:
-            artifact_directory.rmdir()
-        except OSError:
-            pass
+        artifact_root = (self.data_dir / "artifacts").resolve()
+        artifact_directory = (artifact_root / mission["id"]).resolve()
+        if artifact_directory.is_relative_to(artifact_root):
+            try:
+                artifact_directory.rmdir()
+            except OSError:
+                pass
         return {"id": mission_id, "title": mission["title"]}
 
     def delete_project(self, project_id: str) -> dict[str, Any] | None:
@@ -8104,12 +8106,19 @@ class MissionStore:
 
     def add_artifact(self, mission_id: str, name: str, media_type: str, created_by: str,
                      content: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not isinstance(mission_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", mission_id):
+            raise ValueError("mission_id_invalid")
+        with self._connect() as db:
+            if not db.execute("SELECT 1 FROM missions WHERE id = ?", (mission_id,)).fetchone():
+                raise ValueError("mission_not_found")
         artifact_id = str(uuid.uuid4())
         safe_name = Path(name).name.strip()[:255]
         if not safe_name or len(content) > 10_000_000:
             raise ValueError("artifact name or size is invalid")
-        stored_path = self.data_dir / "artifacts" / mission_id / artifact_id
-        stored_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_root = self.data_dir / "artifacts"
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        artifact_root = artifact_root.resolve(strict=True)
+        stored_path = artifact_root / artifact_id
         temporary_path = stored_path.with_suffix(".tmp")
         temporary_path.write_bytes(content)
         artifact = {"id": artifact_id, "mission_id": mission_id, "name": safe_name,
