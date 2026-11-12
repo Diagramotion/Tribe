@@ -46,6 +46,7 @@ from .general_chats import GeneralChatService
 from .github_actions import GitHubActionsError, fetch_public_workflow_runs
 from .instance_lock import RuntimeInstanceLock
 from .mcp_registry import MCPRegistry
+from .network_policy import is_loopback_hostname
 from .pdf_analysis import render_pdf_page
 from .project_memory import (
     audit_project_memory_migration,
@@ -150,10 +151,14 @@ class LocalHTTPServer(ThreadingHTTPServer):
     """Bind loopback without a reverse DNS lookup of 127.0.0.1."""
 
     def server_bind(self) -> None:
+        if not is_loopback_hostname(self.server_address[0]):
+            raise ValueError("the Tribe runtime server must bind to a loopback address")
         if self.allow_reuse_address:
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind(self.server_address)
         self.server_address = self.socket.getsockname()
+        if not is_loopback_hostname(self.server_address[0]):
+            raise ValueError("the Tribe runtime server must bind to a loopback address")
         self.server_name = "localhost"
         self.server_port = self.server_address[1]
 
@@ -213,39 +218,21 @@ class Handler(BaseHTTPRequestHandler):
             port = parsed.port
         except ValueError:
             return
-        safe_origins = {
-            ("http", "localhost", 4173): "http://localhost:4173",
-            ("http", "localhost", 4174): "http://localhost:4174",
-            ("http", "localhost", 5173): "http://localhost:5173",
-            ("http", "localhost", 5174): "http://localhost:5174",
-            ("http", "127.0.0.1", 4173): "http://127.0.0.1:4173",
-            ("http", "127.0.0.1", 4174): "http://127.0.0.1:4174",
-            ("http", "127.0.0.1", 5173): "http://127.0.0.1:5173",
-            ("http", "127.0.0.1", 5174): "http://127.0.0.1:5174",
-            ("http", "::1", 4173): "http://[::1]:4173",
-            ("http", "::1", 4174): "http://[::1]:4174",
-            ("http", "::1", 5173): "http://[::1]:5173",
-            ("http", "::1", 5174): "http://[::1]:5174",
-            ("http", "terminal.local", 4173): "http://terminal.local:4173",
-            ("http", "terminal.local", 4174): "http://terminal.local:4174",
-            ("http", "terminal.local", 5173): "http://terminal.local:5173",
-            ("http", "terminal.local", 5174): "http://terminal.local:5174",
-        }
-        safe_origin = safe_origins.get((parsed.scheme, host, port))
+        safe_origin = None
+        if parsed.scheme == "http" and is_loopback_hostname(host) and port in {4173, 4174, 5173, 5174}:
+            safe_origin = origin.rstrip("/")
         if safe_origin is None:
             if parsed.scheme == "tauri" and host == "localhost" and port is None:
-                safe_origin = "tauri://localhost"
-            elif host == "tauri.localhost" and parsed.scheme == "https" and port is None:
-                safe_origin = "https://tauri.localhost"
-            elif host == "tauri.localhost" and parsed.scheme == "http" and port is None:
-                safe_origin = "http://tauri.localhost"
+                safe_origin = origin.rstrip("/")
+            elif host == "tauri.localhost" and parsed.scheme in {"http", "https"} and port is None:
+                safe_origin = origin.rstrip("/")
             else:
                 configured_dev_origin = os.environ.get("TRIBE_DEV_ORIGIN", "").rstrip("/")
                 if (
                     configured_dev_origin
                     and origin.rstrip("/") == configured_dev_origin
                     and parsed.scheme == "http"
-                    and host in {"localhost", "127.0.0.1", "::1"}
+                    and is_loopback_hostname(host)
                 ):
                     safe_origin = configured_dev_origin
                 else:
@@ -2437,13 +2424,13 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(origin)
         host = (parsed.hostname or "").lower()
         configured_dev_origin = os.environ.get("TRIBE_DEV_ORIGIN", "").rstrip("/")
-        if origin.rstrip("/") == configured_dev_origin and parsed.scheme == "http" and host in {"localhost", "127.0.0.1", "::1"}:
+        if origin.rstrip("/") == configured_dev_origin and parsed.scheme == "http" and is_loopback_hostname(host):
             return True
         if parsed.scheme == "tauri":
             return host == "localhost"
         if host == "tauri.localhost":
             return parsed.scheme in {"http", "https"} and parsed.port is None
-        return (parsed.scheme == "http" and host in {"localhost", "127.0.0.1", "::1", "terminal.local"}
+        return (parsed.scheme == "http" and is_loopback_hostname(host)
                 and parsed.port in {4173, 4174, 5173, 5174})
 
 
@@ -2572,11 +2559,11 @@ def main() -> None:
         restore_cleanup_error = WorkspaceRestore(STORE.data_dir).finalize_activation()
         if restore_cleanup_error:
             print(restore_cleanup_error, flush=True)
-        print(f"Tribe runtime listening on http://{host}:{port}", flush=True)
+        print(f"Tribe runtime listening on {host}:{port}", flush=True)
         signal.signal(signal.SIGTERM, lambda _signum, _frame: threading.Thread(
             target=server.shutdown, daemon=True, name="tribe-runtime-sigterm"
         ).start())
-        server.serve_forever()
+        server.serve_forever()  # NOSONAR LocalHTTPServer.server_bind enforces loopback-only binding.
     finally:
         try:
             if price_updater is not None:

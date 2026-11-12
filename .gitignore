@@ -3,6 +3,8 @@ dist/
 __pycache__/
 *.py[cod]
 .venv/
+coverage/
+.scannerwork/
 build/
 /release/
 runtime/*.egg-info/

@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import Any
 
 from .capabilities import WORKFLOW_OPERATION_NAMES
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunsplit
 
+from .network_policy import is_loopback_hostname
 from .store import MissionStore
 
 _SERVER_NAME = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
@@ -115,7 +116,7 @@ class MCPRegistry:
                 parsed = urlparse(definition["url"])
                 if (not parsed.hostname or parsed.username or parsed.password
                         or parsed.scheme not in {"http", "https"}
-                        or (parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"})):
+                        or (parsed.scheme == "http" and not is_loopback_hostname(parsed.hostname))):
                     raise ValueError(f"MCP URLs must use HTTPS or loopback HTTP without embedded credentials ({name!r})")
             read_only_tools = definition.get("readOnlyTools", [])
             if not isinstance(read_only_tools, list) or any(
@@ -336,11 +337,13 @@ class MCPRegistry:
             browser_access = self.store.project_web_access(project_id)
             allowed_domains = browser_access["allowedDomains"]
             if browser_access["enabled"] and allowed_domains:
-                origins = ";".join(
-                    origin
-                    for domain in allowed_domains
-                    for origin in (f"https://{domain}", f"http://{domain}")
-                )
+                origins = []
+                for domain in allowed_domains:
+                    host = f"[{domain}]" if ":" in domain else domain
+                    origins.append(urlunsplit(("https", host, "", "", "")))
+                    if is_loopback_hostname(domain):
+                        origins.append(urlunsplit(("http", host, "", "", "")))
+                allowed_origins = ";".join(origins)
                 playwright = servers.get("playwright")
                 if playwright is not None:
                     args = playwright.get("args", [])
@@ -354,7 +357,7 @@ class MCPRegistry:
                             skip_value = True
                         elif not arg.startswith("--allowed-origins="):
                             filtered_args.append(arg)
-                    playwright["args"] = [*filtered_args, "--allowed-origins", origins]
+                    playwright["args"] = [*filtered_args, "--allowed-origins", allowed_origins]
             else:
                 servers.pop("playwright", None)
         config["mcpServers"] = servers

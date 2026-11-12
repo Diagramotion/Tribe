@@ -1,3 +1,17 @@
+const { isIP } = require("node:net");
+
+function normaliseHostname(hostname) {
+  return hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+}
+
+function isLoopbackHostname(hostname) {
+  const host = normaliseHostname(hostname);
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  const family = isIP(host);
+  if (family === 4) return Number(host.split(".", 1)[0]) === 127;
+  return family === 6 && host === "::1";
+}
+
 function normaliseBrowserDomains(domains) {
   if (!Array.isArray(domains) || domains.length === 0 || domains.length > 100) {
     throw new Error("The project's allowed website list is unavailable.");
@@ -7,10 +21,12 @@ function normaliseBrowserDomains(domains) {
       throw new Error("The project's allowed website list is invalid.");
     }
     try {
-      const parsed = new URL(`https://${domain}`);
-      const hostname = parsed.hostname.toLowerCase().replace(/\.$/, "");
+      const input = domain.trim().toLowerCase().replace(/\.$/, "");
+      const urlHost = input.includes(":") && !input.startsWith("[") ? `[${input}]` : input;
+      const parsed = new URL(`https://${urlHost}`);
+      const hostname = normaliseHostname(parsed.hostname);
       if (parsed.username || parsed.password || parsed.port || parsed.pathname !== "/"
-          || parsed.search || parsed.hash || hostname !== domain.toLowerCase().replace(/\.$/, "")) {
+          || parsed.search || parsed.hash || hostname !== normaliseHostname(input)) {
         throw new Error("invalid_hostname");
       }
       return hostname;
@@ -25,14 +41,15 @@ function browserRequestPolicy(details, policies) {
 }
 
 function browserRequestAllowed(policy, address) {
-  if (!policy) return true;
   try {
     const url = new URL(address);
-    return ["http:", "https:"].includes(url.protocol)
-      && policy.domains.has(url.hostname.toLowerCase().replace(/\.$/, ""));
+    const hostname = normaliseHostname(url.hostname);
+    if (!["http:", "https:"].includes(url.protocol)) return false;
+    if (url.protocol === "http:" && !isLoopbackHostname(hostname)) return false;
+    return !policy || policy.domains.has(hostname);
   } catch {
     return false;
   }
 }
 
-module.exports = { browserRequestAllowed, browserRequestPolicy, normaliseBrowserDomains };
+module.exports = { browserRequestAllowed, browserRequestPolicy, isLoopbackHostname, normaliseBrowserDomains };

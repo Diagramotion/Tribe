@@ -30,7 +30,7 @@ ai = [
     "playwright>=1.52,<2",
 ]
 desktop = ["pyinstaller>=6.10,<7"]
-test = ["pytest>=8,<10"]
+test = ["coverage>=7.15,<8", "pytest>=8,<10"]
 
 [project.scripts]
 tribe-runtime = "tribe_runtime.server:main"
