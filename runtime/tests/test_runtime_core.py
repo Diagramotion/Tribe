@@ -718,6 +718,16 @@ class RuntimeCase(unittest.TestCase):
         self.assertNotIn("docs", loaded_configurations[0]["mcpServers"])
         self.assertEqual(loaded_configurations[0]["mcpServers"]["local"]["command"], sys.executable)
         self.assertFalse(list(registry.root.glob("runtime-*.json")))
+        self.assertEqual(
+            registry.validate({"mcpServers": {"local": {"url": "http://127.0.0.2:9000/mcp"}}}),
+            {"mcpServers": {"local": {"url": "http://127.0.0.2:9000/mcp"}}},
+        )
+        self.assertEqual(
+            registry.validate({"mcpServers": {"ipv6": {"url": "http://[::1]:9000/mcp"}}}),
+            {"mcpServers": {"ipv6": {"url": "http://[::1]:9000/mcp"}}},
+        )
+        with self.assertRaisesRegex(ValueError, "loopback HTTP"):
+            registry.validate({"mcpServers": {"remote": {"url": "http://tools.example.com/mcp"}}})
         with patch("keyring.get_password", return_value=None), patch(
             "keyring.delete_password", side_effect=keyring.errors.PasswordDeleteError,
         ):
@@ -834,11 +844,14 @@ for line in sys.stdin:
             "docs": saved["mcpServers"]["docs"],
             "playwright": browser | {"args": [*browser["args"], "--allowed-origins=https://unapproved.example"]},
         }})
-        self.store.set_project_web_access(self.project["id"], True, ["docs.python.org", "react.dev"])
+        self.store.set_project_web_access(
+            self.project["id"], True,
+            ["docs.python.org", "react.dev", "127.0.0.2", "::1"],
+        )
         runtime_browser = registry._runtime_config(self.project["id"])["mcpServers"]["playwright"]
         self.assertEqual(runtime_browser["args"][-2:], [
             "--allowed-origins",
-            "https://docs.python.org;http://docs.python.org;https://react.dev;http://react.dev",
+            "https://docs.python.org;https://react.dev;https://127.0.0.2;http://127.0.0.2;https://[::1];http://[::1]",
         ])
         self.assertNotIn("https://unapproved.example", runtime_browser["args"][-1])
         self.assertIsNone(registry.approval_for(self.project["id"], "playwright_browser_snapshot"))

@@ -6472,6 +6472,7 @@ class MissionStore:
 
     def set_project_web_access(self, project_id: str, enabled: bool,
                                allowed_domains: list[str]) -> dict[str, Any]:
+        import ipaddress
         import re
 
         if not isinstance(enabled, bool):
@@ -6487,7 +6488,17 @@ class MissionStore:
             if not isinstance(item, str):
                 raise TypeError("allowed_domains_must_contain_hostnames")
             domain = item.strip().lower().rstrip(".")
-            if not hostname_pattern.fullmatch(domain):
+            if domain.startswith("[") and domain.endswith("]"):
+                domain = domain[1:-1]
+            if ":" in domain:
+                try:
+                    address = ipaddress.ip_address(domain)
+                except ValueError as error:
+                    raise ValueError("allowed_domains_must_be_exact_hostnames_without_wildcards") from error
+                if address.version != 6:
+                    raise ValueError("allowed_domains_must_be_exact_hostnames_without_wildcards")
+                domain = address.compressed
+            elif not hostname_pattern.fullmatch(domain):
                 raise ValueError("allowed_domains_must_be_exact_hostnames_without_wildcards")
             if domain not in domains:
                 domains.append(domain)

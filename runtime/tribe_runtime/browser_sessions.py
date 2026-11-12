@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+from .network_policy import is_loopback_hostname
+
 MAX_SNAPSHOT_CHARS = 40_000
 MAX_CONSOLE_MESSAGES = 100
 MAX_SCREENSHOT_BYTES = 4_000_000
-LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 BROWSER_READ_TOOLS = frozenset({
     "browser_snapshot", "browser_screenshot", "browser_tabs", "browser_console_messages",
 })
@@ -75,6 +76,8 @@ def _validated_url(value: str) -> tuple[str, str]:
         _ = parsed.port
     except (UnicodeError, ValueError) as error:
         raise BrowserPolicyError("The web address is invalid.") from error
+    if parsed.scheme == "http" and not is_loopback_hostname(host):
+        raise BrowserPolicyError("HTTP pages are supported only for localhost and loopback addresses.")
     return value.strip(), host
 
 
@@ -191,7 +194,7 @@ class BrowserSessionManager:
              allowed_domains: list[str] | tuple[str, ...], *, allow_local: bool = True) -> dict[str, Any]:
         safe_url, host = _validated_url(url)
         allowed = frozenset(domain.casefold().rstrip(".") for domain in allowed_domains if isinstance(domain, str))
-        if host not in allowed and not (allow_local and host in LOCAL_HOSTS):
+        if host not in allowed and not (allow_local and is_loopback_hostname(host)):
             raise BrowserPolicyError("This website is not in the project's allowed website list.")
         return self._call("open", project_id, mission_id, agent_id, safe_url, allowed)
 
@@ -273,7 +276,7 @@ class BrowserSessionManager:
                 allowed_domains: list[str] | tuple[str, ...]) -> dict[str, Any]:
         safe_url, host = _validated_url(url)
         allowed = frozenset(domain.casefold().rstrip(".") for domain in allowed_domains if isinstance(domain, str))
-        if host not in allowed and host not in LOCAL_HOSTS:
+        if host not in allowed and not is_loopback_hostname(host):
             raise BrowserPolicyError("This website is not in the project's allowed website list.")
         return self._call("new_tab", project_id, mission_id, agent_id, safe_url, allowed)
 
@@ -285,7 +288,7 @@ class BrowserSessionManager:
         safe_url, host = _validated_url(url)
         allowed = frozenset(domain.casefold().rstrip(".") for domain in allowed_domains
                             if isinstance(domain, str))
-        if host not in allowed and host not in LOCAL_HOSTS:
+        if host not in allowed and not is_loopback_hostname(host):
             raise BrowserPolicyError("This website is not in the project's allowed website list.")
         with self._lock:
             key = self._session_ids.get(session_id)
@@ -340,8 +343,8 @@ class BrowserSessionManager:
                 and not request.redirected_from
                 and (navigation_target == "*" or request_host == navigation_target)
             )
-            pending_external_navigation = navigation_target not in {"", "*", *LOCAL_HOSTS}
-            local_page = current_host in LOCAL_HOSTS and not pending_external_navigation
+            pending_external_navigation = navigation_target not in {"", "*"} and not is_loopback_hostname(navigation_target)
+            local_page = is_loopback_hostname(current_host) and not pending_external_navigation
             if self.request_allowed(request.url, session.allowed_domains,
                                     local_page or explicit_local_navigation):
                 route.continue_()
@@ -358,7 +361,7 @@ class BrowserSessionManager:
             _, host = _validated_url(url)
         except BrowserPolicyError:
             return False
-        return host in allowed_domains or (local_preview and host in LOCAL_HOSTS)
+        return host in allowed_domains or (local_preview and is_loopback_hostname(host))
 
     def _update_page(self, session: _Session, page: Any) -> None:
         try:
@@ -495,7 +498,7 @@ class BrowserSessionManager:
             return
         session.allowed_domains = allowed
         session.blocked_hosts.clear()
-        if session.hostname not in allowed and session.hostname not in LOCAL_HOSTS:
+        if session.hostname not in allowed and not is_loopback_hostname(session.hostname):
             self._do_close(browser, mission_id, agent_id)
 
     def _do_screenshot(self, browser: Any, mission_id: str, agent_id: str) -> bytes:

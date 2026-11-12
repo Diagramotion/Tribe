@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from tribe_runtime.browser_sessions import BrowserPolicyError, BrowserSessionManager
+from tribe_runtime.browser_sessions import BrowserPolicyError, BrowserSessionManager, _validated_url
 
 
 class _PageHandler(BaseHTTPRequestHandler):
@@ -81,6 +81,13 @@ def test_browser_policy_rejects_unapproved_hosts_credentials_and_non_http(browse
         browser.open("p", "m", "a", "file:///etc/passwd", [])
     with pytest.raises(BrowserPolicyError):
         browser.open("p", "m", "a", "https://sub.allowed.example", ["allowed.example"])
+
+
+def test_cleartext_browser_urls_are_limited_to_loopback_hosts():
+    assert _validated_url("http://127.0.0.2:8080/preview")[1] == "127.0.0.2"
+    assert _validated_url("http://[::1]:8080/preview")[1] == "::1"
+    with pytest.raises(BrowserPolicyError, match="localhost and loopback"):
+        _validated_url("http://example.com/preview")
 
 
 def test_external_pages_cannot_reach_loopback_services():

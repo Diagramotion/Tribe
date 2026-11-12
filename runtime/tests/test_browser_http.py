@@ -113,3 +113,24 @@ def test_browser_http_routes_scope_sessions_and_serve_uncached_screenshots():
         site.shutdown()
         site.server_close()
         site_thread.join(timeout=2)
+
+
+def test_runtime_accepts_cleartext_origins_only_for_localhost_and_loopback():
+    from types import SimpleNamespace
+
+    handler = runtime_server.Handler
+    for origin in (
+        "http://localhost:5173",
+        "http://127.0.0.2:5173",
+        "http://[::1]:5173",
+    ):
+        request = SimpleNamespace(headers={"Origin": origin})
+        assert handler._local_origin(request)
+    for origin in ("http://terminal.local:5173", "http://example.com:5173", "https://example.com"):
+        request = SimpleNamespace(headers={"Origin": origin})
+        assert not handler._local_origin(request)
+
+
+def test_runtime_http_server_rejects_non_loopback_bind_addresses():
+    with pytest.raises(ValueError, match="must bind to a loopback address"):
+        runtime_server.LocalHTTPServer(("0.0.0.0", 0), runtime_server.Handler)

@@ -442,11 +442,11 @@ function configureBrowserSession(browserSession) {
   });
   browserSession.setPermissionRequestHandler(requestBrowserPermission);
   browserSession.webRequest.onBeforeRequest(
-    { urls: ["http://*/*", "https://*/*"] },
+    { urls: ["*://*/*"] },
     (details, callback) => {
       const policy = browserRequestPolicies.get(details.webContentsId ?? details.webContents?.id);
       const owner = browserContentsOwners.get(details.webContentsId ?? details.webContents?.id);
-      const allowed = !policy || browserRequestAllowed(policy, details.url);
+      const allowed = browserRequestAllowed(policy, details.url);
       const diagnostic = owner ? {
         scope: owner.scope, tabId: owner.tabId, startedAt: Date.now(), url: sanitiseDiagnosticUrl(details.url),
       } : null;
@@ -481,7 +481,7 @@ function configureBrowserSession(browserSession) {
       }
     },
   );
-  browserSession.webRequest.onCompleted({ urls: ["http://*/*", "https://*/*"] }, (details) => {
+  browserSession.webRequest.onCompleted({ urls: ["*://*/*"] }, (details) => {
     const request = browserDiagnosticRequests.get(details.id);
     if (!request) return;
     browserDiagnosticRequests.delete(details.id);
@@ -500,7 +500,7 @@ function configureBrowserSession(browserSession) {
       status: details.statusCode, durationMs: Math.max(0, Date.now() - request.startedAt),
     }, 300);
   });
-  browserSession.webRequest.onErrorOccurred({ urls: ["http://*/*", "https://*/*"] }, (details) => {
+  browserSession.webRequest.onErrorOccurred({ urls: ["*://*/*"] }, (details) => {
     const request = browserDiagnosticRequests.get(details.id);
     if (!request) return;
     browserDiagnosticRequests.delete(details.id);

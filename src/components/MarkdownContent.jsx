@@ -130,7 +130,7 @@ function MarkdownLink({ href, node: _node, ...props }) {
   let opensInNewTab = false;
   if (href) {
     try {
-      const localOrigin = typeof window === "undefined" ? "http://tribe.local" : window.location.origin;
+      const localOrigin = typeof window === "undefined" ? "https://tribe.local" : window.location.origin;
       const url = new URL(href, localOrigin);
       opensInNewTab = ["http:", "https:"].includes(url.protocol) && url.origin !== localOrigin;
     } catch { /* Keep invalid or unsupported links in the renderer's default behaviour. */ }

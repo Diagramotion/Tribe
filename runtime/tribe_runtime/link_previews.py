@@ -67,16 +67,11 @@ def _public_address(host: str, port: int) -> str:
     return str(addresses[0])
 
 
-class _PinnedHTTPConnection(http.client.HTTPConnection):
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     def __init__(self, host: str, port: int, address: str, timeout: float) -> None:
         super().__init__(host, port, timeout=timeout)
         self.address = address
 
-    def connect(self) -> None:
-        self.sock = socket.create_connection((self.address, self.port), self.timeout)
-
-
-class _PinnedHTTPSConnection(_PinnedHTTPConnection):
     def connect(self) -> None:
         raw = socket.create_connection((self.address, self.port), self.timeout)
         try:
@@ -98,14 +93,13 @@ def _read_resource(
         parsed = urlsplit(current)
         scheme = parsed.scheme.lower()
         host = (parsed.hostname or "").lower().rstrip(".")
-        if scheme not in {"http", "https"} or not host or parsed.username or parsed.password:
-            raise ValueError("invalid_public_link")
-        port = parsed.port or (443 if scheme == "https" else 80)
-        if port != (443 if scheme == "https" else 80):
-            raise ValueError("unsupported_link_port")
+        if scheme != "https" or not host or parsed.username or parsed.password:
+            return None
+        port = parsed.port or 443
+        if port != 443:
+            return None
         address = _public_address(host, port)
-        connection_type = _PinnedHTTPSConnection if scheme == "https" else _PinnedHTTPConnection
-        connection = connection_type(host, port, address, timeout=3.5)
+        connection = _PinnedHTTPSConnection(host, port, address, timeout=3.5)
         path = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         try:
             connection.request("GET", path, headers={
@@ -192,10 +186,10 @@ def link_preview(raw_url: str) -> dict | None:
         parsed = urlsplit(raw_url.strip())
         host = (parsed.hostname or "").lower().rstrip(".")
         scheme = parsed.scheme.lower()
-        if scheme not in {"http", "https"} or not host or parsed.username or parsed.password:
+        if scheme != "https" or not host or parsed.username or parsed.password:
             return None
         port = parsed.port
-        if port not in (None, 80, 443):
+        if port not in (None, 443):
             return None
         clean_url = urlunsplit((scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
     except ValueError:
