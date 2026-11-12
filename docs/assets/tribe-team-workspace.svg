@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="820" viewBox="0 0 1440 820" fill="none" role="img" aria-labelledby="title description">
+  <title id="title">Tribe: a configurable team of AI agents working in one shared workspace</title>
+  <desc id="description">A goal connects to a shared project workspace. Example roles such as researcher, data analyst and writer collaborate through shared context, tasks and results. The same workspace can support software, data, research, marketing or other work.</desc>
+  <defs>
+    <linearGradient id="bg" x1="48" y1="24" x2="1372" y2="820" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#111F33"/>
+      <stop offset="1" stop-color="#08111D"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="1160" y1="92" x2="1283" y2="292" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5B8CFF" stop-opacity=".24"/>
+      <stop offset="1" stop-color="#9A6BFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="84" y1="0" x2="84" y2="48" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8AB4FF"/>
+      <stop offset="1" stop-color="#9E8BFF"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#020712" flood-opacity=".38"/>
+    </filter>
+    <style>
+      text { font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .eyebrow { font-size: 12px; font-weight: 700; letter-spacing: 1.8px; fill: #94A6BD; }
+      .muted { fill: #91A1B7; }
+      .white { fill: #F4F7FC; }
+      .line { stroke: #56729A; stroke-opacity: .7; stroke-width: 2; }
+    </style>
+  </defs>
+
+  <rect width="1440" height="820" rx="28" fill="url(#bg)"/>
+  <circle cx="1270" cy="156" r="226" fill="url(#glow)"/>
+  <path d="M1 652C270 581 412 731 695 664c269-64 467-114 744-22v178H1V652Z" fill="#0C1929" opacity=".74"/>
+
+  <g transform="translate(72 54)">
+    <rect width="38" height="38" rx="12" fill="url(#accent)"/>
+    <path d="m18 10-9 17h18L18 10Zm0 0v9" stroke="#111B2C" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="18" cy="10" r="2.2" fill="#111B2C"/>
+    <circle cx="9" cy="27" r="2.2" fill="#111B2C"/>
+    <circle cx="27" cy="27" r="2.2" fill="#111B2C"/>
+    <text x="52" y="27" class="white" font-size="20" font-weight="700">Tribe</text>
+  </g>
+  <g transform="translate(1156 55)">
+    <rect width="212" height="34" rx="17" fill="#182A40" stroke="#314760"/>
+    <circle cx="18" cy="17" r="4" fill="#77D4B1"/>
+    <text x="32" y="21" font-size="11" font-weight="700" letter-spacing="1.05" fill="#BED0E5">OPEN SOURCE · LOCAL FIRST</text>
+  </g>
+
+  <text x="72" y="156" class="white" font-size="42" font-weight="680" letter-spacing="-1.2">A team shaped around the work.</text>
+  <text x="74" y="194" class="muted" font-size="18">Bring a goal. Choose the roles. Give the team one shared place to work.</text>
+
+  <!-- Goal -->
+  <g filter="url(#shadow)">
+    <rect x="72" y="306" width="276" height="214" rx="20" fill="#14243A" stroke="#304662"/>
+    <rect x="94" y="328" width="34" height="34" rx="11" fill="#253A59"/>
+    <path d="M104 345h14m-7-7v14m-8 8h16" stroke="#9FC0FF" stroke-width="2" stroke-linecap="round"/>
+    <text x="140" y="342" class="eyebrow">YOUR GOAL</text>
+    <text x="96" y="403" class="white" font-size="18" font-weight="620">Turn customer feedback</text>
+    <text x="96" y="430" class="white" font-size="18" font-weight="620">into a clear launch plan.</text>
+    <text x="96" y="478" class="muted" font-size="13">You set the outcome and stay in control.</text>
+  </g>
+
+  <!-- Shared workspace -->
+  <g filter="url(#shadow)">
+    <rect x="438" y="252" width="508" height="334" rx="22" fill="#101D2E" stroke="#3A5372"/>
+    <path d="M438 274a22 22 0 0 1 22-22h464a22 22 0 0 1 22 22v39H438v-39Z" fill="#182941"/>
+    <circle cx="466" cy="283" r="5" fill="#FF7D78"/>
+    <circle cx="484" cy="283" r="5" fill="#E9BE68"/>
+    <circle cx="502" cy="283" r="5" fill="#6CCFA7"/>
+    <text x="534" y="288" class="white" font-size="13" font-weight="650">PROJECT WORKSPACE</text>
+    <rect x="822" y="267" width="101" height="28" rx="14" fill="#1D3A42"/>
+    <circle cx="838" cy="281" r="4" fill="#75D4B0"/>
+    <text x="850" y="285" font-size="11" font-weight="600" fill="#A7E5CE">LOCAL</text>
+
+    <rect x="464" y="336" width="217" height="224" rx="15" fill="#14243A" stroke="#2C405A"/>
+    <text x="484" y="366" class="eyebrow">SHARED CONTEXT</text>
+    <circle cx="490" cy="401" r="7" fill="#779FFF"/>
+    <text x="507" y="405" class="white" font-size="14" font-weight="600">Conversation</text>
+    <text x="484" y="429" class="muted" font-size="12">A place for the team to share</text>
+    <text x="484" y="447" class="muted" font-size="12">updates, questions and decisions.</text>
+    <path d="M484 463h177" stroke="#2A3C54"/>
+    <circle cx="490" cy="488" r="7" fill="#B58BFF"/>
+    <text x="507" y="492" class="white" font-size="14" font-weight="600">Tasks and dependencies</text>
+    <text x="484" y="516" class="muted" font-size="12">Clear ownership; ready work stays</text>
+    <text x="484" y="534" class="muted" font-size="12">available to the right teammate.</text>
+
+    <rect x="700" y="336" width="220" height="105" rx="15" fill="#14243A" stroke="#2C405A"/>
+    <text x="720" y="366" class="eyebrow">TEAM ACTIVITY</text>
+    <circle cx="725" cy="394" r="5" fill="#79D5B4"/>
+    <text x="739" y="399" class="white" font-size="13">Find recurring themes</text>
+    <text x="720" y="423" class="muted" font-size="11">Analysis · in progress</text>
+
+    <rect x="700" y="455" width="220" height="105" rx="15" fill="#14243A" stroke="#2C405A"/>
+    <text x="720" y="485" class="eyebrow">SHARED RESULT</text>
+    <path d="m721 511 6 6 12-13" stroke="#8DDEBC" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="748" y="518" class="white" font-size="13">Launch brief ready to review</text>
+    <text x="720" y="542" class="muted" font-size="11">Saved with its project context</text>
+  </g>
+
+  <!-- Peer connections: roles connect to shared work, not a boss-agent tree. -->
+  <path d="M348 412h66c18 0 24-12 24-26v-22" class="line"/>
+  <circle cx="438" cy="364" r="5" fill="#94B8FF"/>
+  <path d="M946 340h46c18 0 25-10 25-25v-14" class="line"/>
+  <path d="M946 419h66" class="line"/>
+  <path d="M946 498h46c18 0 25 10 25 25v12" class="line"/>
+  <circle cx="946" cy="340" r="5" fill="#A894FF"/>
+  <circle cx="946" cy="419" r="5" fill="#75D4B0"/>
+  <circle cx="946" cy="498" r="5" fill="#F2C876"/>
+
+  <!-- Example roles -->
+  <text x="1044" y="262" class="eyebrow">EXAMPLE ROLES · MAKE YOUR OWN</text>
+  <g filter="url(#shadow)">
+    <rect x="1034" y="278" width="334" height="82" rx="16" fill="#17283E" stroke="#344B66"/>
+    <circle cx="1067" cy="319" r="17" fill="#342F57"/>
+    <path d="M1062 320c0-5 10-5 10 0m-5-3a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" stroke="#C0B0FF" stroke-width="1.5" stroke-linecap="round"/>
+    <text x="1094" y="314" class="white" font-size="15" font-weight="640">Researcher</text>
+    <text x="1094" y="337" class="muted" font-size="12">Finds and checks useful sources</text>
+
+    <rect x="1034" y="377" width="334" height="82" rx="16" fill="#17283E" stroke="#344B66"/>
+    <circle cx="1067" cy="418" r="17" fill="#1F4140"/>
+    <path d="M1059 423h16m-13-5h10m-8-5h6m-11 14v-16h16v16" stroke="#92DEC7" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="1094" y="413" class="white" font-size="15" font-weight="640">Data analyst</text>
+    <text x="1094" y="436" class="muted" font-size="12">Looks for patterns in the evidence</text>
+
+    <rect x="1034" y="476" width="334" height="82" rx="16" fill="#17283E" stroke="#344B66"/>
+    <circle cx="1067" cy="517" r="17" fill="#493B29"/>
+    <path d="M1060 509h14v16h-14zm3 4h8m-8 4h8m-8 4h6" stroke="#F2D18C" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="1094" y="512" class="white" font-size="15" font-weight="640">Communicator</text>
+    <text x="1094" y="535" class="muted" font-size="12">Turns findings into a useful brief</text>
+  </g>
+
+  <path d="M72 638h1296" stroke="#2A3D54"/>
+  <text x="72" y="681" class="eyebrow">ONE WORKSPACE · DIFFERENT KINDS OF WORK</text>
+  <g transform="translate(72 707)">
+    <rect width="240" height="44" rx="22" fill="#17283E" stroke="#344B66"/>
+    <text x="120" y="28" text-anchor="middle" class="white" font-size="14" font-weight="600">Software</text>
+    <rect x="256" width="240" height="44" rx="22" fill="#17283E" stroke="#344B66"/>
+    <text x="376" y="28" text-anchor="middle" class="white" font-size="14" font-weight="600">Data</text>
+    <rect x="512" width="240" height="44" rx="22" fill="#17283E" stroke="#344B66"/>
+    <text x="632" y="28" text-anchor="middle" class="white" font-size="14" font-weight="600">Research</text>
+    <rect x="768" width="240" height="44" rx="22" fill="#17283E" stroke="#344B66"/>
+    <text x="888" y="28" text-anchor="middle" class="white" font-size="14" font-weight="600">Marketing</text>
+    <rect x="1024" width="240" height="44" rx="22" fill="#17283E" stroke="#344B66"/>
+    <text x="1144" y="28" text-anchor="middle" class="white" font-size="14" font-weight="600">Your next idea</text>
+  </g>
+</svg>
