@@ -187,12 +187,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            release-assets/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Tribe $GITHUB_REF_NAME" \
-            --notes-file "docs/releases/$GITHUB_REF_NAME.md" \
-            --latest
+          release_args=(
+            "$GITHUB_REF_NAME"
+            release-assets/*
+            --repo "$GITHUB_REPOSITORY"
+            --title "Tribe $GITHUB_REF_NAME"
+            --notes-file "docs/releases/$GITHUB_REF_NAME.md"
+          )
+          if [[ "$GITHUB_REF_NAME" =~ -(alpha|beta|rc)\. ]]; then
+            gh release create "${release_args[@]}" --prerelease
+          else
+            gh release create "${release_args[@]}" --latest
+          fi
 
   electron-browser:
     name: Electron browser (${{ matrix.target }})
@@ -235,12 +241,24 @@ jobs:
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
-          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
-            APPLE_API_ISSUER APPLE_API_KEY_ID APPLE_API_PRIVATE_KEY KEYCHAIN_PASSWORD; do
+          signing_values=(APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_API_ISSUER APPLE_API_KEY_ID APPLE_API_PRIVATE_KEY KEYCHAIN_PASSWORD)
+          configured=false
+          for name in "${signing_values[@]}"; do
+            if [[ -n "${!name:-}" ]]; then
+              configured=true
+              break
+            fi
+          done
+          if [[ "$configured" == false ]]; then
+            echo "::warning::Publishing an unsigned macOS alpha; Apple signing secrets are not configured."
+            exit 0
+          fi
+          for name in "${signing_values[@]}"; do
             if [[ -z "${!name:-}" ]]; then
               echo "::error::Missing required GitHub Actions secret: $name"
               exit 1
