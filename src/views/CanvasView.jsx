@@ -20,7 +20,7 @@ function CanvasPreview({ document, pageId, onTextSelection }) {
   }
 
   if (document.kind === "markdown") return <article id={pageId} className={`canvas-markdown${document.body.trim() ? "" : " canvas-markdown--empty"}`} onKeyUp={captureSelection} onMouseUp={captureSelection}>{document.body.trim() ? <MarkdownContent>{document.body}</MarkdownContent> : <p className="canvas-empty">Nothing to preview yet.</p>}</article>;
-  if (document.kind === "diagram") return <div id={pageId} className="canvas-diagram" onKeyUp={captureSelection} onMouseUp={captureSelection}><DiagramPreview source={document.body} /></div>;
+  if (document.kind === "diagram") return <div aria-label="Diagram preview" id={pageId} className="canvas-diagram" onKeyUp={captureSelection} onMouseUp={captureSelection} role="region"><DiagramPreview source={document.body} /></div>;
   return <pre id={pageId} className={`canvas-preview canvas-preview--${document.kind}`} onKeyUp={captureSelection} onMouseUp={captureSelection}>{document.body}</pre>;
 }
 

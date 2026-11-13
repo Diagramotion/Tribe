@@ -67,7 +67,7 @@ export async function renderCanvasDiagramSvg(document) {
       fontSize: "15px",
     },
   });
-  const id = `tribe-diagram-export-${Math.random().toString(36).slice(2)}`;
+  const id = `tribe-diagram-export-${globalThis.crypto.randomUUID()}`;
   const { svg } = await mermaid.render(id, document.body);
   // Mermaid embeds the diagram's intrinsic width as a max-width, which prevents
   // responsive chat previews and expanded previews from using their viewport.

@@ -30,12 +30,10 @@ test("credential references avoid collisions with existing MCP secrets", () => {
   assert.equal(credentialReference("linear-cloud", ["TRIBE_MCP_LINEAR_CLOUD_TOKEN"]), "TRIBE_MCP_LINEAR_CLOUD_TOKEN_2");
 });
 
-test("remote service form offers unauthenticated, token and OAuth sign-in methods", () => {
+test("remote service form starts with concise connection fields", () => {
   const html = renderToStaticMarkup(React.createElement(AddRemoteServiceForm, { onAdd: async () => true }));
-  assert.match(html, /Add a remote service/);
+  assert.match(html, /Add remote server/);
   assert.match(html, /Service address/);
-  assert.match(html, /Sign-in method/);
-  assert.match(html, /Access token/);
-  assert.match(html, /Sign in with browser/);
-  assert.match(html, /HTTPS/);
+  assert.match(html, /Sign-in/);
+  assert.match(html, /No sign-in/);
 });

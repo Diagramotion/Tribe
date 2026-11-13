@@ -29,10 +29,15 @@ test("uses a bounded fallback when a hidden browser cannot paint", async () => {
 });
 
 test("does not request paint from a destroyed browser page", async () => {
+  let requestedPaint = false;
   const contents = {
     isDestroyed: () => true,
-    executeJavaScript: () => { throw new Error("must not run"); },
+    executeJavaScript: () => {
+      requestedPaint = true;
+      throw new Error("must not run");
+    },
   };
 
   await waitForBrowserPaint(contents, 20);
+  assert.equal(requestedPaint, false);
 });

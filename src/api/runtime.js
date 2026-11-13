@@ -81,12 +81,13 @@ export const runtime = {
       try {
         let hasMore = false;
         do {
+          if (closed) break;
           const { events = [], hasMore: nextPage = false } = await request(
             `/api/events?mission=${encodeURIComponent(missionId)}&after=${cursor}&limit=200`,
           );
           for (const event of events) deliver(event);
           hasMore = nextPage && events.length > 0;
-        } while (hasMore && !closed);
+        } while (hasMore);
       } catch { /* EventSource keeps retrying; the fallback poll will try again. */ }
       finally {
         recovering = false;
@@ -299,7 +300,11 @@ export const runtime = {
     const filename = disposition.match(/filename="([^"]+)"/)?.[1] ?? "tribe-project-activity.json";
     return { blob: await response.blob(), filename };
   },
-  getMcpConfig: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/mcp`),
+  getMcpConfig: () => request("/api/mcp"),
+  getProjectMcpExclusions: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/mcp-exclusions`),
+  saveProjectMcpExclusions: (projectId, excluded) => request(`/api/projects/${encodeURIComponent(projectId)}/mcp-exclusions`, {
+    method: "PUT", body: JSON.stringify({ excluded }),
+  }),
   getComputerAccess: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/computer-access`),
   getBrowserRuntime: () => request("/api/browser/runtime"),
   getBrowserSessions: (missionId) => request(`/api/missions/${encodeURIComponent(missionId)}/browser`),
@@ -341,21 +346,21 @@ export const runtime = {
   cancelComputerRequest: (id, completionToken) => request(`/api/computer/requests/${encodeURIComponent(id)}/cancel`, {
     method: "POST", body: JSON.stringify({ completionToken }),
   }),
-  saveMcpConfig: (projectId, config) => request(`/api/projects/${encodeURIComponent(projectId)}/mcp`, {
+  saveMcpConfig: (_projectId, config) => request("/api/mcp", {
     method: "PUT", body: JSON.stringify({ config }),
   }),
-  checkMcpServer: (projectId, serverName) => request(`/api/projects/${encodeURIComponent(projectId)}/mcp/check`, {
-    method: "POST", body: JSON.stringify({ serverName }),
+  checkMcpServer: (projectId, serverName) => request("/api/mcp/check", {
+    method: "POST", body: JSON.stringify({ projectId, serverName }),
   }),
-  mcpOAuthStatus: (projectId, serverName) => request(`/api/projects/${encodeURIComponent(projectId)}/mcp/oauth/${encodeURIComponent(serverName)}/status`),
-  forgetMcpOAuth: (projectId, serverName) => request(`/api/projects/${encodeURIComponent(projectId)}/mcp/oauth/${encodeURIComponent(serverName)}`, { method: "DELETE" }),
-  installPlaywrightBrowser: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/mcp/playwright`, {
+  mcpOAuthStatus: (_projectId, serverName) => request(`/api/mcp/oauth/${encodeURIComponent(serverName)}/status`),
+  forgetMcpOAuth: (_projectId, serverName) => request(`/api/mcp/oauth/${encodeURIComponent(serverName)}`, { method: "DELETE" }),
+  installPlaywrightBrowser: () => request("/api/mcp/playwright", {
     method: "POST", body: JSON.stringify({}),
   }),
-  installPlaywrightChromium: (projectId) => request(`/api/projects/${encodeURIComponent(projectId)}/mcp/playwright/install`, {
+  installPlaywrightChromium: () => request("/api/mcp/playwright/install", {
     method: "POST", body: JSON.stringify({}),
   }),
-  saveMcpSecrets: (projectId, secrets) => request(`/api/projects/${encodeURIComponent(projectId)}/mcp/secrets`, {
+  saveMcpSecrets: (_projectId, secrets) => request("/api/mcp/secrets", {
     method: "PUT", body: JSON.stringify({ secrets }),
   }),
   createAgent: (definition, projectId = null) => request("/api/agents", {

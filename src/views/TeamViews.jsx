@@ -275,11 +275,11 @@ export function AgentRolesView({ agents, capabilityCatalog = [], agentConfigured
             <legend>Repository access</legend>
             <div className="repository-access-options" role="radiogroup" aria-label="Repository access">
               <label className={`repository-access-option ${repositoryAccess === "read_only" ? "repository-access-option--selected" : ""}`}>
-                <input checked={repositoryAccess === "read_only"} name="repository-access" onChange={() => setRepositoryAccess("read_only")} type="radio" value="read_only" />
+                <input aria-label="Read only" checked={repositoryAccess === "read_only"} name="repository-access" onChange={() => setRepositoryAccess("read_only")} type="radio" value="read_only" />
                 <span><strong>Read only</strong><small>Inspect and verify</small></span>
               </label>
               <label className={`repository-access-option ${repositoryAccess === "workspace_write" ? "repository-access-option--selected" : ""}`}>
-                <input checked={repositoryAccess === "workspace_write"} name="repository-access" onChange={() => setRepositoryAccess("workspace_write")} type="radio" value="workspace_write" />
+                <input aria-label="Can edit" checked={repositoryAccess === "workspace_write"} name="repository-access" onChange={() => setRepositoryAccess("workspace_write")} type="radio" value="workspace_write" />
                 <span><strong>Can edit</strong><small>Change repository files</small></span>
               </label>
             </div>

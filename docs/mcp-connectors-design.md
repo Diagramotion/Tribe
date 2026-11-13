@@ -2,7 +2,7 @@
 
 ## Boundary
 
-Model providers and service connections are separate concerns. Pydantic AI selects the model provider; MCP connects agents to tools and data services. Keep remote services under the existing project-scoped MCP boundary rather than adding provider-specific connector code.
+Model providers and service connections are separate concerns. Pydantic AI selects the model provider; MCP connects agents to tools and data services. Keep MCP server definitions and credentials at workspace scope; let project settings exclude selected workspace servers. Do not add provider-specific connector code.
 
 Use Pydantic AI's `MCPToolset` and its FastMCP client for protocol, discovery and tool lifecycle. Tribe should own the user flow, credential scope, permission policy, durable connection status and audit events. Continue using `load_mcp_toolsets` for ordinary stdio and HTTP configurations. OAuth needs a small direct `MCPToolset` construction path because the installed configuration loader maps HTTP entries to URL plus headers and does not expose its `auth` argument.
 
@@ -10,7 +10,7 @@ Pydantic AI documents HTTP authentication on `MCPToolset`; FastMCP provides an O
 
 ## First-party connection flow
 
-The Connections screen offers **Add a remote service** with a small form for no-auth, header-token or browser OAuth connections:
+Workspace Connections offers first-class setup for local stdio servers and **Add a remote service** for no-auth, header-token or browser OAuth connections:
 
 - Name shown to the user and agents.
 - HTTPS service address. Permit HTTP only for loopback development servers.
@@ -19,12 +19,12 @@ The Connections screen offers **Add a remote service** with a small form for no-
 
 After connection, show the server's advertised tools and let the user explicitly mark read-only tools. OAuth consent is initiated only by **Sign in and check**; agents cannot open a browser sign-in flow. The user can inspect sign-in state and forget credentials saved on this device. All non-read-only tool calls retain Tribe's exact-action approval. OAuth consent authorises the service account; it does not approve agent actions.
 
-Keep advanced JSON for stdio commands and protocol options. The common OAuth flow must not require editing JSON or environment-variable names.
+The local-server form accepts any executable, arguments and environment references. Keep advanced JSON for protocol options. The common OAuth flow must not require editing JSON or environment-variable names.
 
 ## Credential and event handling
 
 - Store OAuth access/refresh tokens and any dynamic client registration data in the OS keychain through FastMCP's `AsyncKeyValue` storage interface.
-- Scope credential keys to the local workspace, project, server identity and endpoint. Never store credentials in MCP JSON, SQLite, backups, mission events, agent prompts or logs.
+- Scope credential keys to the local workspace, server identity and endpoint. Project exclusions control access to a configured server without creating project-specific copies of its credentials. Never store credentials in MCP JSON, SQLite, backups, mission events, agent prompts or logs.
 - If OS credential storage is unavailable, fail closed; do not fall back to plaintext or memory-only storage.
 - Persist only connection metadata and state such as `not_connected`, `connected`, `needs_sign_in` and the last successful check. Never persist token values or authorization codes.
 - “Forget sign-in” deletes Tribe's local token and client-registration entries. It cannot promise to revoke the remote grant; explain that provider-side revocation may be needed.

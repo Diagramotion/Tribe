@@ -32,6 +32,7 @@ export function LinkPreviews({ source }) {
     setLoading(true);
     Promise.all(urls.map(getLinkPreview))
       .then((result) => { if (active) setPreviews(result.filter(Boolean)); })
+      .catch(() => { if (active) setPreviews([]); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [urls]);

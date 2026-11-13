@@ -357,11 +357,16 @@ export function RepositoryView({ artifact, project, missionId, agents = [], onBr
           ? <MediaArtifactPreview artifact={artifact} />
           : artifact.previewDataUrl
           ? <figure className="artifact-image-preview">
-            <div className={`artifact-image-stage ${pinMode ? "artifact-image-stage--pinning" : ""}`} onClick={(event) => {
+            <div aria-label={pinMode ? `Add a review comment to ${artifact.name}` : undefined} className={`artifact-image-stage ${pinMode ? "artifact-image-stage--pinning" : ""}`} onClick={(event) => {
               if (!pinMode) return;
               const point = imagePointAnchor(event.clientX, event.clientY, event.currentTarget.getBoundingClientRect());
               if (point) { setReviewAnchor(point); setPinMode(false); }
-            }}>
+            }} onKeyDown={(event) => {
+              if (!pinMode || !["Enter", " "].includes(event.key)) return;
+              event.preventDefault();
+              setReviewAnchor({ x: 0.5, y: 0.5 });
+              setPinMode(false);
+            }} role={pinMode ? "button" : undefined} tabIndex={pinMode ? 0 : undefined}>
               <img alt={`Preview of ${artifact.name}`} draggable="false" src={artifact.previewDataUrl} />
               {reviewThreads.map((thread, index) => isImagePointAnchor(thread.anchor) && <button
                 aria-label={`Review comment ${index + 1} at ${Math.round(thread.anchor.x * 100)} percent across, ${Math.round(thread.anchor.y * 100)} percent down`}

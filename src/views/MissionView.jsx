@@ -692,7 +692,7 @@ function InteractionCard({ interaction, onResolve }) {
           onKeyDown={(event) => {
             if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && answer.trim()) {
               event.preventDefault();
-              sendAnswer();
+              void sendAnswer();
             }
           }}
           placeholder="Write your answer…"

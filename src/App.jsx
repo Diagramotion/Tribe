@@ -24,6 +24,7 @@ import {
   Gear,
   GitDiff,
   GitBranch,
+  Plug,
   ListChecks,
   MagnifyingGlass,
   Paperclip,
@@ -65,7 +66,7 @@ import { parseMissionPrompt } from "./domain/slash-commands.js";
 import { modelDisplayName, sortModelCatalog } from "./domain/model-catalog.js";
 import { IconButton, Sidebar } from "./components/WorkspaceSidebar.jsx";
 import { SelectControl } from "./components/SelectControl.jsx";
-import { AddRemoteServiceForm } from "./components/AddRemoteServiceForm.jsx";
+import { AddLocalServiceForm, AddRemoteServiceForm } from "./components/AddRemoteServiceForm.jsx";
 import { useDialogFocus } from "./hooks/useDialogFocus.js";
 import { ViewErrorBoundary } from "./components/ViewErrorBoundary.jsx";
 import { AgentActivityView, ArtifactList, MissionView } from "./views/MissionView.jsx";
@@ -144,6 +145,51 @@ function MissionWorkflowProgress({ stages, currentStageId, currentTitle, title, 
         </li>;
       })}
     </ol>
+  </section>;
+}
+
+function ProjectMcpAccess({ projectId, onManage }) {
+  const [servers, setServers] = useState([]);
+  const [excluded, setExcluded] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let current = true;
+    setLoading(true);
+    Promise.all([runtime.getMcpConfig(), runtime.getProjectMcpExclusions(projectId)])
+      .then(([workspace, project]) => {
+        if (!current) return;
+        setServers(Object.keys(workspace.config?.mcpServers ?? {}).sort());
+        setExcluded(project.excluded ?? []);
+      })
+      .catch((cause) => { if (current) setError(cause.message); })
+      .finally(() => { if (current) setLoading(false); });
+    return () => { current = false; };
+  }, [projectId]);
+  async function setServerIncluded(name, included) {
+    const next = included ? excluded.filter((item) => item !== name) : [...excluded, name];
+    setSaving(true);
+    setError("");
+    try {
+      const result = await runtime.saveProjectMcpExclusions(projectId, next);
+      setExcluded(result.excluded ?? next);
+    } catch (cause) {
+      setError(cause.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+  return <section className="settings-card">
+    <div className="settings-card-heading"><span className="settings-symbol"><Plug size={17} /></span><div><h3>Workspace MCP servers</h3><p>Connections are configured once in workspace settings. Choose which ones agents can use in this project; role grants still control individual tools.</p></div><button className="button button--quiet" onClick={onManage} type="button">Manage workspace servers</button></div>
+    {loading ? <p className="settings-note">Loading connections…</p> : servers.length === 0 ? <p className="settings-note">No workspace MCP servers are configured.</p> : <div className="project-mcp-exclusions" aria-label="Workspace MCP access for this project">
+      {servers.map((name) => {
+        const included = !excluded.includes(name);
+        return <label className="mcp-enable-toggle" key={name}><input aria-label={`${name} available in this project`} checked={included} disabled={saving} onChange={(event) => void setServerIncluded(name, event.target.checked)} role="switch" type="checkbox" /><span aria-hidden="true" className="mcp-enable-switch" />{name}<small>{included ? "Available" : "Excluded"}</small></label>;
+      })}
+    </div>}
+    {error && <p className="recipe-error" role="alert">{error}</p>}
+    <p className="settings-note">Exclusions apply to every agent in this project and do not change the workspace connection or credentials.</p>
   </section>;
 }
 
@@ -275,7 +321,7 @@ function mcpSecretNames(raw) {
         });
       });
     });
-    return [...references].sort();
+    return [...references].sort((left, right) => left.localeCompare(right));
   } catch {
     return [];
   }
@@ -376,7 +422,7 @@ export function App() {
     if (tab === "Browser") {
       const currentBrowserState = browserWorkspaceStateRef.current;
       const browserTab = currentBrowserState.tabs.find((item) => item.id === currentBrowserState.activeTabId) ?? currentBrowserState.tabs[0];
-      if (browserTab) selectBrowserWorkspaceTab(browserTab.id);
+      if (browserTab) void selectBrowserWorkspaceTab(browserTab.id);
       else void openBrowserWorkspace();
       return;
     }
@@ -592,6 +638,7 @@ export function App() {
   const [providerModels, setProviderModels] = useState(null);
   const [providerModelsDiscovering, setProviderModelsDiscovering] = useState(false);
   const [mcpConfigInput, setMcpConfigInput] = useState('{\n  "mcpServers": {}\n}');
+  const [mcpAddType, setMcpAddType] = useState("remote");
   const [mcpSavedConfig, setMcpSavedConfig] = useState('{\n  "mcpServers": {}\n}');
   const [mcpSaving, setMcpSaving] = useState(false);
   const [mcpChecks, setMcpChecks] = useState({});
@@ -894,7 +941,7 @@ export function App() {
   }
 
   useEffect(() => {
-    refreshPendingRequests();
+    void refreshPendingRequests();
     const timer = window.setInterval(refreshPendingRequests, 2500);
     return () => window.clearInterval(timer);
   }, []);
@@ -1056,7 +1103,7 @@ export function App() {
       }).catch(() => {});
     }
     if (event.type.startsWith("interaction.") && event.type.endsWith(".requested")) {
-      refreshPendingRequests();
+      void refreshPendingRequests();
       const item = mapInteraction(event.payload.interaction);
       const waiting = pendingInteractionAgentsRef.current.get(item.agent) ?? new Set();
       waiting.add(item.id);
@@ -1080,7 +1127,7 @@ export function App() {
         : agent));
     }
     if (event.type.startsWith("interaction.") && event.type.endsWith(".resolved")) {
-      refreshPendingRequests();
+      void refreshPendingRequests();
       const resolved = event.payload.interaction;
       const waiting = pendingInteractionAgentsRef.current.get(resolved.requested_by);
       waiting?.delete(resolved.id);
@@ -1163,7 +1210,7 @@ export function App() {
         if (preferredIndex > 0) mappedInteractions.unshift(...mappedInteractions.splice(preferredIndex, 1));
         if (preferredIndex >= 0) preferredInteractionRef.current = null;
         setInteractions(mappedInteractions);
-        refreshPendingRequests();
+        void refreshPendingRequests();
         setWorkItems(data.workItems.map(mapWorkItem));
         setIsolatedWorkspaces(data.isolatedWorkspaces ?? []);
         setArtifacts(data.artifacts.map(mapArtifact));
@@ -1185,7 +1232,7 @@ export function App() {
         if (alive) setRuntimeStatus("offline");
       }
     };
-    load();
+    void load();
     return () => { alive = false; unsubscribe(); };
   }, [project.id, mission?.id, showNewChat, selectedGeneralChat]);
 
@@ -1203,7 +1250,7 @@ export function App() {
         }
       } catch { /* Command history will refresh when the runtime reconnects. */ }
     };
-    refresh();
+    void refresh();
     if (activeTab !== "Runs" && !(projectPaneOpen && selectedWorkspaceView === "Runs")) return () => { alive = false; };
     const timer = window.setInterval(refresh, 1200);
     return () => { alive = false; window.clearInterval(timer); };
@@ -1215,7 +1262,7 @@ export function App() {
     const refresh = async () => {
       try { const result = await runtime.listSchedules(project.id); if (alive) setSchedules(result.schedules); } catch { /* Keep the cached schedule list while reconnecting. */ }
     };
-    refresh();
+    void refresh();
     if (activeTab !== "Schedules" && !(projectPaneOpen && selectedWorkspaceView === "Schedules") && !(projectSettingsOpen && projectSettingsSection === "schedules")) return () => { alive = false; };
     const timer = window.setInterval(refresh, 5000);
     return () => { alive = false; window.clearInterval(timer); };
@@ -1268,7 +1315,7 @@ export function App() {
     const refresh = async () => {
       try { const result = await runtime.getUsage(project.id); if (alive) setUsage(result.usage); } catch { /* Usage data is available again when the runtime reconnects. */ }
     };
-    refresh();
+    void refresh();
     if (activeTab !== "Settings") return () => { alive = false; };
     const timer = window.setInterval(refresh, 5000);
     return () => { alive = false; window.clearInterval(timer); };
@@ -2132,6 +2179,7 @@ export function App() {
 
   async function openAgentSettings(mode = "model", presetModel = null, presetBaseUrl = null, presetApiKey = "") {
     setSettingsMode(mode);
+    if (mode === "mcp") setMcpAddType("remote");
     setModelInput(presetModel ?? agentRuntime.model ?? "");
     setModelBaseUrlInput(presetBaseUrl ?? agentRuntime.baseUrl ?? "");
     setApiKeyInput(presetApiKey);
@@ -2144,9 +2192,8 @@ export function App() {
     setMcpSecretStatus({});
     setMcpSecretValues({});
     setSettingsOpen(true);
-    if (!project.id) return;
     try {
-      const { config, secretStatus } = await runtime.getMcpConfig(project.id);
+      const { config, secretStatus } = await runtime.getMcpConfig();
       const serialisedConfig = JSON.stringify(config, null, 2);
       setMcpConfigInput(serialisedConfig);
       setMcpSavedConfig(serialisedConfig);
@@ -2154,12 +2201,12 @@ export function App() {
       setMcpSecretValues({});
       const oauthServers = Object.entries(config.mcpServers ?? {}).filter(([, definition]) => definition.oauth);
       const statuses = await Promise.all(oauthServers.map(async ([name]) => {
-        try { return [name, await runtime.mcpOAuthStatus(project.id, name)]; }
+        try { return [name, await runtime.mcpOAuthStatus(null, name)]; }
         catch { return [name, { state: "needs_sign_in" }]; }
       }));
       setMcpOAuthStatuses(Object.fromEntries(statuses));
-    } catch (error) {
-      setSettingsError(`Could not load MCP servers: ${error.message}`);
+    } catch {
+      setSettingsError("Couldn’t load workspace servers. Try again.");
     }
   }
 
@@ -2169,7 +2216,7 @@ export function App() {
   }
 
   async function addRemoteMcpServer({ serviceKey, endpoint, authMode, oauthScopes, headerName, headerValue, credentialName }) {
-    if (!project.id || mcpSaving) return false;
+    if (mcpSaving) return false;
     let config;
     try {
       config = JSON.parse(mcpConfigInput);
@@ -2183,7 +2230,7 @@ export function App() {
       return false;
     }
     if (Object.keys(servers).length >= 50) {
-      setSettingsError("This project has reached the 50 service limit.");
+      setSettingsError("The workspace has reached the 50 service limit.");
       return false;
     }
     if (Object.hasOwn(servers, serviceKey)) {
@@ -2198,7 +2245,7 @@ export function App() {
     setSettingsError("");
     let configSaved = false;
     try {
-      const response = await runtime.saveMcpConfig(project.id, nextConfig);
+      const response = await runtime.saveMcpConfig(null, nextConfig);
       configSaved = true;
       const serialisedConfig = JSON.stringify(response.config, null, 2);
       setMcpConfigInput(serialisedConfig);
@@ -2207,7 +2254,7 @@ export function App() {
       setMcpChecks((current) => ({ ...current, [serviceKey]: null }));
       if (authMode === "oauth") setMcpOAuthStatuses((current) => ({ ...current, [serviceKey]: { state: "needs_sign_in" } }));
       if (headerValue) {
-        const saved = await runtime.saveMcpSecrets(project.id, { [credentialName]: headerValue });
+        const saved = await runtime.saveMcpSecrets(null, { [credentialName]: headerValue });
         setMcpSecretStatus(saved.secretStatus ?? {});
       }
       setMcpSecretValues({});
@@ -2229,8 +2276,47 @@ export function App() {
     }
   }
 
+  async function addLocalMcpServer({ serviceKey, definition }) {
+    if (mcpSaving) return false;
+    let config;
+    try { config = JSON.parse(mcpConfigInput); }
+    catch { setSettingsError("Fix the advanced connection settings before adding a service."); return false; }
+    const servers = config?.mcpServers;
+    if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+      setSettingsError("The connection settings must contain an mcpServers object.");
+      return false;
+    }
+    if (Object.keys(servers).length >= 50) { setSettingsError("The workspace has reached the 50 service limit."); return false; }
+    if (Object.hasOwn(servers, serviceKey)) { setSettingsError("A service with that name already exists."); return false; }
+    setMcpSaving(true);
+    setSettingsError("");
+    try {
+      const response = await runtime.saveMcpConfig(null, { ...config, mcpServers: { ...servers, [serviceKey]: definition } });
+      const serialisedConfig = JSON.stringify(response.config, null, 2);
+      setMcpConfigInput(serialisedConfig);
+      setMcpSavedConfig(serialisedConfig);
+      setMcpSecretStatus(response.secretStatus ?? {});
+      setMcpChecks((current) => ({ ...current, [serviceKey]: { loading: true, error: "" } }));
+      try {
+        const check = await runtime.checkMcpServer(project.id, serviceKey);
+        setMcpChecks((current) => ({ ...current, [serviceKey]: { loading: false, tools: check.tools, preflight: check.preflight, error: "" } }));
+        notify(`Local server added · ${check.tools.length} tools found`);
+      } catch (checkError) {
+        setMcpChecks((current) => ({ ...current, [serviceKey]: { loading: false, tools: null, error: checkError.message } }));
+        notify("Local server added, but it could not connect. Check the message below.");
+      }
+      return true;
+    } catch (error) {
+      setSettingsError(error.message === "not_found"
+        ? "MCP settings are unavailable in this Tribe version. Restart Tribe after updating it."
+        : error.message);
+      return false;
+    } finally {
+      setMcpSaving(false);
+    }
+  }
+
   async function saveMcpConfig(configOverride = null) {
-    if (!project.id) return;
     setSettingsError("");
     let config;
     try {
@@ -2241,7 +2327,7 @@ export function App() {
     }
     setMcpSaving(true);
     try {
-      const response = await runtime.saveMcpConfig(project.id, config);
+      const response = await runtime.saveMcpConfig(null, config);
       const serialisedConfig = JSON.stringify(response.config, null, 2);
       setMcpConfigInput(serialisedConfig);
       setMcpSavedConfig(serialisedConfig);
@@ -2256,11 +2342,10 @@ export function App() {
   }
 
   async function installPlaywrightBrowser() {
-    if (!project.id) return;
     setMcpSaving(true);
     setSettingsError("");
     try {
-      const response = await runtime.installPlaywrightBrowser(project.id);
+      const response = await runtime.installPlaywrightBrowser();
       const serialisedConfig = JSON.stringify(response.config, null, 2);
       setMcpConfigInput(serialisedConfig);
       setMcpSavedConfig(serialisedConfig);
@@ -2274,7 +2359,7 @@ export function App() {
   }
 
   async function checkMcpServer(serverName) {
-    if (!project.id || mcpConfigInput !== mcpSavedConfig) return;
+    if (mcpConfigInput !== mcpSavedConfig) return;
     const isOAuth = Boolean(mcpServerEntries(mcpConfigInput).find(([name]) => name === serverName)?.[1]?.oauth);
     setMcpChecks((current) => ({ ...current, [serverName]: { ...(current[serverName] ?? {}), loading: true, error: "" } }));
     try {
@@ -2292,23 +2377,22 @@ export function App() {
   }
 
   async function installPlaywrightChromium() {
-    if (!project.id || mcpBrowserInstall[project.id]?.loading) return;
-    const projectId = project.id;
-    setMcpBrowserInstall((current) => ({ ...current, [projectId]: { loading: true, installed: false, error: "" } }));
+    if (mcpBrowserInstall.workspace?.loading) return;
+    setMcpBrowserInstall((current) => ({ ...current, workspace: { loading: true, installed: false, error: "" } }));
     try {
-      await runtime.installPlaywrightChromium(projectId);
-      setMcpBrowserInstall((current) => ({ ...current, [projectId]: { loading: false, installed: true, error: "" } }));
+      await runtime.installPlaywrightChromium();
+      setMcpBrowserInstall((current) => ({ ...current, workspace: { loading: false, installed: true, error: "" } }));
     } catch (error) {
-      setMcpBrowserInstall((current) => ({ ...current, [projectId]: { loading: false, installed: false, error: error.message } }));
+      setMcpBrowserInstall((current) => ({ ...current, workspace: { loading: false, installed: false, error: error.message } }));
     }
   }
 
   async function forgetMcpOAuth(serverName) {
-    if (!project.id || mcpSaving) return;
+    if (mcpSaving) return;
     setMcpSaving(true);
     setSettingsError("");
     try {
-      const status = await runtime.forgetMcpOAuth(project.id, serverName);
+      const status = await runtime.forgetMcpOAuth(null, serverName);
       setMcpOAuthStatuses((current) => ({ ...current, [serverName]: status }));
       setMcpChecks((current) => ({ ...current, [serverName]: null }));
       notify("Service sign-in removed from this device.");
@@ -2332,13 +2416,12 @@ export function App() {
   }
 
   async function saveMcpSecrets() {
-    if (!project.id) return;
     const secrets = Object.fromEntries(Object.entries(mcpSecretValues).filter(([, value]) => value));
     if (!Object.keys(secrets).length) return;
     setMcpSaving(true);
     setSettingsError("");
     try {
-      const { secretStatus } = await runtime.saveMcpSecrets(project.id, secrets);
+      const { secretStatus } = await runtime.saveMcpSecrets(null, secrets);
       setMcpSecretStatus(secretStatus);
       setMcpSecretValues({});
       notify("Tool credentials saved securely.");
@@ -2350,11 +2433,10 @@ export function App() {
   }
 
   async function forgetMcpSecret(name) {
-    if (!project.id) return;
     setMcpSaving(true);
     setSettingsError("");
     try {
-      const { secretStatus } = await runtime.saveMcpSecrets(project.id, { [name]: "" });
+      const { secretStatus } = await runtime.saveMcpSecrets(null, { [name]: "" });
       setMcpSecretStatus(secretStatus);
       setMcpSecretValues((current) => ({ ...current, [name]: "" }));
       notify(`${name} credentials removed.`);
@@ -2479,7 +2561,7 @@ export function App() {
       const { interaction } = await runtime.resolveInteraction(activeInteraction.id, resolution, accessScope);
       if (interaction.event) applyEvent(interaction.event);
       if (interaction.unblocked_event) applyEvent(interaction.unblocked_event);
-      refreshPendingRequests();
+      void refreshPendingRequests();
       notify(activeInteraction.type === "approval"
         ? resolution === "denied" ? "Action declined."
           : accessScope === "chat" ? "Public web access allowed for this chat."
@@ -2589,7 +2671,7 @@ export function App() {
       if (!opened) return;
     }
     setComposerDraft({
-      token: `${Date.now()}-${Math.random()}`,
+      token: globalThis.crypto.randomUUID(),
       text: `Analyse these selected spreadsheet cells.\n\nSource workbook: ${artifact.name}\nWorksheet: ${sheet}\nRange: ${range}\n\n${text}`,
       attachments: [{ id: artifact.id, name: artifact.name, mediaType: artifact.type, size: artifact.size }],
     });
@@ -2654,7 +2736,7 @@ export function App() {
       if (!opened) return;
     }
     setComposerDraft({
-      token: `${Date.now()}-${Math.random()}`,
+      token: globalThis.crypto.randomUUID(),
       text: "Please help me with this document: ",
       canvasDocument: context,
     });
@@ -2941,6 +3023,7 @@ export function App() {
 
   function renderProjectSettingsSection(section) {
     if (section === "team") return <AgentRolesView agents={agents} capabilityCatalog={capabilityCatalog} projectAgentIds={project.agentIds ?? agents.map((agent) => agent.id)} agentConfigured={agentRuntime.enabled} onCreate={(definition) => createAgentDefinition(definition, project.id)} onUpdate={updateAgentDefinition} onArchive={archiveAgentDefinition} onUpdateProjectTeam={updateProjectTeam} onConnectModel={() => openAgentSettings("model")} onManageModels={() => { setProjectSettingsOpen(false); openWorkspaceSettings("models"); }} />;
+    if (section === "mcp") return <ProjectMcpAccess projectId={project.id} onManage={() => { setProjectSettingsOpen(false); openAgentSettings("mcp"); }} />;
     if (section === "datasets") return <ProjectDatasetsView projectId={project.id} />;
     if (section === "approvals") return <ApprovalSettingsView projectId={project.id} />;
     if (section === "interactive") return <InteractiveAccessView onSave={saveInteractiveAccess} policy={interactiveAccess} projectName={project.name} />;
@@ -3190,7 +3273,7 @@ export function App() {
         {settingsOpen && (
           <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeAgentSettings(); }}>
             <section className="mission-dialog agent-settings-dialog" ref={agentSettingsDialogRef} role="dialog" aria-modal="true" aria-labelledby="agent-settings-heading" tabIndex={-1}>
-              <div className="dialog-heading"><div><span className="eyebrow">{settingsMode === "mcp" ? `Project tools · ${project.name}` : "Workspace default"}</span><h2 id="agent-settings-heading">{settingsMode === "mcp" ? "Manage tool connections" : agentRuntime.configured ? "Change default model" : "Choose a default model"}</h2></div><IconButton label="Close" onClick={closeAgentSettings}><X size={17} /></IconButton></div>
+              <div className="dialog-heading"><div><span className="eyebrow">{settingsMode === "mcp" ? "Workspace" : "Workspace default"}</span><h2 id="agent-settings-heading">{settingsMode === "mcp" ? "MCP servers" : agentRuntime.configured ? "Change default model" : "Choose a default model"}</h2></div><IconButton label="Close" onClick={closeAgentSettings}><X size={17} /></IconButton></div>
               {settingsMode === "model" && <form className="model-settings-form" id="model-settings-form" onSubmit={saveSettings}>
                 <p className="settings-note">Chats use this model when no chat preference is set. An explicit agent-role choice takes priority over the chat selection. Agents may send mission details and repository content to the provider; credentials are saved securely on this device.</p>
                 <div className="ollama-discovery">
@@ -3209,20 +3292,25 @@ export function App() {
                 {modelInput.toLowerCase().startsWith("ollama:") && <p className="settings-note">Tribe connects to Ollama on this device by default. To use a different address, set <code>TRIBE_OLLAMA_BASE_URL</code>.</p>}
               </form>}
               {settingsMode === "mcp" && <section className="mcp-settings" aria-labelledby="mcp-settings-heading">
-                <div className="mcp-settings-heading"><div><h3 id="mcp-settings-heading">Tool connections</h3><p className="settings-note">Add tools agents can use in {project.name}. Actions that change data ask for your approval.</p></div><div className="mcp-heading-actions"><button className="button button--quiet" disabled={mcpSaving || !project.id || mcpConfigInput === mcpSavedConfig} onClick={() => saveMcpConfig()} type="button">{mcpSaving ? "Saving…" : "Save changes"}</button><button className="button button--quiet" disabled={mcpSaving || !project.id || hasMcpServer(mcpConfigInput, "playwright")} onClick={installPlaywrightBrowser} type="button">Add browser tools</button></div></div>
-                <p className="settings-note">Browser tools run in an isolated headless session. The first browser launch may download Chromium; install it ahead of time here if you prefer. Agents can inspect pages without approval; opening pages, clicking, typing and inspecting network requests require approval. Code execution is disabled.</p>
+                <div className="mcp-settings-heading"><div><h3 id="mcp-settings-heading">Connect MCP servers</h3><p className="settings-note">Connect local or remote servers. Projects can exclude any server.</p></div><div className="mcp-heading-actions"><button className="button button--quiet" disabled={mcpSaving || mcpConfigInput === mcpSavedConfig} onClick={() => saveMcpConfig()} type="button">{mcpSaving ? "Saving…" : "Save changes"}</button><button className="button button--quiet" disabled={mcpSaving || hasMcpServer(mcpConfigInput, "playwright")} onClick={installPlaywrightBrowser} type="button">Add browser tools</button></div></div>
                 <div className="mcp-server-list">
-                  <AddRemoteServiceForm onAdd={addRemoteMcpServer} saving={mcpSaving} secretNames={mcpSecretNames(mcpConfigInput)} serverNames={mcpServerEntries(mcpConfigInput).map(([name]) => name)} />
-                  {mcpServerEntries(mcpConfigInput).length === 0 && <div className="mcp-empty">No other tools connected. Add local services in advanced settings, or add browser tools above.</div>}
+                  <div aria-label="Connection type" className="mcp-add-type-switch" role="group">
+                    <button aria-pressed={mcpAddType === "remote"} className={mcpAddType === "remote" ? "mcp-add-type--active" : ""} onClick={() => setMcpAddType("remote")} type="button">Remote</button>
+                    <button aria-pressed={mcpAddType === "local"} className={mcpAddType === "local" ? "mcp-add-type--active" : ""} onClick={() => setMcpAddType("local")} type="button">Local</button>
+                  </div>
+                  {mcpAddType === "local"
+                    ? <AddLocalServiceForm onAdd={addLocalMcpServer} saving={mcpSaving} serverNames={mcpServerEntries(mcpConfigInput).map(([name]) => name)} />
+                    : <AddRemoteServiceForm onAdd={addRemoteMcpServer} saving={mcpSaving} secretNames={mcpSecretNames(mcpConfigInput)} serverNames={mcpServerEntries(mcpConfigInput).map(([name]) => name)} />}
                   {mcpServerEntries(mcpConfigInput).map(([name, definition]) => {
                     const check = mcpChecks[name];
                     const isPlaywright = name === "playwright" && definition.command === "npx" && (definition.args ?? []).some((argument) => argument.startsWith("@playwright/mcp@"));
-                    const browserInstall = mcpBrowserInstall[project.id];
+                    const browserInstall = mcpBrowserInstall.workspace;
                     const disabledTools = new Set(definition.disabledTools ?? []);
                     return <article className="mcp-server-card" key={name}>
                       <div className="mcp-server-card-heading"><div><strong>{name}</strong><small>{definition.command ? `Local · ${definition.command}` : `Remote · ${definition.url}`}</small></div><label className="mcp-enable-toggle"><input aria-label={`${name} enabled`} checked={!definition.disabled} onChange={(event) => updateMcpServer(name, (server) => ({ ...server, disabled: !event.target.checked }))} role="switch" type="checkbox" /><span aria-hidden="true" className="mcp-enable-switch" />Enabled</label></div>
                       <div className="mcp-server-card-actions"><button className="button button--quiet" disabled={mcpSaving || check?.loading || mcpConfigInput !== mcpSavedConfig} onClick={() => checkMcpServer(name)} type="button">{check?.loading ? (definition.oauth ? "Signing in…" : "Checking…") : definition.oauth ? "Sign in and check" : "Check connection"}</button>{isPlaywright && <button className="button button--quiet" disabled={browserInstall?.loading || mcpConfigInput !== mcpSavedConfig} onClick={installPlaywrightChromium} type="button">{browserInstall?.loading ? "Installing Chromium…" : "Install Chromium"}</button>}{definition.oauth && <><span className={`mcp-oauth-state mcp-oauth-state--${mcpOAuthStatuses[name]?.state ?? "unknown"}`}>{mcpOAuthStatuses[name]?.state === "connected" ? "Signed in on this device" : "Sign-in needed"}</span>{mcpOAuthStatuses[name]?.state === "connected" && <button className="button button--quiet" disabled={mcpSaving} onClick={() => forgetMcpOAuth(name)} type="button">Forget sign-in</button>}<small>{mcpOAuthStatuses[name]?.state === "connected" ? "Forget removes saved credentials here; revoke access with the service to end its grant." : "Your browser will open to request access when you sign in."}</small></>}{mcpConfigInput !== mcpSavedConfig && <small>Save changes before checking.</small>}</div>
                       {isPlaywright && browserInstall?.installed && <p className="mcp-preflight-status" role="status">Chromium is installed on this device.</p>}
+                      {isPlaywright && <p className="settings-note">Page inspection is read-only. Navigation and interaction need approval.</p>}
                       {isPlaywright && browserInstall?.error && <p className="mcp-check-error" role="status">Couldn’t install Chromium · {browserInstall.error}</p>}
                       {check?.error && <p className="mcp-check-error" role="status">Connection failed · {check.error}</p>}
                       {check?.preflight?.ready && <p className="mcp-preflight-status" role="status">Playwright opened its browser successfully with Node.js {check.preflight.nodeVersion}.</p>}
@@ -3230,10 +3318,10 @@ export function App() {
                     </article>;
                   })}
                 </div>
-                <details className="mcp-advanced-config"><summary>Advanced connection settings (JSON)</summary><textarea aria-label="Tool connection settings" className="mcp-config-input" onChange={(event) => setMcpConfigInput(event.target.value)} spellCheck="false" value={mcpConfigInput} /></details>
+                <details className="mcp-advanced-config"><summary>Advanced (JSON)</summary><textarea aria-label="Tool connection settings" className="mcp-config-input" onChange={(event) => setMcpConfigInput(event.target.value)} spellCheck="false" value={mcpConfigInput} /></details>
                 {mcpSecretNames(mcpConfigInput).length > 0 && <div className="mcp-secret-list">
                   <strong>Server credentials</strong>
-                  <p className="settings-note">Credentials are saved separately and supplied when the connection starts.</p>
+                  <p className="settings-note">Credentials are stored in your device keychain.</p>
                   {mcpSecretNames(mcpConfigInput).map((name) => <div className="mcp-secret-row" key={name}>
                     <label>{name}<input autoComplete="new-password" onChange={(event) => setMcpSecretValues((current) => ({ ...current, [name]: event.target.value }))} placeholder={mcpSecretStatus[name] === "environment" ? "Provided by the app environment" : mcpSecretStatus[name] === "keychain" ? "Saved securely · enter to replace" : "Required"} type="password" value={mcpSecretValues[name] ?? ""} /></label>
                     {mcpSecretStatus[name] === "keychain" && <button className="button button--quiet" disabled={mcpSaving} onClick={() => forgetMcpSecret(name)} type="button">Forget</button>}

@@ -499,7 +499,7 @@ export function BrowserView({ visible = true, projects = [], onStateChange }) {
       <button onClick={() => void resolvePermission(request.id, "allow-once")} type="button">Allow once</button>
       {request.canRemember && <><button onClick={() => void resolvePermission(request.id, "block-profile")} type="button">Always block</button><button onClick={() => void resolvePermission(request.id, "allow-profile")} type="button">Always allow</button></>}
     </div>)}
-    {customViewportDialog && <div className="tribe-browser-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setCustomViewportDialog(false); }}>
+    {customViewportDialog && <div className="tribe-browser-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setCustomViewportDialog(false); }} role="presentation">
       <form aria-labelledby="tribe-browser-custom-viewport-title" aria-modal="true" className="tribe-browser-profile-dialog tribe-browser-custom-viewport" onSubmit={(event) => void applyCustomViewport(event)} role="dialog">
         <header><div><h2 id="tribe-browser-custom-viewport-title">Custom viewport</h2><p>Set the page dimensions for responsive checks.</p></div><IconButton label="Close custom viewport" onClick={() => setCustomViewportDialog(false)} type="button"><X size={16} /></IconButton></header>
         <div className="tribe-browser-custom-fields">
@@ -509,7 +509,7 @@ export function BrowserView({ visible = true, projects = [], onStateChange }) {
         <footer><button onClick={() => setCustomViewportDialog(false)} type="button">Cancel</button><button type="submit">Apply viewport</button></footer>
       </form>
     </div>}
-    {emulationDialog && <div className="tribe-browser-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setEmulationDialog(false); }}>
+    {emulationDialog && <div className="tribe-browser-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setEmulationDialog(false); }} role="presentation">
       <form aria-labelledby="tribe-browser-emulation-title" aria-modal="true" className="tribe-browser-profile-dialog tribe-browser-custom-viewport" onSubmit={(event) => void applyEmulationSettings(event)} role="dialog">
         <header><div><h2 id="tribe-browser-emulation-title">Page emulation</h2><p>Set this tab’s language, motion preference and network connection.</p></div><IconButton label="Close page emulation" onClick={() => setEmulationDialog(false)} type="button"><X size={16} /></IconButton></header>
         <div className="tribe-browser-custom-fields tribe-browser-emulation-fields">
@@ -521,7 +521,7 @@ export function BrowserView({ visible = true, projects = [], onStateChange }) {
         <footer><button onClick={() => setEmulationDialog(false)} type="button">Cancel</button><button type="submit">Apply to this tab</button></footer>
       </form>
     </div>}
-    {diagnosticsDialog && <div className="tribe-browser-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setDiagnosticsDialog(false); }}>
+    {diagnosticsDialog && <div className="tribe-browser-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setDiagnosticsDialog(false); }} role="presentation">
       <section aria-labelledby="tribe-browser-diagnostics-title" aria-modal="true" className="tribe-browser-profile-dialog tribe-browser-diagnostics-dialog" role="dialog">
         <header><div><h2 id="tribe-browser-diagnostics-title">Page diagnostics</h2><p title={diagnostics.url}>{diagnostics.url || "Current browser tab"}</p></div><div className="tribe-browser-dialog-actions"><IconButton disabled={diagnosticsLoading} label="Refresh diagnostics" onClick={() => void refreshDiagnostics()} type="button"><ArrowClockwise className={diagnosticsLoading ? "spin" : ""} size={15} /></IconButton><IconButton label="Close page diagnostics" onClick={() => setDiagnosticsDialog(false)} type="button"><X size={16} /></IconButton></div></header>
         <nav aria-label="Diagnostic type" className="tribe-browser-diagnostics-tabs" role="tablist">
@@ -546,7 +546,7 @@ export function BrowserView({ visible = true, projects = [], onStateChange }) {
         </div>
       </section>
     </div>}
-    {profileDialog && <div className="tribe-browser-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setProfileDialog(false); }}>
+    {profileDialog && <div className="tribe-browser-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setProfileDialog(false); }} role="presentation">
       <section aria-labelledby="tribe-browser-profiles-title" aria-modal="true" className="tribe-browser-profile-dialog" role="dialog">
         <header><div><h2 id="tribe-browser-profiles-title">Browser profiles</h2><p>Profiles keep website sign-ins and site data between Tribe sessions.</p></div><IconButton label="Close browser profiles" onClick={() => setProfileDialog(false)} type="button"><X size={16} /></IconButton></header>
         <div className="tribe-browser-profile-list">

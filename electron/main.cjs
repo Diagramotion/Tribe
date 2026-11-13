@@ -95,7 +95,7 @@ function runBrowserShortcut(action, scope = "workspace") {
   }
   if (!tab || !contents || contents.isDestroyed()) return;
   if (["back", "forward", "reload", "hard-reload"].includes(action)) {
-    clearAgentRequestPolicy(scope, tabId);
+    clearAgentRequestPolicy(contents);
     tab.agentAllowedDomains = null;
   }
   if (action === "close-tab") {
@@ -1427,7 +1427,7 @@ function snapshotPage(prefix) {
       type,
       accept: type === "file" ? String(element.accept || "").slice(0, 256) : undefined,
       multiple: element instanceof HTMLSelectElement || type === "file" ? Boolean(element.multiple) : undefined,
-      value: ["password", "hidden", "file"].includes(type) ? undefined : undefined,
+      value: undefined,
       checked: "checked" in element ? Boolean(element.checked) : undefined,
       disabled: Boolean(element.disabled),
       options: element instanceof HTMLSelectElement
@@ -2892,6 +2892,9 @@ app.whenReady().then(async () => {
   startBrowserAutomationServer();
   await createMainWindow();
   app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) void createMainWindow(); });
+}).catch((error) => {
+  console.error("Tribe could not start:", error);
+  app.quit();
 });
 
 app.on("before-quit", (event) => {

@@ -79,9 +79,9 @@ The latest desktop release provides installers for **Apple Silicon macOS** and *
 
 **[Download the latest release](https://github.com/Diagramotion/Tribe/releases/latest)**
 
-The macOS download is a zipped `.app`; Windows downloads include MSI and NSIS installers. Releases include SHA-256 checksums. New macOS releases are signed with a Developer ID certificate and notarised; Windows installers remain unsigned and may show a SmartScreen trust prompt. Previously published releases are not changed retroactively. See [macOS release signing](docs/releases/macos-signing.md) for the release workflow requirements.
+The macOS download is a zipped `.app`; Windows downloads use the NSIS installer. Releases include SHA-256 checksums. New macOS releases are signed with a Developer ID certificate and notarised; Windows installers remain unsigned and may show a SmartScreen trust prompt. The earlier v0.1.0 release also includes MSI installers. Previously published releases are not changed retroactively. See [macOS release signing](docs/releases/macos-signing.md) for the release workflow requirements.
 
-The Tauri desktop release includes the local Python runtime. The managed Chromium browser is being developed in a separate Electron shell and is not included in these installers.
+Previously published v0.1.0 installers use Tauri and do not include the managed browser. New tagged releases use Electron, which bundles the managed Chromium browser and local Python runtime; existing releases are not changed retroactively.
 
 ## Models, privacy and permissions
 
@@ -98,7 +98,7 @@ Each role’s available tools come from its profile grants. Sensitive or externa
 - Node.js 22
 - Python 3.11 or later
 - [uv](https://docs.astral.sh/uv/)
-- Rust toolchain for the Tauri desktop application
+- Rust toolchain only when building the legacy Tauri shell
 
 ### Run the workspace preview
 
@@ -116,7 +116,7 @@ Open the local URL printed by Vite. Add a project, select its team and configure
 
 ```sh
 uv sync --project runtime --extra ai --extra desktop
-npm run desktop:dev
+npm run desktop:electron
 ```
 
 For development checks and packaging details, see [CONTRIBUTING.md](CONTRIBUTING.md) and [runtime and application architecture](docs/runtime-foundation.md).
@@ -149,7 +149,7 @@ The app and project data stay local. With a hosted model, the prompt and relevan
 
 ### Which operating systems are supported?
 
-The current Tauri desktop release targets Apple Silicon macOS and 64-bit Windows. The managed Chromium browser is part of a separate Electron shell and is not included in the release installers.
+The Electron desktop release targets Apple Silicon macOS and 64-bit Windows and includes the managed Chromium browser. Previously published v0.1.0 Tauri installers remain available in that release’s assets.
 
 ## Roadmap and contributing
 

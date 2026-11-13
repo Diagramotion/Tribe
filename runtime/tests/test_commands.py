@@ -100,13 +100,12 @@ class BackgroundCommandLaunchTests(unittest.TestCase):
         argv = ["git", "status", "--short"]
         self.assertIs(build_launch_argv(argv, r"C:\Program Files\Git\git.exe", windows=True), argv)
 
-    def test_command_parser_rejects_shell_syntax(self) -> None:
+    def test_command_parser_accepts_executables_without_a_code_allowlist(self) -> None:
         self.assertEqual(BackgroundCommandRunner.parse("pytest -q tests"), ["pytest", "-q", "tests"])
         self.assertEqual(BackgroundCommandRunner.parse("uv run pytest -q"), ["uv", "run", "pytest", "-q"])
         self.assertEqual(BackgroundCommandRunner.parse("bun run test"), ["bun", "run", "test"])
         self.assertEqual(BackgroundCommandRunner.parse("make check"), ["make", "check"])
-        with self.assertRaisesRegex(ValueError, "allowed_executable"):
-            BackgroundCommandRunner.parse("echo unsafe")
+        self.assertEqual(BackgroundCommandRunner.parse("gh pr view 42"), ["gh", "pr", "view", "42"])
 
     def test_jupyter_is_an_allowed_command_and_prefers_project_environment(self) -> None:
         self.assertEqual(
@@ -291,7 +290,7 @@ class BackgroundCommandLaunchTests(unittest.TestCase):
 
     def test_project_approved_executable_can_be_parsed(self) -> None:
         self.assertEqual(
-            BackgroundCommandRunner.parse("terraform plan", ["terraform"]),
+            BackgroundCommandRunner.parse("terraform plan"),
             ["terraform", "plan"],
         )
 

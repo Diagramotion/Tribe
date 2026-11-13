@@ -126,7 +126,7 @@ class OAuthMcpRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     patch("keyring.set_password", side_effect=set_password), \
                     patch("keyring.delete_password", side_effect=delete_password):
                 credentials = OAuthKeyringStore(
-                    project["id"], "docs", workspace_id=str(store.data_dir.resolve()),
+                    "workspace", "docs", workspace_id=str(store.data_dir.resolve()),
                 )
                 from mcp.shared.auth import OAuthToken
 

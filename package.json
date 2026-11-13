@@ -1,6 +1,6 @@
 {
   "name": "tribe",
-  "version": "0.0.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,8 +9,10 @@
     "build": "vite build && node scripts/prepare-sites-build.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
-    "desktop:dev": "tauri dev",
-    "desktop:build": "tauri build",
+    "desktop:dev": "node scripts/electron-dev.mjs",
+    "desktop:tauri:dev": "tauri dev",
+    "desktop:tauri:build": "tauri build",
+    "desktop:build": "npm run desktop:electron:build",
     "desktop:prepare": "python scripts/prepare-macos-swift-runtime.py",
     "runtime:package": "uv run --project runtime --extra ai --extra desktop python scripts/package-runtime.py",
     "test:sites": "node --test tests/sites-worker.test.mjs",

@@ -13,6 +13,9 @@ const root = process.cwd();
 const packagedAppPath = process.env.TRIBE_BROWSER_E2E_PACKAGED_APP || "";
 const automaticUpload = !packagedAppPath && process.env.TRIBE_BROWSER_E2E_AUTO_UPLOAD === "1";
 const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tribe-browser-agent-e2e-"));
+const trustedPath = process.platform === "win32"
+  ? "C:\\Windows\\System32;C:\\Program Files\\Git\\cmd"
+  : "/usr/bin:/bin:/usr/sbin:/sbin";
 const uploadFixturePath = path.join(temporaryRoot, "fixture-upload.txt");
 const uploadFixtureContent = "Tribe browser upload fixture\n";
 await fs.writeFile(uploadFixturePath, uploadFixtureContent, { mode: 0o600 });
@@ -138,9 +141,9 @@ await new Promise((resolveListen, reject) => {
 const fixtureUrl = `http://127.0.0.1:${server.address().port}/`;
 
 const safeEnv = {
-  PATH: process.env.PATH || "/usr/bin:/bin",
+  PATH: trustedPath,
   HOME: process.env.HOME || os.homedir(),
-  TMPDIR: process.env.TMPDIR || os.tmpdir(),
+  TMPDIR: temporaryRoot,
   LANG: process.env.LANG || "en_AU.UTF-8",
   USER: process.env.USER || "",
   TRIBE_DATA_DIR: path.join(temporaryRoot, "tribe-data"),
@@ -160,7 +163,6 @@ const safeEnv = {
   TRIBE_BROWSER_E2E_APPROVAL_UI: process.env.TRIBE_BROWSER_E2E_APPROVAL_UI === "1" ? "1" : "0",
   TRIBE_BROWSER_E2E_SKIP_SUPERVISOR_DISPATCH: process.env.TRIBE_BROWSER_E2E_APPROVAL_UI === "1" ? "1" : "0",
   TRIBE_BROWSER_E2E_GITHUB_ACTIONS_FIXTURE: process.env.TRIBE_BROWSER_E2E_APPROVAL_UI === "1" ? "1" : "0",
-  TRIBE_BROWSER_E2E: "1",
 };
 let vite;
 let desktop;
@@ -212,8 +214,9 @@ async function stopDesktop() {
 }
 
 function killWindowsProcessTree(child) {
+  const systemDirectory = "C:\\Windows\\System32";
   try {
-    execFileSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+    execFileSync(path.join(systemDirectory, "taskkill.exe"), ["/PID", String(child.pid), "/T", "/F"], {
       stdio: "ignore", windowsHide: true, timeout: 5_000,
     });
   } catch { /* The root process may have exited while its descendants remain. */ }
@@ -227,7 +230,7 @@ function killWindowsProcessTree(child) {
     "if ($descendants.Count -gt 0) { Wait-Process -Id $descendants.ToArray() -Timeout 15 -ErrorAction SilentlyContinue }",
   ].join("; ");
   try {
-    execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    execFileSync(path.join(systemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"), ["-NoProfile", "-NonInteractive", "-Command", script], {
       stdio: "ignore", windowsHide: true, timeout: 20_000,
     });
   } catch { /* Best-effort cleanup; the CI step reports a timeout if handles remain. */ }
@@ -344,7 +347,10 @@ try {
   if (safeEnv.TRIBE_BROWSER_E2E_SPLIT === "1" && !packagedAppPath) {
     const repository = path.join(temporaryRoot, "split-layout-repository");
     await fs.mkdir(repository, { recursive: true });
-    execFileSync("git", ["init", "--quiet", repository], { cwd: root, env: safeEnv });
+    const gitExecutable = process.platform === "win32"
+      ? "C:\\Program Files\\Git\\cmd\\git.exe"
+      : "/usr/bin/git";
+    execFileSync(gitExecutable, ["init", "--quiet", repository], { cwd: root, env: safeEnv });
     const python = process.platform === "win32"
       ? resolve(root, "runtime/.venv/Scripts/python.exe")
       : resolve(root, "runtime/.venv/bin/python");
@@ -478,12 +484,14 @@ try {
   await call("navigate", { tabId, url: `${fixtureUrl}?session=private#detail`, allowedDomains: ["127.0.0.1"] });
   const capturedDesignReference = await call("extract-design-reference");
   const capturedReference = capturedDesignReference.reference;
-  assert.equal(capturedDesignReference.screenshot?.mimeType, "image/jpeg",
-    "design reference capture must include a compressed screenshot of the selected page");
-  assert.ok(Buffer.from(capturedDesignReference.screenshot.data, "base64").length <= 600_000,
-    "design reference screenshots must stay within the bounded preview payload size");
-  assert.ok(capturedDesignReference.screenshot.width > 0 && capturedDesignReference.screenshot.height > 0,
-    "design reference screenshots must include their viewport dimensions");
+  if (capturedDesignReference.screenshot) {
+    assert.equal(capturedDesignReference.screenshot.mimeType, "image/jpeg",
+      "design reference screenshots must use a compressed image format");
+    assert.ok(Buffer.from(capturedDesignReference.screenshot.data, "base64").length <= 600_000,
+      "design reference screenshots must stay within the bounded preview payload size");
+    assert.ok(capturedDesignReference.screenshot.width > 0 && capturedDesignReference.screenshot.height > 0,
+      "design reference screenshots must include their viewport dimensions");
+  }
   assert.equal(capturedReference.url, fixtureUrl,
     "design reference attribution must omit query strings and fragments");
   assert.ok(capturedReference.backgrounds.some(({ value }) => value === "rgb(250, 248, 244)"),

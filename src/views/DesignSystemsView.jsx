@@ -239,8 +239,29 @@ function packageRootAttributes(source, tagName, theme) {
 
 function packageLayoutGuidance(system) {
   const content = system.packageFiles?.find((item) => item.path === "DESIGN.md")?.content ?? "";
-  const sections = [...content.matchAll(/^#{2,3}\s+([^\n]*(?:layout|spacing|grid|responsive|adaptation)[^\n]*)\n([\s\S]*?)(?=^#{2,3}\s|$(?![\s\S]))/gim)];
-  return sections.map((match) => ({ heading: match[1].trim(), body: match[2].trim() })).filter((item) => item.body);
+  const sections = [];
+  let current = null;
+  for (const line of content.split(/\r?\n/)) {
+    let headingLevel = 0;
+    while (line[headingLevel] === "#") headingLevel += 1;
+    if ((headingLevel === 2 || headingLevel === 3) && (line[headingLevel] === " " || line[headingLevel] === "\t")) {
+      if (current) sections.push(current);
+      let title = line.slice(headingLevel).trimEnd();
+      let closingHashStart = title.length;
+      while (closingHashStart > 0 && title[closingHashStart - 1] === "#") closingHashStart -= 1;
+      if (closingHashStart < title.length && closingHashStart > 0 && (title[closingHashStart - 1] === " " || title[closingHashStart - 1] === "\t")) {
+        title = title.slice(0, closingHashStart).trimEnd();
+      }
+      title = title.trim();
+      current = /(?:layout|spacing|grid|responsive|adaptation)/i.test(title)
+        ? { heading: title, lines: [] }
+        : null;
+    } else if (current) {
+      current.lines.push(line);
+    }
+  }
+  if (current) sections.push(current);
+  return sections.map(({ heading, lines }) => ({ heading, body: lines.join("\n").trim() })).filter((item) => item.body);
 }
 
 function packageLogo(system) {
@@ -266,7 +287,60 @@ function packageAsset(system, fromPath, reference) {
   }
 }
 
-function packageCss(system, source, sourcePath, seen = new Set(), depth = 0, budget = { remaining: 1_000_000 }) {
+function rewritePackageCssUrls(system, css, sourcePath) {
+  const urlToken = /url\(/gi;
+  let output = "";
+  let position = 0;
+  let token;
+  while ((token = urlToken.exec(css))) {
+    const start = token.index;
+    let cursor = urlToken.lastIndex;
+    while (cursor < css.length && /\s/.test(css[cursor])) cursor += 1;
+    const quote = css[cursor] === "\"" || css[cursor] === "'" ? css[cursor] : "";
+    let reference;
+    let close;
+    if (quote) {
+      const valueStart = cursor + 1;
+      const valueEnd = css.indexOf(quote, valueStart);
+      if (valueEnd < 0) {
+        output += css.slice(position);
+        return output;
+      }
+      reference = css.slice(valueStart, valueEnd);
+      cursor = valueEnd + 1;
+      while (cursor < css.length && /\s/.test(css[cursor])) cursor += 1;
+      if (css[cursor] !== ")") {
+        output += css.slice(position, urlToken.lastIndex);
+        position = urlToken.lastIndex;
+        continue;
+      }
+      close = cursor;
+    } else {
+      close = css.indexOf(")", cursor);
+      if (close < 0) {
+        output += css.slice(position);
+        return output;
+      }
+      reference = css.slice(cursor, close).trim();
+    }
+
+    output += css.slice(position, start);
+    const trimmed = reference.trim();
+    if (trimmed.startsWith("#")) {
+      output += `url("${trimmed}")`;
+    } else {
+      const asset = packageAsset(system, sourcePath, trimmed);
+      const dataUrl = packageAssetDataUrl(asset);
+      output += dataUrl ? `url("${dataUrl}")` : "none";
+    }
+    position = close + 1;
+    urlToken.lastIndex = position;
+  }
+  return output + css.slice(position);
+}
+
+function packageCss(system, source, sourcePath, seen = new Set(), depth = 0, budget = null) {
+  budget ??= { remaining: 1_000_000 };
   if (typeof source !== "string" || source.length > 500_000 || source.length > budget.remaining || depth > 8) return "";
   budget.remaining -= source.length;
   const imports = source.replace(/@import\s+(?:url\(\s*)?["']?([^"'\s)]+)["']?\s*\)?\s*;/gi, (_match, reference) => {
@@ -275,12 +349,7 @@ function packageCss(system, source, sourcePath, seen = new Set(), depth = 0, bud
     const nextSeen = new Set(seen).add(asset.path);
     return packageCss(system, asset.content, asset.path, nextSeen, depth + 1, budget);
   });
-  return imports.replace(/url\(\s*(["']?)(.*?)\1\s*\)/gi, (_match, _quote, reference) => {
-    if (reference.trim().startsWith("#")) return `url("${reference.trim()}")`;
-    const asset = packageAsset(system, sourcePath, reference);
-    const dataUrl = packageAssetDataUrl(asset);
-    return dataUrl ? `url("${dataUrl}")` : "none";
-  }).replace(/<\/style/gi, "<\\/style");
+  return rewritePackageCssUrls(system, imports, sourcePath).replace(/<\/style/gi, "<\\/style");
 }
 
 function packageLogoDataUrl(asset) {
@@ -411,7 +480,6 @@ export default function DesignSystemsView({ projects = [], onProjectDesignSystem
     runtime.listDesignSystems().then(({ systems = [] }) => {
       if (!current) return;
       setUserSystems(systems);
-      if (systems.length) setSelectedId((id) => id.startsWith("custom-") ? id : id);
     }).catch((error) => {
       if (current) setLoadError(error.message || "Could not load saved design systems.");
     }).finally(() => { if (current) setLoading(false); });
@@ -1448,8 +1516,8 @@ export default function DesignSystemsView({ projects = [], onProjectDesignSystem
         </section>
       </div>
     </div>
-    {editor && draft && <div className="mission-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) requestCloseEditor(); }}>
-      <form aria-labelledby="design-system-editor-title" aria-modal="true" className="mission-dialog design-system-editor" onSubmit={saveDraft} role="dialog">
+    {editor && draft && <div className="mission-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) requestCloseEditor(); }} role="presentation">
+      <form aria-labelledby="design-system-editor-title" aria-modal="true" className="mission-dialog design-system-editor" onSubmit={saveDraft} role="dialog" tabIndex={-1}>
         <header className="design-system-editor-heading"><div><span className="eyebrow">{editor.mode === "edit" ? "New version" : editor.source === "project" ? "Project extraction" : "Reusable design guidance"}</span><h2 id="design-system-editor-title">{editor.mode === "edit" ? `Edit ${selected.name}` : editor.source === "project" ? `Review ${draft.name}` : "Create a design system"}</h2><p>{editor.source === "project" ? "Review extracted tokens, source files and the responsive preview before saving." : "Set tokens and component guidance, then review them in the live preview."}</p></div><button aria-label="Close" className="icon-button" disabled={saving || assetBusy} onClick={requestCloseEditor} type="button"><X size={16} /></button></header>
         <div className="design-system-editor-body">
           <label>System name<input autoFocus maxLength={100} onChange={(event) => updateDraft("name", event.target.value)} required value={draft.name} /></label>
@@ -1487,7 +1555,7 @@ export default function DesignSystemsView({ projects = [], onProjectDesignSystem
               <div className="design-system-reference-mock" style={{ background: draft.tokens.canvas, color: draft.tokens.text, borderColor: draft.tokens.line, borderRadius: draft.tokens.radius, fontFamily: draft.tokens.font, fontSize: draft.tokens.fontSize }}>
                 <span style={{ color: draft.tokens.muted }}>Draft system · {draft.name || "Untitled"}</span><strong>Preview components</strong>
                 <input aria-label="Preview search field" placeholder="Search items" style={{ background: draft.tokens.surface, color: draft.tokens.text, borderColor: draft.tokens.line, borderRadius: draft.tokens.radius }} />
-                <div><button style={{ background: draft.tokens.accent, color: draft.tokens.canvas, borderRadius: draft.tokens.radius }}>Primary action</button><span style={{ background: draft.tokens.success, color: contrastRatio(draft.tokens.success, "#ffffff") >= 4.5 ? "#ffffff" : "#07111c", borderRadius: draft.tokens.radius }}>Ready</span></div>
+                <div><button type="button" style={{ background: draft.tokens.accent, color: draft.tokens.canvas, borderRadius: draft.tokens.radius }}>Primary action</button><span style={{ background: draft.tokens.success, color: contrastRatio(draft.tokens.success, "#ffffff") >= 4.5 ? "#ffffff" : "#07111c", borderRadius: draft.tokens.radius }}>Ready</span></div>
                 <small style={{ color: draft.tokens.muted }}>Body text, field and status colours</small>
               </div>
             </div>

@@ -28,7 +28,7 @@ function downloadWorkbook(artifact) {
     link.download = artifact.name;
     link.click();
     URL.revokeObjectURL(url);
-  });
+  }).catch((error) => console.error("Could not download workbook:", error));
 }
 
 export function XlsxArtifactPreview({ artifact, canSendSelection, onUseSelection }) {

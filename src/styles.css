@@ -344,7 +344,7 @@ input::placeholder, textarea::placeholder { color: var(--muted-2); opacity: 1; }
 .search-box { width: 208px; height: 31px; padding: 0 8px; display: flex; align-items: center; gap: 7px; border: 1px solid var(--line-subtle); border-radius: var(--radius-control); background: #0f1b2a; color: var(--muted); }
 .search-box input { flex: 1; width: 100px; border: 0; outline: 0; background: transparent; color: var(--text); font-size: var(--font-ui-strong); }
 .search-box input::placeholder { color: var(--muted); }
-.search-box kbd { padding: 2px 4px; border: 1px solid var(--line-subtle); border-radius: 4px; color: var(--muted); font: 12px inherit; }
+.search-box kbd { padding: 2px 4px; border: 1px solid var(--line-subtle); border-radius: 4px; color: var(--muted); font-size: 12px; font-family: inherit; }
 .agent-live i, .channel-live i { width: 6px; height: 6px; display: inline-block; border-radius: 50%; background: var(--success); }
 
 .page-heading { min-height: 105px; padding: 20px 30px 17px; display: flex; align-items: center; justify-content: space-between; gap: var(--space-5); }
@@ -3103,35 +3103,29 @@ select option:checked { background: var(--surface-selected); color: var(--text);
 .mcp-settings .settings-note { margin: 0; }
 .mcp-config-input { min-height: 136px; max-height: 240px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important; font-size: var(--font-ui-strong) !important; line-height: var(--leading-body); }
 .mcp-server-list { display: grid; gap: var(--space-2); }
+.mcp-add-type-switch { width: fit-content; display: inline-flex; gap: 3px; padding: 3px; border: 1px solid var(--line-subtle); border-radius: var(--radius-control); background: var(--surface-well); }
+.mcp-add-type-switch button { min-width: 92px; min-height: 30px; padding: 0 12px; border: 0; border-radius: calc(var(--radius-control) - 3px); background: transparent; color: var(--muted); font: 600 var(--font-ui) system-ui, sans-serif; cursor: pointer; }
+.mcp-add-type-switch button:hover { color: var(--text); }
+.mcp-add-type-switch button.mcp-add-type--active { background: var(--surface-selected); color: var(--text); box-shadow: 0 0 0 1px var(--line-control); }
 .mcp-add-service { display: grid; gap: 11px; padding: 13px; border: 1px solid var(--line-subtle); border-radius: 9px; background: var(--surface-soft); }
-.mcp-add-service-heading { display: flex; align-items: center; gap: 9px; }
-.mcp-add-service-heading > div { display: grid; gap: 3px; }
-.mcp-add-service-heading strong { color: var(--text); font-size: var(--font-body); }
-.mcp-add-service-heading small, .mcp-add-service-footer > small, .mcp-token-fields > small { color: var(--muted-2); font-size: var(--font-caption); line-height: 1.45; }
+.mcp-add-service-footer > small { color: var(--muted-2); font-size: var(--font-caption); line-height: 1.45; }
 .mcp-add-service-fields { display: grid; grid-template-columns: minmax(150px, .7fr) minmax(0, 1.5fr); gap: 9px; }
 .mcp-add-service label, .model-settings-form label { min-width: 0; display: grid; gap: 6px; color: var(--text-secondary); font-size: var(--font-ui); font-weight: 600; }
 .mcp-add-service input:not([type="checkbox"]):not([type="radio"]), .model-settings-form input, .model-settings-form select { width: 100%; min-width: 0; min-height: 34px; padding: 0 9px; border: 1px solid var(--line-control); border-radius: var(--radius-compact); background: var(--canvas); color: var(--text); font: 12px system-ui, sans-serif; }
+.mcp-add-service textarea { width: 100%; min-width: 0; min-height: 64px; padding: 8px 9px; border: 1px solid var(--line-control); border-radius: var(--radius-compact); background: var(--canvas); color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
+.mcp-add-service label small { color: var(--muted-2); font-size: var(--font-caption); font-weight: 400; line-height: 1.4; }
 .mcp-auth-toggle { position: relative; width: fit-content; min-height: 26px; display: inline-flex !important; align-items: center; gap: 8px !important; cursor: pointer; }
 .mcp-auth-toggle input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); clip-path: inset(50%); white-space: nowrap; }
 .mcp-auth-toggle input:focus-visible + .computer-access-switch { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 .mcp-auth-toggle input:checked + .computer-access-switch { border-color: var(--accent-primary-border); background: var(--accent-primary); }
 .mcp-auth-toggle input:checked + .computer-access-switch::before { transform: translateX(15px); background: var(--text); }
 .mcp-auth-toggle > span:last-child { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font-size: var(--font-ui); }
-.mcp-auth-methods { min-width: 0; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; border: 0; }
-.mcp-auth-methods legend { margin-bottom: 6px; padding: 0; color: var(--text-secondary); font-size: var(--font-ui); font-weight: 600; }
-.mcp-add-service .mcp-auth-method { min-width: 0; min-height: 52px; padding: var(--space-2); display: flex; align-items: flex-start; gap: var(--space-2); border: 1px solid var(--line-subtle); border-radius: var(--radius-control); background: var(--canvas); cursor: pointer; }
-.mcp-add-service .mcp-auth-method:hover { border-color: var(--line-strong); }
-.mcp-add-service .mcp-auth-method--selected { border-color: var(--accent-primary-border); background: var(--surface-selected); }
-.mcp-add-service .mcp-auth-method input[type="radio"] { width: 15px; height: 15px; min-height: 15px; margin: 1px 0 0; flex: 0 0 15px; accent-color: #52aef6; }
-.mcp-add-service .mcp-auth-method > span { min-width: 0; display: grid; gap: 3px; }
-.mcp-add-service .mcp-auth-method strong { color: var(--text); font-size: var(--font-caption); }
-.mcp-add-service .mcp-auth-method small { color: var(--muted-2); font-size: var(--font-compact); line-height: 1.35; font-weight: 400; }
-.mcp-add-service .mcp-auth-method:focus-within { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 .mcp-token-fields { display: grid; grid-template-columns: minmax(130px, .6fr) minmax(0, 1.4fr); gap: var(--space-2); align-items: end; }
-.mcp-token-fields > small { grid-column: 1 / -1; }
 .mcp-add-service-footer { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
 .mcp-add-service-footer > small { max-width: 440px; }
 .mcp-add-service .settings-error { margin: 0; }
+.mcp-auth-advanced { display: grid; gap: 9px; }
+.mcp-auth-advanced summary { width: fit-content; color: var(--muted); font-size: var(--font-ui); cursor: pointer; }
 .model-settings-form { display: grid; gap: 18px; }
 .mcp-empty { padding: 13px; border: 1px dashed var(--line-subtle); border-radius: var(--radius-card); color: var(--muted); font-size: var(--font-ui-strong); }
 .mcp-server-card { display: grid; gap: 9px; padding: 11px; border: 1px solid var(--line-subtle); border-radius: 9px; background: var(--surface-soft); }
@@ -3147,6 +3141,9 @@ select option:checked { background: var(--surface-selected); color: var(--text);
 .mcp-enable-toggle input:checked + .mcp-enable-switch::before { transform: translateX(13px); background: var(--text); }
 .mcp-enable-toggle input:focus-visible + .mcp-enable-switch { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 .mcp-enable-toggle input:disabled + .mcp-enable-switch { opacity: .45; cursor: not-allowed; }
+.project-mcp-exclusions { display: grid; gap: 8px; margin: 13px 0; }
+.project-mcp-exclusions .mcp-enable-toggle { min-height: 34px; padding: 7px 9px; display: flex !important; border: 1px solid var(--line-subtle); border-radius: var(--radius-control); background: var(--surface-soft); }
+.project-mcp-exclusions .mcp-enable-toggle small { margin-left: auto; color: var(--muted); font-size: var(--font-caption); }
 .mcp-tool-row input { width: 15px !important; height: 15px !important; flex: 0 0 15px; margin: 0; padding: 0 !important; appearance: none; border: 1px solid var(--line-control); border-radius: 4px; background: var(--surface-well); cursor: pointer; }
 .mcp-tool-row input:checked { border-color: var(--accent-primary-border); background: var(--accent-primary); }
 .mcp-tool-row input:checked::after { width: 4px; height: 7px; margin: 1px 0 0 4px; display: block; border: solid var(--text); border-width: 0 1.5px 1.5px 0; content: ""; transform: rotate(45deg); }
@@ -3525,8 +3522,7 @@ select option:checked { background: var(--surface-selected); color: var(--text);
 .web-access-form .web-access-toggle { position: relative; }
 
 @media (max-width: 680px) {
-  .mcp-add-service-fields, .mcp-token-fields, .mcp-auth-methods { grid-template-columns: minmax(0, 1fr); }
-  .mcp-token-fields > small { grid-column: auto; }
+  .mcp-add-service-fields, .mcp-token-fields { grid-template-columns: minmax(0, 1fr); }
   .mcp-add-service-footer { align-items: flex-start; flex-direction: column; }
   .mcp-add-service-footer .button { align-self: flex-end; }
   .workflow-options { grid-template-columns: 1fr; }

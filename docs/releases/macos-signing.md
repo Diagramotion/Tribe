@@ -1,6 +1,6 @@
 # macOS release signing
 
-GitHub release builds for Apple Silicon must be signed with an Apple Developer ID Application certificate and notarised with an App Store Connect API key. The tag workflow fails before building the release app if any signing secret is missing; it does not publish an unsigned replacement.
+GitHub Electron release builds for Apple Silicon must be signed with an Apple Developer ID Application certificate and notarised with an App Store Connect API key. The tag workflow fails before building the release app if any signing secret is missing; it does not publish an unsigned replacement.
 
 ## Configure repository secrets
 
@@ -23,6 +23,6 @@ base64 -i DeveloperID.p12 | tr -d '\n'
 base64 -i AuthKey_ABC123.p8 | tr -d '\n'
 ```
 
-The workflow imports the certificate into a temporary keychain, asks Tauri to sign and notarise the app, and removes the keychain and private key when the build ends. The signing and notarisation secrets are exposed only to tag-triggered macOS release steps, not pull request builds.
+The workflow imports the certificate into a temporary keychain, asks Electron Builder to sign and notarise the app, and removes the keychain and private key when the build ends. The signing and notarisation secrets are exposed only to tag-triggered macOS release steps, not pull request builds.
 
-See the [Tauri macOS code signing guide](https://v2.tauri.app/distribute/sign/macos/) for creating the certificate and App Store Connect API key.
+See the [Electron Builder macOS code signing guide](https://www.electron.build/code-signing) for signing configuration and Apple's guidance for creating the certificate and App Store Connect API key.

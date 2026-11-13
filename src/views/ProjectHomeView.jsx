@@ -115,7 +115,7 @@ export function ProjectHomeView({ project, missions, skills = [], recipes = [], 
       selectSlashOption(slashOptions[activeSlashOption] ?? slashOptions[0]);
       return;
     }
-    if (event.key === "Enter" && !event.shiftKey) startMission(event);
+    if (event.key === "Enter" && !event.shiftKey) void startMission(event);
   }
 
   const recentMissions = (missions ?? []).filter((item) => !item.archived_at).slice(0, 5);
