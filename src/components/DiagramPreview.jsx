@@ -90,8 +90,8 @@ export function DiagramPreview({ source }) {
     const diagram = viewport?.querySelector("svg");
     if (!viewport || !diagram || scale <= 1) return { x: 0, y: 0 };
     const style = window.getComputedStyle(viewport);
-    const availableWidth = viewport.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
-    const availableHeight = viewport.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+  const availableWidth = viewport.clientWidth - Number.parseFloat(style.paddingLeft) - Number.parseFloat(style.paddingRight);
+  const availableHeight = viewport.clientHeight - Number.parseFloat(style.paddingTop) - Number.parseFloat(style.paddingBottom);
     const bounds = diagram.getBoundingClientRect();
     const layoutWidth = bounds.width / zoom;
     const layoutHeight = bounds.height / zoom;

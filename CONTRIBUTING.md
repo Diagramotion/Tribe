@@ -12,7 +12,7 @@ uv sync --project runtime --extra ai --extra test
 npm run dev
 ```
 
-For the desktop shell, install the Rust toolchain and platform prerequisites required by Tauri, then use `npm run desktop:dev`.
+For the Electron desktop shell and managed Browser, use `npm run desktop:dev`. The legacy Tauri shell is available separately through `npm run desktop:tauri:dev`.
 
 ## Checks
 

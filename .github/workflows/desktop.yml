@@ -17,6 +17,7 @@ permissions:
 
 jobs:
   build:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
     strategy:
       fail-fast: false
       matrix:
@@ -165,22 +166,22 @@ jobs:
 
   publish-release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build]
+    needs: [electron-browser]
     runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Download verified desktop installers
+      - name: Download verified Electron installers
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p release-assets
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --name tribe-release-aarch64-apple-darwin --dir release-assets
+            --name tribe-electron-release-aarch64-apple-darwin --dir release-assets
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --name tribe-release-x86_64-pc-windows-msvc --dir release-assets
+            --name tribe-electron-release-x86_64-pc-windows-msvc --dir release-assets
           (cd release-assets && find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
       - name: Publish GitHub release
         env:
@@ -195,7 +196,6 @@ jobs:
 
   electron-browser:
     name: Electron browser (${{ matrix.target }})
-    if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
@@ -216,6 +216,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
+      - name: Set Electron version from release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: npm version --no-git-tag-version "${GITHUB_REF_NAME#v}"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
@@ -223,6 +227,54 @@ jobs:
       - run: npm ci
       - run: python -m pip install uv
       - run: uv sync --project runtime --extra ai --extra desktop
+      - name: Prepare Electron macOS signing and notarization
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_API_ISSUER APPLE_API_KEY_ID APPLE_API_PRIVATE_KEY KEYCHAIN_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing required GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
+
+          keychain_path="$RUNNER_TEMP/tribe-electron-signing.keychain-db"
+          certificate_path="$RUNNER_TEMP/tribe-developer-id.p12"
+          api_key_path="$RUNNER_TEMP/Tribe-NotaryKey.p8"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$certificate_path"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" | base64 -D > "$api_key_path"
+          chmod 600 "$certificate_path" "$api_key_path"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$certificate_path" -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security default-keychain -d user -s "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" \
+            "$HOME/Library/Keychains/login.keychain-db" /Library/Keychains/System.keychain
+          security find-identity -v -p codesigning "$keychain_path" \
+            | grep -Fq "\"$APPLE_SIGNING_IDENTITY\"" || {
+              echo "::error::The configured identity is not present in the imported Developer ID certificate."
+              exit 1
+            }
+          echo "CSC_LINK=$certificate_path" >> "$GITHUB_ENV"
+          echo "CSC_KEY_PASSWORD=$APPLE_CERTIFICATE_PASSWORD" >> "$GITHUB_ENV"
+          echo "CSC_NAME=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY=$api_key_path" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY_ID=$APPLE_API_KEY_ID" >> "$GITHUB_ENV"
+          echo "APPLE_API_ISSUER=$APPLE_API_ISSUER" >> "$GITHUB_ENV"
       - name: Browser unit tests
         run: npm run test:browser
       - name: Live Electron browser and agent test
@@ -244,3 +296,34 @@ jobs:
         with:
           name: tribe-electron-${{ matrix.target }}
           path: release/electron/**
+      - name: Stage macOS Electron release
+        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'macOS'
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p release-assets
+          installer=$(find release/electron -maxdepth 1 -type f -name '*.zip' | head -n 1)
+          test -n "$installer"
+          cp "$installer" "release-assets/Tribe-${RELEASE_VERSION}-macos-arm64.zip"
+      - name: Stage Windows Electron release
+        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'Windows'
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "release/electron" -Filter "*.exe" | Where-Object { $_.Name -notmatch "uninstall" } | Select-Object -First 1
+          if (-not $installer) { throw "Expected an Electron Windows installer." }
+          New-Item -ItemType Directory -Force -Path "release-assets" | Out-Null
+          Copy-Item $installer.FullName "release-assets/Tribe-$env:RELEASE_VERSION-windows-x64-setup.exe"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: tribe-electron-release-${{ matrix.target }}
+          path: release-assets/*
+          if-no-files-found: error
+      - name: Remove Electron signing credentials
+        if: always() && runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/tribe-electron-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/tribe-developer-id.p12" "$RUNNER_TEMP/Tribe-NotaryKey.p8"

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import test from "node:test";
 import worker from "../worker/index.js";
 
@@ -62,7 +62,12 @@ test("does not turn missing API or write requests into the app shell", async () 
 });
 
 test("emits the files required by Sites packaging", async () => {
-  await access(new URL("../dist/client/index.html", import.meta.url));
-  await access(new URL("../dist/server/index.js", import.meta.url));
-  await access(new URL("../dist/.openai/hosting.json", import.meta.url));
+  const requiredFiles = [
+    "../dist/client/index.html",
+    "../dist/server/index.js",
+    "../dist/.openai/hosting.json",
+  ];
+  for (const relativePath of requiredFiles) {
+    assert.equal((await stat(new URL(relativePath, import.meta.url))).isFile(), true, `${relativePath} must be a file`);
+  }
 });

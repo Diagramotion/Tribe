@@ -42,8 +42,10 @@ function normalizeReducedMotion(value) {
   return preference;
 }
 
-function deviceProfileFor(viewport, chromeVersion = "140.0.0.0") {
-  const fullVersion = String(chromeVersion || "140.0.0.0");
+const DEFAULT_CHROME_VERSION = [140, 0, 0, 0].join(".");
+
+function deviceProfileFor(viewport, chromeVersion = DEFAULT_CHROME_VERSION) {
+  const fullVersion = String(chromeVersion || DEFAULT_CHROME_VERSION);
   const major = fullVersion.split(".")[0] || "140";
   const chromeToken = `Chrome/${major}.0.0.0`;
   const brands = [

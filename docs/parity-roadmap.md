@@ -18,7 +18,7 @@ flowchart LR
   Tribe --> Repo
   Runtime --> Store
   UI -->|REST and SSE| API
-  API --> Native[Tauri v2 shell and sidecar]
+  API --> Native[Electron shell and sidecar]
 ```
 
 Pydantic AI/Harness owns standard model, tool, workspace, skill, MCP, and capability composition. Tribe owns durable projects and missions, event delivery, role consumers, the agent-maintained plan, approval decisions, repository policy, and UI projections. No Pydantic `Coder` or `SubAgents` composition may silently delegate work outside the shared event channel.

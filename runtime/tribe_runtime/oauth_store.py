@@ -17,6 +17,7 @@ class OAuthKeyringStore:
 
     def __init__(
         self, project_id: str, server_name: str, *, workspace_id: str = "default", clock=time.time,
+        fallback: "OAuthKeyringStore | None" = None,
     ) -> None:
         if not project_id or not server_name:
             raise ValueError("project_and_server_required")
@@ -24,6 +25,7 @@ class OAuthKeyringStore:
         self._server_name = server_name
         self._workspace_id = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()[:24]
         self._clock = clock
+        self._fallback = fallback
 
     def _account(self, key: str, collection: str | None) -> str:
         collection_key = f"{collection or 'default'}\0{key}".encode("utf-8")
@@ -87,12 +89,30 @@ class OAuthKeyringStore:
 
     async def get(self, key: str, *, collection: str | None = None) -> dict[str, Any] | None:
         value, _ = await asyncio.to_thread(self._read_sync, key, collection)
+        if value is None and self._fallback is not None:
+            value, remaining = await self._fallback._read_with_ttl(key, collection)
+            if value is not None:
+                await self.put(key, value, collection=collection, ttl=remaining)
+                await self._fallback.delete(key, collection=collection)
         return value
+
+    async def _read_with_ttl(
+        self, key: str, collection: str | None,
+    ) -> tuple[dict[str, Any] | None, float | None]:
+        value, expires_at = await asyncio.to_thread(self._read_sync, key, collection)
+        remaining = None if expires_at is None else max(0.0, expires_at - self._clock())
+        return value, remaining
 
     async def ttl(
         self, key: str, *, collection: str | None = None
     ) -> tuple[dict[str, Any] | None, float | None]:
         value, expires_at = await asyncio.to_thread(self._read_sync, key, collection)
+        if value is None and self._fallback is not None:
+            value, remaining = await self._fallback._read_with_ttl(key, collection)
+            if value is not None:
+                await self.put(key, value, collection=collection, ttl=remaining)
+                await self._fallback.delete(key, collection=collection)
+                return value, remaining
         return value, None if expires_at is None else max(0.0, expires_at - self._clock())
 
     async def put(

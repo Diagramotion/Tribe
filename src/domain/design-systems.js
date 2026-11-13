@@ -890,13 +890,37 @@ export function designSystemGuideHeadings(markdown) {
       return;
     }
     if (fenceCharacter) return;
-    const match = line.match(/^#{2,3}\s+(.+?)\s*#*\s*$/);
-    if (!match) return;
-    const title = match[1].replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").replace(/[`*_~]/g, "").trim();
+    let depth = 0;
+    while (line[depth] === "#") depth += 1;
+    if ((depth !== 2 && depth !== 3) || (line[depth] !== " " && line[depth] !== "\t")) return;
+    let headingText = line.slice(depth).trimEnd();
+    let closingHashStart = headingText.length;
+    while (closingHashStart > 0 && headingText[closingHashStart - 1] === "#") closingHashStart -= 1;
+    if (closingHashStart < headingText.length && closingHashStart > 0 && (headingText[closingHashStart - 1] === " " || headingText[closingHashStart - 1] === "\t")) {
+      headingText = headingText.slice(0, closingHashStart).trimEnd();
+    }
+    if (!headingText) return;
+    let title = "";
+    for (let position = 0; position < headingText.length;) {
+      if (headingText[position] === "[") {
+        const labelEnd = headingText.indexOf("]", position + 1);
+        const destinationEnd = labelEnd >= 0 && headingText[labelEnd + 1] === "("
+          ? headingText.indexOf(")", labelEnd + 2)
+          : -1;
+        if (destinationEnd >= 0) {
+          title += headingText.slice(position + 1, labelEnd);
+          position = destinationEnd + 1;
+          continue;
+        }
+      }
+      title += headingText[position];
+      position += 1;
+    }
+    title = title.replace(/[`*_~]/g, "").trim();
     const base = title.toLowerCase().normalize("NFKD").replace(/\p{Diacritic}/gu, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || `section-${index + 1}`;
     const count = (used.get(base) ?? 0) + 1;
     used.set(base, count);
-    headings.push({ depth: line.match(/^#+/)[0].length, id: `design-guide-${base}${count > 1 ? `-${count}` : ""}`, line: index + 1, title });
+    headings.push({ depth, id: `design-guide-${base}${count > 1 ? `-${count}` : ""}`, line: index + 1, title });
   });
   return headings;
 }

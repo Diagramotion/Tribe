@@ -1,3 +1,5 @@
+const { waitForBrowserPaint } = require("./browser-paint.cjs");
+
 const DESIGN_REFERENCE_SCRIPT = `(() => {
   const url = new URL(location.href);
   const visible = (element) => {
@@ -157,11 +159,21 @@ async function readDesignReference(contents, isCurrentTab = () => true) {
   }
   let screenshot;
   if (typeof contents.capturePage === "function") {
-    const image = await contents.capturePage();
+    // A navigation can commit its DOM before Chromium has produced a frame.
+    // Let the visible page paint first; macOS may otherwise reject capturePage
+    // with UnknownVizError while the compositor is catching up.
+    await waitForBrowserPaint(contents);
+    let image;
+    try {
+      image = await contents.capturePage();
+    } catch {
+      // Style extraction remains useful when the compositor cannot provide a
+      // screenshot (for example, immediately after a renderer navigation).
+    }
     if (contents.isDestroyed?.() || !isCurrentTab() || pageUrl() !== startingPageUrl) {
       throw new Error("The browser page changed during capture. Capture it again.");
     }
-    if (!image?.isEmpty?.()) {
+    if (image && !image.isEmpty?.()) {
       const size = image.getSize();
       let quality = 68;
       let bytes = image.toJPEG(quality);

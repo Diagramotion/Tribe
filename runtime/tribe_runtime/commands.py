@@ -19,18 +19,6 @@ from pathlib import Path
 from .store import MissionStore
 from .windows_job import WindowsProcessJob
 
-ALLOWED_EXECUTABLES = frozenset({
-    # JavaScript and TypeScript
-    "bun", "corepack", "deno", "node", "npm", "npx", "pnpm", "yarn",
-    # Python
-    "conda-lock", "jupyter", "mypy", "nox", "pip", "pip3", "pipenv", "pipx", "pixi", "poetry", "pytest", "python", "python3", "ruff", "tox", "uv",
-    # Compiled languages and build tools
-    "cargo", "cmake", "ctest", "dotnet", "go", "gradle", "java", "javac", "make", "mvn", "swift", "xcodebuild",
-    # Ruby and PHP
-    "bundle", "composer", "gem", "php", "ruby",
-    # Version control and container builds
-    "git", "docker", "podman",
-})
 WINDOWS_SCRIPT_CONTROL_CHARS = frozenset("&|<>^%!()\r\n")
 STOP_GRACE_SECONDS = 3.0
 
@@ -144,16 +132,15 @@ class BackgroundCommandRunner:
         self.store.recover_background_runs()
 
     @staticmethod
-    def parse(command_line: str, additional_executables: tuple[str, ...] | list[str] = ()) -> list[str]:
+    def parse(command_line: str) -> list[str]:
         if not command_line or len(command_line) > 4000:
             raise ValueError("command_must_be_1_to_4000_characters")
         try:
             argv = shlex.split(command_line, posix=os.name != "nt")
         except ValueError as error:
             raise ValueError("command_has_invalid_quoting") from error
-        allowed = ALLOWED_EXECUTABLES.union(additional_executables)
-        if not argv or argv[0] not in allowed or len(argv) > 32:
-            raise ValueError("command_must_use_an_allowed_executable_and_at_most_31_arguments")
+        if not argv or len(argv) > 32:
+            raise ValueError("command_must_use_one_executable_and_at_most_31_arguments")
         if any(not arg or len(arg) > 1000 or "\x00" in arg for arg in argv):
             raise ValueError("command_argument_is_invalid")
         return argv
@@ -168,11 +155,8 @@ class BackgroundCommandRunner:
             raise ValueError("mission_not_found")
         if mission["status"] == "completed":
             raise ValueError("mission_completed")
-        allowed = ALLOWED_EXECUTABLES.union(
-            self.store.project_command_tools(mission["project_id"])
-        )
-        if not argv or argv[0] not in allowed or len(argv) > 32:
-            raise ValueError("command_must_use_a_project_approved_executable_and_at_most_31_arguments")
+        if not argv or len(argv) > 32:
+            raise ValueError("command_must_use_one_executable_and_at_most_31_arguments")
         root = self.store.project_repository(mission_id)
         if jupyter_environment and (argv[0] != "jupyter" or jupyter_environment not in {".venv", "venv"}):
             raise ValueError("jupyter_environment_invalid")

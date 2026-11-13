@@ -30,8 +30,8 @@ test("design reference capture keeps the active page URL and excludes page conte
     isDestroyed: () => false,
     getURL: () => "https://example.com/products?token=secret#details",
     executeJavaScript: async (source, userGesture) => {
-      script = source;
       assert.equal(userGesture, true);
+      if (source.includes("getComputedStyle")) script = source;
       return raw;
     },
     capturePage: async () => ({
@@ -83,6 +83,19 @@ test("design reference capture rejects a tab switch or navigation during the rea
       return raw;
     },
   }), /page changed/);
+});
+
+test("keeps visual styles when the native page screenshot is temporarily unavailable", async () => {
+  const result = await readDesignReference({
+    isDestroyed: () => false,
+    getURL: () => "https://example.com",
+    executeJavaScript: async () => raw,
+    capturePage: async () => { throw new Error("UnknownVizError"); },
+  });
+
+  assert.equal(result.reference.url, "https://example.com/");
+  assert.equal(result.reference.sampleCount, raw.sampleCount);
+  assert.equal("screenshot" in result, false);
 });
 
 test("reference URLs omit credentials, query strings and fragments", () => {

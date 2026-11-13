@@ -762,6 +762,35 @@ class Handler(BaseHTTPRequestHandler):
                 "proposals": STORE.knowledge_proposals(project_id, pending_only=False),
                 "migration": audit_project_memory_migration(STORE, project_id),
             })
+        if parsed.path == "/api/mcp":
+            try:
+                registry = MCPRegistry(STORE)
+                return self._json(200, {
+                    "config": registry.workspace_config(),
+                    "secretStatus": registry.secret_status(),
+                })
+            except ValueError as error:
+                return self._json(500, {"error": str(error)})
+        project_mcp_exclusions = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/mcp-exclusions", parsed.path)
+        if project_mcp_exclusions:
+            try:
+                registry = MCPRegistry(STORE)
+                project_id = project_mcp_exclusions.group(1)
+                config = registry.workspace_config()
+                return self._json(200, {
+                    "servers": sorted(config["mcpServers"]),
+                    "excluded": registry.get_exclusions(project_id),
+                })
+            except ValueError as error:
+                return self._json(404 if str(error) == "project_not_found" else 422, {"error": str(error)})
+        mcp_oauth_status_match = re.fullmatch(r"/api/mcp/oauth/([a-zA-Z0-9_-]{1,64})/status", parsed.path)
+        if mcp_oauth_status_match:
+            try:
+                return self._json(200, asyncio.run(MCPRegistry(STORE).oauth_status("workspace", mcp_oauth_status_match.group(1))))
+            except RuntimeError as error:
+                return self._json(503, {"error": str(error)})
+            except ValueError as error:
+                return self._json(422, {"error": str(error)})
         mcp_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/mcp", parsed.path)
         if mcp_match:
             try:
@@ -1143,7 +1172,7 @@ class Handler(BaseHTTPRequestHandler):
                         "requestId": request["requestId"],
                     })
                     return self._json(200, {"status": "completed"})
-                except (ValueError, KeyError, binascii.Error) as error:
+                except (ValueError, KeyError) as error:
                     return self._json(422, {"error": str(error) or "invalid_observation"})
             if self.path == "/api/settings/check":
                 return self._json(200, {"check": SUPERVISOR.check_connection()})
@@ -1204,6 +1233,70 @@ class Handler(BaseHTTPRequestHandler):
                 if status.get("model"):
                     STORE.register_configured_model(status["model"])
                 return self._json(200, {"agents": status})
+            if self.path == "/api/mcp/playwright":
+                try:
+                    registry = MCPRegistry(STORE)
+                    config = registry.install_playwright_browser_for_workspace()
+                    return self._json(200, {"config": config, "secretStatus": registry.secret_status()})
+                except ValueError as error:
+                    return self._json(422, {"error": str(error)})
+            if self.path == "/api/mcp/playwright/install":
+                try:
+                    config = MCPRegistry(STORE).workspace_config()
+                    definition = config["mcpServers"].get("playwright", {})
+                    if definition.get("command") != "npx" or not any(
+                        str(arg).startswith("@playwright/mcp@") for arg in definition.get("args", [])
+                    ):
+                        return self._json(409, {"error": "Add the browser tools to workspace settings first."})
+                    return self._json(200, MCPRegistry.install_playwright_browser_binary())
+                except ValueError as error:
+                    return self._json(422, {"error": str(error)})
+                except RuntimeError as error:
+                    return self._json(424, {"error": str(error)})
+            mcp_check_match = re.fullmatch(r"/api/mcp/check", self.path)
+            if mcp_check_match:
+                registry = MCPRegistry(STORE)
+                server_name = str(body.get("serverName", ""))
+                project_id = str(body.get("projectId") or "")
+                if not project_id and STORE.bootstrap().get("projects"):
+                    project_id = STORE.bootstrap()["projects"][0]["id"]
+                if not project_id:
+                    return self._json(422, {"error": "Create a project before checking this connection."})
+                is_playwright = False
+                definition: dict[str, Any] = {}
+                try:
+                    definition = registry.workspace_config()["mcpServers"].get(server_name, {})
+                    is_playwright = (server_name == "playwright" and isinstance(definition, dict)
+                                     and definition.get("command") == "npx"
+                                     and any(str(arg).startswith("@playwright/mcp@") for arg in definition.get("args", [])))
+                    preflight = MCPRegistry.check_browser_runtime_dependencies() if is_playwright else None
+                    if preflight and not preflight["ready"]:
+                        return self._json(424, {"error": "Browser tools need Node.js 18 or newer on this device."})
+                    tools = asyncio.run(registry.discover_tools(project_id, server_name, verify_browser_launch=is_playwright))
+                    if preflight:
+                        preflight["browserReady"] = True
+                    return self._json(200, {"serverName": server_name, "tools": tools, "preflight": preflight})
+                except ValueError as error:
+                    message = {
+                        "project_not_found": "Choose an existing project before checking this server.",
+                        "mcp_server_not_found": "This server is no longer configured.",
+                    }.get(str(error), str(error))
+                    return self._json(404 if str(error) in {"project_not_found", "mcp_server_not_found"} else 422, {"error": message})
+                except Exception:  # noqa: BLE001 - MCP transports expose backend-specific errors
+                    message = (
+                        "Could not start the local server. Check the command and arguments."
+                        if definition.get("command") else
+                        "Could not connect to the remote server. Check its address and sign-in settings."
+                    )
+                    return self._json(502, {"error": message})
+            mcp_oauth_forget_match = re.fullmatch(r"/api/mcp/oauth/([a-zA-Z0-9_-]{1,64})", self.path)
+            if mcp_oauth_forget_match:
+                try:
+                    return self._json(200, asyncio.run(MCPRegistry(STORE).forget_oauth("workspace", mcp_oauth_forget_match.group(1))))
+                except RuntimeError as error:
+                    return self._json(503, {"error": str(error)})
+                except ValueError as error:
+                    return self._json(422, {"error": str(error)})
             mcp_check_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/mcp/check", self.path)
             if mcp_check_match:
                 registry = MCPRegistry(STORE)
@@ -1365,7 +1458,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(201, {"system": system})
                 except OverflowError:
                     return self._json(413, {"error": "request_too_large"})
-                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                except (TypeError, ValueError) as error:
                     status = 409 if str(error) == "design_system_version_conflict" else 422
                     return self._json(status, {"error": str(error) or "invalid_request"})
             if self.path == "/api/projects":
@@ -1545,9 +1638,8 @@ class Handler(BaseHTTPRequestHandler):
                 mission = STORE.mission(mission_id)
                 if not mission:
                     return self._json(404, {"error": "mission_not_found"})
-                approved_tools = STORE.project_command_tools(mission["project_id"])
                 run = COMMANDS.start(
-                    mission_id, COMMANDS.parse(command_line, approved_tools),
+                    mission_id, COMMANDS.parse(command_line),
                     jupyter_environment=str(body.get("jupyterEnvironment", "")),
                     notebook_setup_environment=str(body.get("notebookSetupEnvironment", "")),
                     notebook_setup_manager=str(body.get("notebookSetupManager", "")),
@@ -1745,7 +1837,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(201, result)
                 except PermissionError as error:
                     return self._json(403, {"error": str(error)})
-                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                except (TypeError, ValueError) as error:
                     status = 404 if str(error) == "interactive_artifact_not_found" else 422
                     return self._json(status, {"error": str(error) or "invalid_request"})
             if self.path == "/api/work-items":
@@ -1887,7 +1979,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(413, {"error": "request_too_large"})
         except RuntimeError as error:
             return self._json(503, {"error": str(error)})
-        except (ValueError, json.JSONDecodeError, binascii.Error) as error:
+        except ValueError as error:
             if isinstance(error, ValueError) and str(error):
                 return self._json(422, {"error": str(error)})
             return self._json(400, {"error": "invalid_request"})
@@ -1898,6 +1990,48 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "local_origin_required"})
         if RESTORE_PENDING.is_set():
             return self._json(503, {"error": "workspace_restore_shutting_down"})
+        if self.path == "/api/mcp":
+            try:
+                body = self._body()
+                registry = MCPRegistry(STORE)
+                config = registry.save_workspace_config(body.get("config"))
+                for project in STORE.bootstrap().get("projects", []):
+                    for mission in project.get("missions", []):
+                        if mission["status"] == "active":
+                            STORE.append("workspace.mcp.config.updated", "user", mission["id"], {
+                                "servers": sorted(config["mcpServers"]),
+                            })
+                return self._json(200, {"config": config, "secretStatus": registry.secret_status()})
+            except OverflowError:
+                return self._json(413, {"error": "request_too_large"})
+            except RuntimeError as error:
+                return self._json(503, {"error": str(error)})
+            except ValueError as error:
+                return self._json(422, {"error": str(error) or "invalid_request"})
+        project_mcp_exclusions = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/mcp-exclusions", self.path)
+        if project_mcp_exclusions:
+            try:
+                body = self._body()
+                registry = MCPRegistry(STORE)
+                project_id = project_mcp_exclusions.group(1)
+                excluded = registry.save_exclusions(project_id, body.get("excluded", []))
+                return self._json(200, {"excluded": excluded})
+            except OverflowError:
+                return self._json(413, {"error": "request_too_large"})
+            except ValueError as error:
+                status = 404 if str(error) == "project_not_found" else 422
+                return self._json(status, {"error": str(error) or "invalid_request"})
+        if self.path == "/api/mcp/secrets":
+            try:
+                body = self._body()
+                registry = MCPRegistry(STORE)
+                return self._json(200, {"secretStatus": registry.save_secrets(None, body.get("secrets"))})
+            except OverflowError:
+                return self._json(413, {"error": "request_too_large"})
+            except RuntimeError as error:
+                return self._json(503, {"error": str(error)})
+            except ValueError as error:
+                return self._json(422, {"error": str(error) or "invalid_request"})
         project_datasets_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/datasets", self.path)
         if project_datasets_match:
             try:
@@ -1910,9 +2044,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(404, {"error": "project_not_found"})
                 return self._json(200, {"datasets": saved})
             except ValueError as error:
+                if isinstance(error, (json.JSONDecodeError, binascii.Error)):
+                    return self._json(400, {"error": "invalid_request"})
                 return self._json(422, {"error": str(error)})
-            except (json.JSONDecodeError, binascii.Error):
-                return self._json(400, {"error": "invalid_request"})
         general_chat_preferences_match = re.fullmatch(
             r"/api/general-chats/([0-9a-f-]{36})/preferences", self.path,
         )
@@ -1950,7 +2084,7 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("eventExternalRepository"),
                 )
                 return self._json(404, {"error": "schedule_not_found"}) if not schedule else self._json(200, {"schedule": schedule})
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
+            except (TypeError, ValueError) as error:
                 status = 409 if str(error) == "schedule_has_a_chat_in_progress" else 422
                 return self._json(status, {"error": str(error) or "schedule_update_failed"})
         if self.path == "/api/settings/image-generation":
@@ -2021,9 +2155,9 @@ class Handler(BaseHTTPRequestHandler):
                 connection = STORE.set_provider_enabled(provider, enabled)
                 return self._json(200, {"connection": {"id": provider, **connection}})
             except ValueError as error:
+                if isinstance(error, (json.JSONDecodeError, binascii.Error)):
+                    return self._json(400, {"error": "invalid_request"})
                 return self._json(422, {"error": str(error) or "provider_enabled_update_failed"})
-            except (json.JSONDecodeError, binascii.Error):
-                return self._json(400, {"error": "invalid_request"})
         if self.path == "/api/models/allowed":
             try:
                 body = self._body()
@@ -2039,10 +2173,10 @@ class Handler(BaseHTTPRequestHandler):
                 models = STORE.set_model_allowed(identifier, allowed)
                 return self._json(200, {"models": models})
             except ValueError as error:
+                if isinstance(error, (json.JSONDecodeError, binascii.Error)):
+                    return self._json(400, {"error": "invalid_request"})
                 return self._json(409 if str(error) == "workspace_default_model_must_remain_allowed" else 422,
                                   {"error": str(error) or "model_allow_update_failed"})
-            except (json.JSONDecodeError, binascii.Error):
-                return self._json(400, {"error": "invalid_request"})
         if self.path == "/api/models/metadata":
             try:
                 body = self._body()
@@ -2053,9 +2187,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(422, {"error": "model_metadata_invalid"})
                 return self._json(200, {"models": STORE.update_model_metadata(identifier, metadata)})
             except ValueError as error:
+                if isinstance(error, (json.JSONDecodeError, binascii.Error)):
+                    return self._json(400, {"error": "invalid_request"})
                 return self._json(422, {"error": str(error) or "model_metadata_invalid"})
-            except (json.JSONDecodeError, binascii.Error):
-                return self._json(400, {"error": "invalid_request"})
         computer_access_match = re.fullmatch(
             r"/api/projects/([0-9a-f-]{36})/computer-access", self.path
         )
@@ -2067,7 +2201,7 @@ class Handler(BaseHTTPRequestHandler):
                     for mission_id in STORE.mission_ids_for_project(project_id):
                         COMPUTER.cancel_mission(mission_id)
                 return self._json(200, {"computerAccess": policy})
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
+            except (TypeError, ValueError) as error:
                 status = 404 if str(error) == "project_not_found" else 422
                 return self._json(status, {"error": str(error) or "invalid_request"})
         canvas_match = re.fullmatch(
@@ -2099,7 +2233,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"projectId": project_id, "agentIds": selected})
             except OverflowError:
                 return self._json(413, {"error": "request_too_large"})
-            except (ValueError, json.JSONDecodeError) as error:
+            except ValueError as error:
                 status = 404 if str(error) == "project_not_found" else 422
                 return self._json(status, {"error": str(error) or "invalid_request"})
 
@@ -2117,7 +2251,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"project": project})
             except OverflowError:
                 return self._json(413, {"error": "request_too_large"})
-            except (ValueError, json.JSONDecodeError) as error:
+            except ValueError as error:
                 return self._json(422, {"error": str(error) or "invalid_request"})
         project_design_system_match = re.fullmatch(
             r"/api/projects/([0-9a-f-]{36})/design-system", self.path,
@@ -2134,7 +2268,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"designSystem": _design_system_summary(applied)})
             except OverflowError:
                 return self._json(413, {"error": "request_too_large"})
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
+            except (TypeError, ValueError) as error:
                 status = 404 if str(error) in {"project_not_found", "design_system_version_not_found"} else 422
                 return self._json(status, {"error": str(error) or "invalid_request"})
         usage_budget_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/usage-budget", self.path)
@@ -2150,7 +2284,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"budget": budget})
             except OverflowError:
                 return self._json(413, {"error": "request_too_large"})
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
+            except (TypeError, ValueError) as error:
                 status = 404 if str(error) == "project_not_found" else 422
                 return self._json(status, {"error": str(error) or "invalid_request"})
         web_access_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/web-access", self.path)
@@ -2163,7 +2297,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"webAccess": policy})
             except OverflowError:
                 return self._json(413, {"error": "request_too_large"})
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
+            except (TypeError, ValueError) as error:
                 status = 404 if str(error) == "project_not_found" else 422
                 return self._json(status, {"error": str(error) or "invalid_request"})
         approval_policy_match = re.fullmatch(
@@ -2177,7 +2311,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"approvalPolicy": policy})
             except OverflowError:
                 return self._json(413, {"error": "request_too_large"})
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
+            except (TypeError, ValueError) as error:
                 status = 404 if str(error) == "project_not_found" else 422
                 return self._json(status, {"error": str(error) or "invalid_request"})
         interactive_access_match = re.fullmatch(
@@ -2191,7 +2325,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"interactiveAccess": policy})
             except OverflowError:
                 return self._json(413, {"error": "request_too_large"})
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
+            except (TypeError, ValueError) as error:
                 status = 404 if str(error) == "project_not_found" else 422
                 return self._json(status, {"error": str(error) or "invalid_request"})
         command_tools_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/command-tools", self.path)
@@ -2204,7 +2338,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"executables": executables})
             except OverflowError:
                 return self._json(413, {"error": "request_too_large"})
-            except (ValueError, json.JSONDecodeError) as error:
+            except ValueError as error:
                 status = 404 if str(error) == "project_not_found" else 422
                 return self._json(status, {"error": str(error) or "invalid_request"})
         mcp_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/mcp", self.path)
@@ -2228,7 +2362,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(413, {"error": "request_too_large"})
             except RuntimeError as error:
                 return self._json(503, {"error": str(error)})
-            except (ValueError, json.JSONDecodeError) as error:
+            except ValueError as error:
                 status = 404 if str(error) == "project_not_found" else 422
                 return self._json(status, {"error": str(error) or "invalid_request"})
         mcp_secrets_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/mcp/secrets", self.path)
@@ -2242,7 +2376,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(413, {"error": "request_too_large"})
             except RuntimeError as error:
                 return self._json(503, {"error": str(error)})
-            except (ValueError, json.JSONDecodeError) as error:
+            except ValueError as error:
                 status = 404 if str(error) == "project_not_found" else 422
                 return self._json(status, {"error": str(error) or "invalid_request"})
         match = re.fullmatch(r"/api/agents/([a-z][a-z0-9_-]{0,49})", self.path)
@@ -2309,6 +2443,14 @@ class Handler(BaseHTTPRequestHandler):
         if general_chat_match:
             deleted = STORE.delete_general_chat(general_chat_match.group(1))
             return self._json(200, {"deleted": True}) if deleted else self._json(404, {"error": "general_chat_not_found"})
+        workspace_oauth_forget_match = re.fullmatch(r"/api/mcp/oauth/([a-zA-Z0-9_-]{1,64})", self.path)
+        if workspace_oauth_forget_match:
+            try:
+                return self._json(200, asyncio.run(MCPRegistry(STORE).forget_oauth("workspace", workspace_oauth_forget_match.group(1))))
+            except RuntimeError as error:
+                return self._json(503, {"error": str(error)})
+            except ValueError as error:
+                return self._json(422, {"error": str(error)})
         mcp_oauth_forget_match = re.fullmatch(
             r"/api/projects/([0-9a-f-]{36})/mcp/oauth/([a-zA-Z0-9_-]{1,64})", self.path,
         )
@@ -2327,21 +2469,10 @@ class Handler(BaseHTTPRequestHandler):
             if not project:
                 return self._json(404, {"error": "project_not_found"})
             try:
-                mcp_registry = MCPRegistry(STORE)
-                try:
-                    mcp_config = mcp_registry.get_config(project_id)
-                except (OSError, ValueError):
-                    mcp_config = None
                 deleted = STORE.delete_project(project_id)
                 if not deleted:
                     return self._json(404, {"error": "project_not_found"})
-                credential_cleanup = "complete"
-                try:
-                    asyncio.run(mcp_registry.delete_project_data(project_id, mcp_config))
-                except (OSError, RuntimeError, ValueError) as error:
-                    credential_cleanup = "incomplete"
-                    LOGGER.warning("Project %s was deleted, but saved MCP credentials could not all be cleared: %s", project_id, error)
-                return self._json(200, {"project": deleted, "credentialCleanup": credential_cleanup})
+                return self._json(200, {"project": deleted})
             except ValueError as error:
                 return self._json(409 if str(error) == "project_has_unfinished_work" else 404, {"error": str(error)})
         delete_mission_match = re.fullmatch(r"/api/missions/([0-9a-f-]{36})", self.path)

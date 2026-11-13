@@ -1,4 +1,4 @@
-"""Project-scoped MCP configuration composed through Pydantic AI's MCP client."""
+"""Workspace MCP configuration composed through Pydantic AI's MCP client."""
 
 from __future__ import annotations
 
@@ -39,27 +39,121 @@ def _mcp_tool_allowed(tool_definition: Any) -> bool:
     return not tool_definition.name.endswith("_browser_run_code_unsafe")
 
 
+def _write_temporary_config(root: Path, config: dict[str, Any]) -> Path:
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=root, prefix="check-", suffix=".json", delete=False,
+    ) as temporary:
+        temporary_path = Path(temporary.name)
+        os.chmod(temporary_path, 0o600)
+        json.dump(config, temporary)
+    return temporary_path
+
+
 class MCPRegistry:
-    """Validates project MCP definitions and delegates protocol handling to Pydantic AI."""
+    """Validates workspace MCP definitions and delegates protocol handling to Pydantic AI."""
 
     def __init__(self, store: MissionStore):
         self.store = store
         self.root = store.data_dir / "mcp"
         self.root.mkdir(parents=True, exist_ok=True)
+        self.workspace_config_path = self.root / "workspace.json"
+        self.origins_path = self.root / "legacy-origins.json"
+        self.aliases_path = self.root / "legacy-server-names.json"
 
-    def config_path(self, project_id: str) -> Path:
-        if not self.store.bootstrap(project_id)["project"]:
-            raise ValueError("project_not_found")
-        return self.root / f"{project_id}.json"
+    def _migrate_legacy_configs(self) -> None:
+        """Import old project definitions while retaining each project's prior access."""
+        if self.workspace_config_path.exists():
+            return
+        servers: dict[str, Any] = {}
+        origins: dict[str, str] = {}
+        aliases: dict[str, str] = {}
+        legacy_configs: dict[str, dict[str, Any]] = {}
+        imported_names: dict[str, set[str]] = {}
+        for project in self.store.bootstrap().get("projects", []):
+            project_id = project["id"]
+            path = self.root / f"{project_id}.json"
+            if not path.exists():
+                continue
+            try:
+                legacy = self.validate(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            legacy_configs[project_id] = legacy
+            for name, definition in legacy["mcpServers"].items():
+                target = name
+                if target in servers:
+                    target = f"{name[:55]}_{project_id.replace('-', '')[:8]}"
+                if target not in servers:
+                    servers[target] = definition
+                    origins[target] = project_id
+                    aliases[target] = name
+                imported_names.setdefault(project_id, set()).add(target)
+        checked = self.validate({"mcpServers": servers})
+        self._write_json(self.workspace_config_path, checked)
+        self._write_json(self.origins_path, origins)
+        self._write_json(self.aliases_path, aliases)
+        for project in self.store.bootstrap().get("projects", []):
+            project_id = project["id"]
+            allowed = imported_names.get(project_id, set())
+            self.save_exclusions(project_id, set(servers) - allowed)
 
-    def get_config(self, project_id: str) -> dict[str, Any]:
-        path = self.config_path(project_id)
-        if not path.exists():
-            return {"mcpServers": {}}
+    @staticmethod
+    def _write_json(path: Path, value: Any) -> None:
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        temporary.replace(path)
+
+    def workspace_config(self) -> dict[str, Any]:
+        self._migrate_legacy_configs()
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return self.validate(json.loads(self.workspace_config_path.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"MCP configuration could not be read: {error}") from error
+
+    def save_workspace_config(self, config: Any) -> dict[str, Any]:
+        checked = self.validate(config)
+        self._migrate_legacy_configs()
+        self._write_json(self.workspace_config_path, checked)
+        return checked
+
+    def exclusions_path(self, project_id: str) -> Path:
+        if not self.store.bootstrap(project_id)["project"]:
+            raise ValueError("project_not_found")
+        return self.root / f"{project_id}.excluded.json"
+
+    def get_exclusions(self, project_id: str) -> list[str]:
+        self._migrate_legacy_configs()
+        path = self.exclusions_path(project_id)
+        try:
+            values = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Project MCP exclusions could not be read: {error}") from error
+        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+            raise ValueError("Project MCP exclusions are invalid")
+        configured = set(self.workspace_config()["mcpServers"])
+        return sorted(set(values) & configured)
+
+    def save_exclusions(self, project_id: str, excluded: set[str] | list[str]) -> list[str]:
+        path = self.exclusions_path(project_id)
+        configured = set(self.workspace_config()["mcpServers"])
+        values = set(excluded)
+        if values - configured:
+            raise ValueError("Project exclusions must refer to configured workspace MCP servers")
+        self._write_json(path, sorted(values))
+        return sorted(values)
+
+    def config_path(self, project_id: str) -> Path:
+        return self.workspace_config_path
+
+    def get_config(self, project_id: str) -> dict[str, Any]:
+        if not self.store.bootstrap(project_id)["project"]:
+            raise ValueError("project_not_found")
+        config = self.workspace_config()
+        excluded = set(self.get_exclusions(project_id))
+        config["mcpServers"] = {name: definition for name, definition in config["mcpServers"].items()
+                                if name not in excluded}
+        return config
 
     @staticmethod
     def validate(config: Any) -> dict[str, Any]:
@@ -133,17 +227,15 @@ class MCPRegistry:
         return config
 
     def save_config(self, project_id: str, config: Any) -> dict[str, Any]:
-        checked = self.validate(config)
-        path = self.config_path(project_id)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(checked, indent=2) + "\n", encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        temporary.replace(path)
-        return checked
+        if not self.store.bootstrap(project_id)["project"]:
+            raise ValueError("project_not_found")
+        return self.save_workspace_config(config)
 
     def install_playwright_browser(self, project_id: str) -> dict[str, Any]:
         """Add Microsoft's pinned Playwright MCP server without changing other servers."""
-        config = self.get_config(project_id)
+        if not self.store.bootstrap(project_id)["project"]:
+            raise ValueError("project_not_found")
+        config = self.workspace_config()
         servers = config["mcpServers"]
         if "playwright" in servers:
             raise ValueError("An MCP server named 'playwright' already exists")
@@ -157,6 +249,21 @@ class MCPRegistry:
             "readOnlyTools": list(PLAYWRIGHT_READ_ONLY_TOOLS),
         }
         return self.save_config(project_id, config)
+
+    def install_playwright_browser_for_workspace(self) -> dict[str, Any]:
+        """Add Microsoft's pinned Playwright MCP server to workspace connections."""
+        config = self.workspace_config()
+        servers = config["mcpServers"]
+        if "playwright" in servers:
+            raise ValueError("An MCP server named 'playwright' already exists")
+        if len(servers) >= 50:
+            raise ValueError("mcpServers cannot contain more than 50 entries")
+        servers["playwright"] = {
+            "command": "npx",
+            "args": ["--yes", f"@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}", "--headless", "--isolated"],
+            "readOnlyTools": list(PLAYWRIGHT_READ_ONLY_TOOLS),
+        }
+        return self.save_workspace_config(config)
 
     @staticmethod
     def check_browser_runtime_dependencies() -> dict[str, Any]:
@@ -231,30 +338,42 @@ class MCPRegistry:
         except keyring.errors.KeyringError:
             return None
 
-    def secret_status(self, project_id: str) -> dict[str, str | None]:
-        config = self.get_config(project_id)
+    def secret_status(self, project_id: str | None = None) -> dict[str, str | None]:
+        config = self.workspace_config() if project_id is None else self.get_config(project_id)
+        try:
+            origins = json.loads(self.origins_path.read_text(encoding="utf-8")) if project_id is None else {}
+        except (OSError, json.JSONDecodeError):
+            origins = {}
         statuses = {}
         for name in sorted(self._secret_references(config)):
             if os.environ.get(name):
                 statuses[name] = "environment"
-            elif self._keychain_secret(project_id, name):
+            elif self._keychain_secret("workspace" if project_id is None else project_id, name):
+                statuses[name] = "keychain"
+            elif project_id is None and any(
+                self._keychain_secret(origins.get(server_name, ""), name)
+                for server_name, definition in config["mcpServers"].items()
+                if any(value == f"${{{name}}}"
+                       for field in ("env", "headers")
+                       for value in definition.get(field, {}).values())
+            ):
                 statuses[name] = "keychain"
             else:
                 statuses[name] = None
         return statuses
 
-    def save_secrets(self, project_id: str, secrets: Any) -> dict[str, bool]:
+    def save_secrets(self, project_id: str | None, secrets: Any) -> dict[str, bool]:
         import keyring
 
         if not isinstance(secrets, dict):
             raise ValueError("secrets must be an object keyed by environment variable name")  # noqa: TRY004
-        allowed = self._secret_references(self.get_config(project_id))
+        allowed = self._secret_references(self.workspace_config() if project_id is None else self.get_config(project_id))
         if set(secrets) - allowed:
-            raise ValueError("secrets may only be set for environment references in this project's MCP configuration")
+            raise ValueError("secrets may only be set for environment references in the MCP configuration")
         for name, value in secrets.items():
             if not isinstance(value, str):
                 raise ValueError(f"secret for {name!r} must be a string")  # noqa: TRY004
-            account = f"{project_id}:{name}"
+            account = f"{'workspace' if project_id is None else project_id}:{name}"
             try:
                 if value:
                     keyring.set_password(_KEYRING_SERVICE, account, value)
@@ -304,20 +423,25 @@ class MCPRegistry:
         return self.root / f"{project_id}.json"
 
     def _resolve_config_secrets(self, project_id: str, config: dict[str, Any]) -> dict[str, Any]:
-        def resolve(value: str) -> str:
+        try:
+            origins = json.loads(self.origins_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            origins = {}
+        def resolve(value: str, server_name: str) -> str:
             match = _ENV_REFERENCE_MATCH.fullmatch(value)
             if not match:
                 return value
             name = match.group(1)
-            secret = os.environ.get(name) or self._keychain_secret(project_id, name)
+            secret = (os.environ.get(name) or self._keychain_secret("workspace", name)
+                      or self._keychain_secret(origins.get(server_name, project_id), name))
             if not secret:
                 raise ValueError(f"MCP environment variable {name!r} is not configured")
             return secret
 
-        for definition in config["mcpServers"].values():
+        for server_name, definition in config["mcpServers"].items():
             for field in ("env", "headers"):
                 definition[field] = {
-                    name: resolve(value) for name, value in definition.get(field, {}).items()
+                    name: resolve(value, server_name) for name, value in definition.get(field, {}).items()
                 }
         return config
 
@@ -367,6 +491,16 @@ class MCPRegistry:
             definition.pop("disabled", None)
             if "command" not in definition:
                 continue
+            expanded_args = []
+            for argument in definition.get("args", []):
+                if argument == "~" or argument.startswith("~/") or argument.startswith("~\\"):
+                    argument = str(Path(argument).expanduser())
+                elif "=" in argument:
+                    option, value = argument.split("=", 1)
+                    if value == "~" or value.startswith("~/") or value.startswith("~\\"):
+                        argument = f"{option}={Path(value).expanduser()}"
+                expanded_args.append(argument)
+            definition["args"] = expanded_args
             cwd = Path(definition.get("cwd") or repository)
             resolved = (repository / cwd).resolve() if not cwd.is_absolute() else cwd.resolve()
             if not resolved.is_relative_to(repository) or not resolved.is_dir():
@@ -401,25 +535,24 @@ class MCPRegistry:
         try:
             standard_toolsets = []
             if config["mcpServers"]:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", encoding="utf-8", dir=self.root, prefix="runtime-", suffix=".json", delete=False
-                ) as temporary:
-                    temporary_path = Path(temporary.name)
-                    os.chmod(temporary_path, 0o600)
-                    json.dump(config, temporary)
+                temporary_path = _write_temporary_config(self.root, config)
                 standard_toolsets = load_mcp_toolsets(temporary_path)
 
             toolsets_by_server = dict(zip(config["mcpServers"], standard_toolsets, strict=True))
             for name, definition in oauth_servers.items():
                 toolsets_by_server[name] = self._oauth_toolset(project_id, name, definition)
+            try:
+                legacy_names = json.loads(self.aliases_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                legacy_names = {}
             return [
                 toolsets_by_server[name].filtered(
-                    lambda _ctx, tool, server_name=name, disabled=disabled_tools.get(name, set()):
+                    lambda _ctx, tool, server_name=name, grant_server=legacy_names.get(name, name), disabled=disabled_tools.get(name, set()):
                         _mcp_tool_allowed(tool)
                         and tool.name.removeprefix(f"{server_name}_") not in disabled
                         and ("mcp:*" in granted_tools
-                             or f"mcp:{server_name}.*" in granted_tools
-                             or f"mcp:{server_name}.{tool.name.removeprefix(f'{server_name}_')}" in granted_tools
+                             or f"mcp:{grant_server}.*" in granted_tools
+                             or f"mcp:{grant_server}.{tool.name.removeprefix(f'{server_name}_')}" in granted_tools
                              or ("workflow:*" in granted_tools
                                  and tool.name.removeprefix(f"{server_name}_") in WORKFLOW_OPERATION_NAMES))
                         and (server_name != "playwright" or self._browser_access_enabled(project_id))
@@ -461,12 +594,7 @@ class MCPRegistry:
 
         temporary_path = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=self.root, prefix="check-", suffix=".json", delete=False
-            ) as temporary:
-                temporary_path = Path(temporary.name)
-                os.chmod(temporary_path, 0o600)
-                json.dump(config, temporary)
+            temporary_path = await asyncio.to_thread(_write_temporary_config, self.root, config)
             toolsets = load_mcp_toolsets(temporary_path)
             async with asyncio.timeout(45 if verify_browser_launch else 20):
                 toolset = toolsets[0]
@@ -493,7 +621,7 @@ class MCPRegistry:
     def _oauth_lease(self, project_id: str, server_name: str, endpoint: str):
         from .oauth_lock import OAuthConnectionLease
 
-        return OAuthConnectionLease(self.store.data_dir / "locks", project_id, server_name, endpoint)
+        return OAuthConnectionLease(self.store.data_dir / "locks", "workspace", server_name, endpoint)
 
     def _oauth_auth(
         self, project_id: str, server_name: str, definition: dict[str, Any], *, allow_interactive: bool = False,
@@ -502,12 +630,25 @@ class MCPRegistry:
         from .oauth_store import OAuthKeyringStore
 
         endpoint = definition["url"]
+        workspace_id = str(self.store.data_dir.resolve())
+        fallback_store = None
+        try:
+            origins = json.loads(self.origins_path.read_text(encoding="utf-8"))
+            aliases = json.loads(self.aliases_path.read_text(encoding="utf-8"))
+            legacy_project = origins.get(server_name)
+            legacy_name = aliases.get(server_name)
+            if legacy_project and legacy_name:
+                fallback_store = OAuthKeyringStore(
+                    legacy_project, legacy_name, workspace_id=workspace_id,
+                )
+        except (OSError, json.JSONDecodeError):
+            pass
         return LeasedOAuth(
             mcp_url=endpoint,
             scopes=definition.get("oauth", {}).get("scopes", []),
             client_name="Tribe",
             token_storage=OAuthKeyringStore(
-                project_id, server_name, workspace_id=str(self.store.data_dir.resolve()),
+                "workspace", server_name, workspace_id=workspace_id, fallback=fallback_store,
             ),
             lease=self._oauth_lease(project_id, server_name, endpoint),
             allow_interactive=allow_interactive,
@@ -524,7 +665,7 @@ class MCPRegistry:
         return MCPToolset(Client(endpoint, auth=auth)).prefixed(server_name)
 
     def _configured_oauth(self, project_id: str, server_name: str) -> tuple[dict[str, Any], Any]:
-        config = self.get_config(project_id)
+        config = self.workspace_config() if project_id == "workspace" else self.get_config(project_id)
         definition = config["mcpServers"].get(server_name)
         if not definition or definition.get("oauth") is None:
             raise ValueError("oauth_service_not_configured")

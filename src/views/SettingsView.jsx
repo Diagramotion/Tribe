@@ -28,8 +28,8 @@ const settingsSections = [
   { id: "workspace", label: "Workspace", icon: FolderSimple },
   { id: "models", label: "Models", icon: Sparkle },
   { id: "web-search", label: "Web search", icon: MagnifyingGlass },
-  { id: "connections", label: "Connections", icon: Plug },
-  { id: "commands", label: "Command tools", icon: TerminalWindow },
+  { id: "connections", label: "MCP servers", icon: Plug },
+  { id: "commands", label: "Agent commands", icon: TerminalWindow },
   { id: "desktop", label: "Desktop access", icon: DesktopTower },
   { id: "data", label: "Usage & data", icon: ChartLine },
   { id: "experimental", label: "Experimental", icon: Sparkle },
@@ -274,11 +274,6 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
   const [desktopAccess, setDesktopAccess] = useState(null);
   const [desktopAccessError, setDesktopAccessError] = useState("");
   const [desktopAccessChecking, setDesktopAccessChecking] = useState(false);
-  const [commandTools, setCommandTools] = useState([]);
-  const [commandToolInput, setCommandToolInput] = useState("");
-  const [commandToolsLoading, setCommandToolsLoading] = useState(false);
-  const [commandToolsSaving, setCommandToolsSaving] = useState(false);
-  const [commandToolsError, setCommandToolsError] = useState("");
   const [contextPruningEnabled, setContextPruningEnabled] = useState(false);
   const [contextPruningSummary, setContextPruningSummary] = useState({});
   const [contextPruningSaving, setContextPruningSaving] = useState(false);
@@ -435,20 +430,6 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
   useEffect(() => {
     setComputerEnabled(Boolean(computerAccess?.enabled));
   }, [project.id, computerAccess]);
-  useEffect(() => {
-    if (activeSection !== "commands" || !project.id) return;
-    let cancelled = false;
-    setCommandToolsLoading(true);
-    setCommandToolsError("");
-    runtime.getProjectCommandTools(project.id).then(({ executables }) => {
-      if (!cancelled) setCommandTools(executables);
-    }).catch((error) => {
-      if (!cancelled) setCommandToolsError(error.message || "Could not load command tools.");
-    }).finally(() => {
-      if (!cancelled) setCommandToolsLoading(false);
-    });
-    return () => { cancelled = true; };
-  }, [activeSection, project.id]);
   async function saveBudget(event) {
     event.preventDefault();
     if (budgetInput && (!/^\d+$/.test(budgetInput) || Number(budgetInput) < 1)) return;
@@ -604,26 +585,6 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
     } finally {
       setComputerSaving(false);
     }
-  }
-  async function saveCommandTools(nextTools) {
-    setCommandToolsSaving(true);
-    setCommandToolsError("");
-    try {
-      const { executables } = await runtime.saveProjectCommandTools(project.id, nextTools);
-      setCommandTools(executables);
-      return true;
-    } catch (error) {
-      setCommandToolsError(error.message || "Command tools could not be saved.");
-      return false;
-    } finally {
-      setCommandToolsSaving(false);
-    }
-  }
-  async function addCommandTool(event) {
-    event.preventDefault();
-    const executable = commandToolInput.trim();
-    if (!/^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/.test(executable) || commandTools.includes(executable)) return;
-    if (await saveCommandTools([...commandTools, executable])) setCommandToolInput("");
   }
   async function checkProvider() {
     const requestId = ++providerCheckRequest.current;
@@ -783,7 +744,10 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
         </nav>
         <div aria-labelledby={`settings-tab-${activeSection}`} className={`settings-section-panel${activeSection === "models" && selectedModelId ? " settings-section-panel--model-detail" : ""}`} id="settings-section-panel" role="tabpanel">
           <div className={`settings-section-heading${activeSection === "models" ? " settings-section-heading--models" : ""}`}><h3>{selectedSection.label}</h3>{activeSection !== "models" && <p>{settingsDescription(activeSection, project.name)}</p>}</div>
-          {activeSection === "workspace" && <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><DesktopTower size={18} /></span><div><h3>This device</h3><p>{workspaceDescription}</p></div></div><span className={`settings-device-status settings-device-status--${runtimeStatus}`}><i />{workspaceStatus}</span></section>}
+          {activeSection === "workspace" && <>
+            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><DesktopTower size={18} /></span><div><h3>This device</h3><p>{workspaceDescription}</p></div></div><span className={`settings-device-status settings-device-status--${runtimeStatus}`}><i />{workspaceStatus}</span></section>
+            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><Plug size={18} /></span><div><h3>Workspace MCP servers</h3><p>Configure remote and local tool connections once for this workspace. Projects can exclude individual servers, and role grants still control which tools agents can call.</p></div><button className="button button--quiet" onClick={onManageMcp} type="button">Manage MCP servers</button></div></section>
+          </>}
           {activeSection === "web-search" && <>
             <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><MagnifyingGlass size={18} /></span><div><h3>Web search for projectless chats</h3><p>Let agents find current public information and cite the pages they use. Search does not grant access to local files, repositories or shell tools.</p></div></div><form className="image-generation-form" onSubmit={saveWebSearchPreference}><label htmlFor="web-search-preference">Search provider</label><SelectControl id="web-search-preference" onChange={setWebSearchDraft} options={[{ value: "automatic", label: "Automatic · model provider, with DuckDuckGo fallback" }, { value: "duckduckgo", label: "DuckDuckGo only" }, { value: "off", label: "Off" }]} size="full" value={webSearchDraft} /><p className="settings-note">Automatic uses the selected model provider’s built-in search when supported, then falls back to DuckDuckGo. The provider or search service receives the search query when an agent searches. Project web access remains controlled in Project settings.</p>{webSearchError && <p className="recipe-error" role="alert">{webSearchError}</p>}<button className="button button--quiet" disabled={webSearchSaving || webSearchDraft === webSearchPreference} type="submit">{webSearchSaving ? "Saving…" : "Save preference"}</button></form></section>
             <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><ShieldCheck size={18} /></span><div><h3>Ongoing research access</h3><p>Manage approvals for read-only public web search and page fetches. Existing project website settings and role permissions still apply.</p></div></div>
@@ -881,10 +845,10 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
             {modelCatalogLoading ? <p className="settings-note">Loading model catalogue…</p> : <ModelCatalog models={modelCatalog.filter((model) => model.id === selectedModelId)} onModelsChange={setModelCatalog} onToggle={toggleModel} onSetDefault={setWorkspaceDefault} defaultModelId={agentRuntime.model} defaultModelSaving={defaultModelSaving} providerConnectionsLoading={providerConnectionsLoading} toggleBusy={modelToggleBusy} error={modelCatalogError} onError={setModelCatalogError} initialModelId={initialModelId} />}
           </section>}
           {activeSection === "connections" && <>
-            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><Plug size={17} /></span><div><h3>Connected services</h3><p>{project.name ? `Services agents can use in ${project.name}. Changes that affect data need your approval.` : "Choose a project to manage its connected services."}</p></div><IconButton disabled={!project.id} label="Manage connections" onClick={onManageMcp}><Plug size={15} /></IconButton></div></section>
-            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><MagnifyingGlass size={17} /></span><div><h3>Web and browser access</h3><p>Allow agents to research public websites or use the project’s browser. Read-only web requests can be approved for a chat, project or workspace; browser actions still need approval.</p></div></div><form className="usage-budget-form web-access-form" onSubmit={saveWebAccess}><label className="web-access-toggle"><button aria-checked={webEnabled} className="web-access-switch" disabled={!project.id} onClick={() => setWebEnabled((enabled) => !enabled)} role="switch" type="button"><span /></button><span>Allow website access</span></label><label htmlFor="web-allowed-domains">Allowed websites <small>Enter exact hostnames, one per line. Browser access is unavailable until at least one is listed.</small></label><textarea disabled={!project.id} id="web-allowed-domains" onChange={(event) => setWebDomains(event.target.value)} placeholder={"docs.python.org\nreact.dev"} rows={3} value={webDomains} /><p className="settings-note">Agents can access only these exact hostnames. Your own browser navigation is not restricted by this list.</p>{webError && <p className="recipe-error" role="alert">{webError}</p>}<div className="web-access-footer"><button className="button button--quiet" disabled={!project.id || webSaving} type="submit">{webSaving ? "Saving…" : "Save website settings"}</button></div></form></section>
+            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><Plug size={17} /></span><div><h3>MCP servers and tools</h3><p>Connect remote services or local stdio servers for this workspace. Projects can exclude selected servers; actions that change data need your approval.</p></div><button className="button button--quiet" onClick={onManageMcp} type="button">Manage MCP servers</button></div></section>
+            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><MagnifyingGlass size={17} /></span><div><h3>Web and browser access</h3><p>Allow agents to research public websites or use the project’s browser. Read-only web requests can be approved for a chat, project or workspace; browser actions still need approval.</p></div></div><form className="usage-budget-form web-access-form" onSubmit={saveWebAccess}><div className="web-access-toggle"><button aria-label="Allow website access" aria-checked={webEnabled} className="web-access-switch" disabled={!project.id} onClick={() => setWebEnabled((enabled) => !enabled)} role="switch" type="button"><span /></button><span>Allow website access</span></div><label htmlFor="web-allowed-domains">Allowed websites <small>Enter exact hostnames, one per line. Browser access is unavailable until at least one is listed.</small></label><textarea disabled={!project.id} id="web-allowed-domains" onChange={(event) => setWebDomains(event.target.value)} placeholder={"docs.python.org\nreact.dev"} rows={3} value={webDomains} /><p className="settings-note">Agents can access only these exact hostnames. Your own browser navigation is not restricted by this list.</p>{webError && <p className="recipe-error" role="alert">{webError}</p>}<div className="web-access-footer"><button className="button button--quiet" disabled={!project.id || webSaving} type="submit">{webSaving ? "Saving…" : "Save website settings"}</button></div></form></section>
           </>}
-          {activeSection === "commands" && <section className="settings-card command-tools-card"><div className="settings-card-heading"><span className="settings-symbol"><TerminalWindow size={17} /></span><div><h3>Project command tools</h3><p>Choose extra executables for background runs in {project.name || "this project"}. Tribe runs each command in the repository folder with your account's file and network access.</p></div></div>{!project.id ? <p className="settings-note">Choose a project to manage its command tools.</p> : <><form className="command-tools-form" onSubmit={addCommandTool}><label htmlFor="project-command-tool">Executable name</label><div><input autoComplete="off" id="project-command-tool" maxLength={128} onChange={(event) => setCommandToolInput(event.target.value)} placeholder="terraform, gh, or a tool on PATH" value={commandToolInput} /><button className="button button--quiet" disabled={commandToolsSaving || !/^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/.test(commandToolInput.trim()) || commandTools.includes(commandToolInput.trim())} type="submit">Add tool</button></div><small>Enter a command name only, without a path or arguments. You start each background run.</small></form>{commandToolsError && <p className="recipe-error" role="alert">{commandToolsError}</p>}{commandToolsLoading ? <p className="settings-note">Loading command tools…</p> : commandTools.length ? <ul className="command-tool-list">{commandTools.map((executable) => <li key={executable}><code>{executable}</code><button className="text-button" disabled={commandToolsSaving} onClick={() => saveCommandTools(commandTools.filter((item) => item !== executable))} type="button">Remove</button></li>)}</ul> : <p className="settings-note">No extra tools approved. Tribe's built-in command set remains available.</p>}</>}</section>}
+          {activeSection === "commands" && <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><TerminalWindow size={17} /></span><div><h3>Shell access</h3><p>Agents can use commands installed on this device when their selected role has the Shell capability. Commands run in the project workspace.</p></div></div><p className="settings-note">Manage Shell access in Project settings → Team. The project approval mode and exact-action prompts govern commands that can change files or affect external services.</p></section>}
           {activeSection === "desktop" && <><section className="settings-card desktop-access-card"><div className="settings-card-heading"><span className="settings-symbol"><DesktopTower size={17} /></span><div><h3>Desktop access</h3><p>Check whether this device can support app inspection. This check does not capture the screen or control apps.</p></div></div><button className="button button--quiet" disabled={!window.__TAURI_INTERNALS__ || desktopAccessChecking} onClick={checkDesktopAccess} type="button">{desktopAccessChecking ? "Checking…" : "Check access"}</button>{!window.__TAURI_INTERNALS__ && <p className="settings-note">Available in the desktop app.</p>}{desktopAccessError && <p className="recipe-error" role="alert">{desktopAccessError}</p>}{desktopAccess && <div className="desktop-access-results" role="status"><p><strong>Screen capture</strong><span>{formatPermission(desktopAccess.screenCapture.permission)}</span><small>{desktopAccess.screenCapture.detail}</small>{desktopAccess.platform === "macos" && <button className="button button--quiet desktop-access-settings-link" onClick={() => openDesktopPrivacySettings("screen_capture")} type="button">Open Screen Recording settings</button>}</p><p><strong>Accessibility</strong><span>{formatPermission(desktopAccess.accessibility.permission)}</span><small>{desktopAccess.accessibility.detail}</small>{desktopAccess.platform === "macos" && <button className="button button--quiet desktop-access-settings-link" onClick={() => openDesktopPrivacySettings("accessibility")} type="button">Open Accessibility settings</button>}</p>{desktopAccess.adapterAvailable ? <p className="settings-note">One-shot window screenshots use the macOS system picker. Accessibility data and app controls are not available.</p> : <p className="settings-note">Window selection depends on this app’s WebView on this platform. Packaged support is not yet verified; accessibility data and app controls are not available.</p>}</div>}</section><section className="settings-card computer-access-card"><div className="settings-card-heading"><span className="settings-symbol"><DesktopTower size={17} /></span><div><h3>Computer use for this project</h3><p>Let agents ask to inspect a window you choose. Each request opens the system picker; Tribe never captures in the background.</p></div></div><form className="computer-access-form" onSubmit={saveComputerAccess}><label className="computer-access-toggle"><input checked={computerEnabled} disabled={!project.id} onChange={(event) => setComputerEnabled(event.target.checked)} role="switch" type="checkbox" /><span className="computer-access-switch" aria-hidden="true" /><span>Allow agents to request a window observation</span></label>{computerError && <p className="recipe-error" role="alert">{computerError}</p>}<button className="button button--quiet" disabled={!project.id || computerSaving || computerEnabled === Boolean(computerAccess?.enabled)} type="submit">{computerSaving ? "Saving…" : "Save access"}</button></form></section></>}
           {activeSection === "data" && <>
             <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><ChartLine size={17} /></span><div><h3>Usage limits</h3><p>Set token and cost limits for {project.name || "this project"}.</p></div></div><MonthToDateUsage usage={usage} /><form className="usage-budget-form" onSubmit={saveBudget}><label htmlFor="agent-run-token-limit">Maximum tokens per agent run <small>No cumulative limit by default. This run budget is separate from the model’s per-request context window; Tribe compacts long conversation history to keep it within that window.</small></label><input id="agent-run-token-limit" max="1000000000" min="1" onChange={(event) => setRunTokenInput(event.target.value)} placeholder="No limit" type="number" value={runTokenInput} /><label htmlFor="monthly-token-limit">Monthly token limit <small>Leave blank for no monthly limit.</small></label><input id="monthly-token-limit" min="1" onChange={(event) => setBudgetInput(event.target.value)} placeholder="No limit" type="number" value={budgetInput} /><label htmlFor="agent-run-cost-limit">Cost per agent run (USD) <small>Leave blank for no run cost ceiling.</small></label><input id="agent-run-cost-limit" max="1000000" min="0.000001" onChange={(event) => setRunCostInput(event.target.value)} placeholder="No limit" step="any" type="number" value={runCostInput} /><small className="budget-limit-note">Best-effort provider estimate. Unpriced models cannot be capped, and the request that crosses a limit may still be billed.</small><div><button className="button button--quiet" disabled={budgetSaving || !project.id} type="submit">{budgetSaving ? "Saving…" : "Save limits"}</button></div></form></section>
@@ -908,8 +872,8 @@ function settingsDescription(section, projectName) {
     workspace: "Local storage and app status for this device.",
     models: "Connect a provider, allow an agent-ready model, then set the workspace default.",
     "web-search": "Choose a search provider and review ongoing public web approvals.",
-    connections: projectName ? `Services and web access for ${projectName}.` : "Choose a project to configure its services.",
-    commands: projectName ? `Choose background command tools for ${projectName}.` : "Choose a project to configure its command tools.",
+    connections: "Configure workspace MCP servers and project website access.",
+    commands: projectName ? `Manage agent command access for ${projectName}.` : "Choose a project to manage agent command access.",
     desktop: "Review the permissions needed for computer-use features.",
     data: "Set usage limits and manage workspace exports.",
     experimental: "Try optional agent features and compare their measured usage.",

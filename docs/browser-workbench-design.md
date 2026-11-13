@@ -14,7 +14,7 @@ The Browser implementation uses Electron's app-owned Chromium `WebContentsView` 
 
 One Electron browser service owns profiles, tabs, navigation, viewport settings, permissions, downloads, storage and diagnostics. The visible Browser pane and authorised agent tools call that service, so both operate on the selected visible tab and its session. Agent calls go through an authenticated loopback service and are checked against the active project's host policy and action approvals.
 
-The existing Tauri desktop distribution remains available and unchanged. The Browser surface is an Electron desktop-shell implementation; its successful macOS development/package checks do not establish a signed production release or cross-platform parity. Continue with this engine for the prototype. Reconsider another engine only if supported-platform packaging, isolation or same-tab automation fails its release gates; do not fall back to an iframe or screenshot relay for arbitrary-site browsing.
+Electron is the standard desktop release shell because the managed Browser depends on Chromium `WebContentsView`. Keep Tauri only as a legacy development path; do not publish it as the standard release while it cannot provide the managed Browser. Release CI must package and exercise Electron on every supported platform before publishing; do not fall back to an iframe or screenshot relay for arbitrary-site browsing.
 
 The browser service owns an engine-neutral contract for browser profiles, contexts, tabs, navigation, viewport/emulation, page observation, input, permissions, storage inspection/clearing, downloads and lifecycle. Engine adapters implement that contract. Browser controls and agent tools call the same operations and reference the same tab identity.
 
@@ -54,7 +54,7 @@ Page content is untrusted input. Keep it isolated from Tribe's privileged applic
 
 Electron with `WebContentsView` is the selected prototype route. Its Chromium page, isolated session partitions, permission and download events, and authenticated same-tab agent bridge have been exercised in macOS development and unpacked-app checks. This is evidence for the browser architecture, not a release decision for the whole desktop shell.
 
-The Electron shell still needs signed packaging and lifecycle verification across supported platforms. The existing Tauri distribution remains unchanged while that work is open. Keep the browser page and agent automation on one Electron service; do not run different browser engines per platform or use an iframe/screenshot relay as a fallback.
+The Electron shell must pass signed macOS packaging, Windows installer and lifecycle verification before a tagged release is published. Keep the browser page and agent automation on one Electron service; do not run different browser engines per platform or use an iframe/screenshot relay as a fallback.
 
 Remaining release gates:
 
@@ -89,7 +89,7 @@ Agent browser requests use the authenticated loopback service and share the curr
 
 Page diagnostics now record main-frame navigation status, in-page URL changes, failed loads and renderer exits. Network entries include method, resource type, HTTP status or failure, and duration; console entries include severity, redacted source URL and line. The panel opens on Page and separates page, console and network events. The browser agent's `browser_diagnostics` tool returns the same per-tab records. URLs omit query strings and fragments and redact likely credentials or user identifiers. These records are bounded and kept in memory; request/response headers and bodies, WebSocket traffic and detailed TLS diagnostics are not captured.
 
-This is not ready to be called a complete browser. Origins with stored data from before inventory tracking began can remain undiscoverable. Other remaining work includes provider-driven browser tool invocation with a real structured-tool model; true mobile operating-system emulation and broader device/client-hint coverage; and signed packaging plus lifecycle and recovery verification across supported desktop platforms. The permission check used an unsigned macOS arm64 development package; permission behavior on other platforms remains unverified. The existing Tauri distribution is unchanged; Electron has not passed all release gates.
+This is not ready to be called a complete browser. Origins with stored data from before inventory tracking began can remain undiscoverable. Other remaining work includes provider-driven browser tool invocation with a real structured-tool model; true mobile operating-system emulation and broader device/client-hint coverage; and signed packaging plus lifecycle and recovery verification across supported desktop platforms. The permission check used an unsigned macOS arm64 development package; permission behavior on other platforms remains unverified. Release CI is the gate for Electron installer and lifecycle acceptance.
 
 ## Shared browser service
 

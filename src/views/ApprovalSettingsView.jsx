@@ -67,7 +67,7 @@ export function ApprovalSettingsView({ projectId }) {
       </div>
       <div aria-label="Approval mode" className="approval-mode-list" role="radiogroup">
         {approvalModes.map((option) => <label className={`approval-mode-option${mode === option.id ? " approval-mode-option--selected" : ""}`} key={option.id}>
-          <input checked={mode === option.id} disabled={loading || saving} name="approval-mode" onChange={() => { setMode(option.id); setNotice(""); }} type="radio" value={option.id} />
+          <input aria-label={option.title} checked={mode === option.id} disabled={loading || saving} name="approval-mode" onChange={() => { setMode(option.id); setNotice(""); }} type="radio" value={option.id} />
           <span aria-hidden="true" className="approval-mode-indicator" /><span className="approval-mode-copy"><strong>{option.title}</strong><small>{option.description}</small></span>
         </label>)}
       </div>

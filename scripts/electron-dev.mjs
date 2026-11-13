@@ -1,12 +1,14 @@
 import { spawn } from "node:child_process";
+import { mkdtemp } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import net from "node:net";
 import crypto from "node:crypto";
 
 const port = Number(process.env.TRIBE_ELECTRON_VITE_PORT || 5176);
 const devUrl = `http://127.0.0.1:${port}`;
-const dataDir = process.env.TRIBE_ELECTRON_DATA_DIR || "/tmp/tribe-browser-system-data";
+const dataDir = process.env.TRIBE_ELECTRON_DATA_DIR || await mkdtemp(join(tmpdir(), "tribe-browser-system-data-"));
 const runtimePort = await reserveLocalPort();
 const browserApiPort = await reserveLocalPort();
 const browserApiToken = crypto.randomBytes(32).toString("hex");

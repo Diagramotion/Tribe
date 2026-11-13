@@ -132,9 +132,9 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
               </ExplorerRowButton>
               <div className="explorer-menu-wrap">
                 <button aria-expanded={openMenu?.key === `general-chat-${chat.id}`} aria-label={`More actions for ${chat.title}`} className="explorer-menu-trigger" onClick={(event) => toggleMenu(`general-chat-${chat.id}`, event)} title={`More actions for ${chat.title}`} type="button"><DotsThree size={17} weight="bold" /></button>
-                {openMenu?.key === `general-chat-${chat.id}` && createPortal(<div className="explorer-context-menu" onClick={(event) => event.stopPropagation()} role="menu" style={{ left: openMenu.left, top: openMenu.top }}>
-                  <button onClick={() => { setOpenMenu(null); onSelectGeneralChat(chat.id); }} role="menuitem" type="button"><ChatCircleDots size={15} />Open chat</button>
-                  <button onClick={() => { setOpenMenu(null); togglePin("chat", chat.id); }} role="menuitem" type="button"><PushPin size={15} />{isPinned("chat", chat.id) ? "Unpin chat" : "Pin chat"}</button>
+                {openMenu?.key === `general-chat-${chat.id}` && createPortal(<div aria-label={`Actions for ${chat.title}`} className="explorer-context-menu" onClick={(event) => event.stopPropagation()} role="group" style={{ left: openMenu.left, top: openMenu.top }}>
+                  <button onClick={() => { setOpenMenu(null); onSelectGeneralChat(chat.id); }} type="button"><ChatCircleDots size={15} />Open chat</button>
+                  <button onClick={() => { setOpenMenu(null); togglePin("chat", chat.id); }} type="button"><PushPin size={15} />{isPinned("chat", chat.id) ? "Unpin chat" : "Pin chat"}</button>
                 </div>, document.body)}
               </div>
             </div>)}
@@ -149,13 +149,13 @@ export function Sidebar({ activeTab, collapsed, onNavigate, onSelectProject, onS
               </ExplorerRowButton>
               <div className="explorer-menu-wrap">
                 <button aria-expanded={openMenu?.key === `project-${item.id}`} aria-label={`More actions for ${item.name}`} className="explorer-menu-trigger" onClick={(event) => { event.stopPropagation(); toggleMenu(`project-${item.id}`, event); }} title={`More actions for ${item.name}`} type="button"><DotsThree size={17} weight="bold" /></button>
-                {openMenu?.key === `project-${item.id}` && createPortal(<div className="explorer-context-menu" onClick={(event) => event.stopPropagation()} role="menu" style={{ left: openMenu.left, top: openMenu.top }}>
-                  <button onClick={() => { setOpenMenu(null); onCreateMission(item); }} role="menuitem" type="button"><ChatCircleDots size={15} />New chat</button>
-                  <button onClick={() => { setOpenMenu(null); onOpenProjectSettings?.(item, openMenu?.trigger); }} role="menuitem" type="button"><Gear size={15} />Project settings</button>
-                  {item.repository && <button onClick={() => { setOpenMenu(null); onSelectProject(item); onNavigate("Code"); }} role="menuitem" type="button"><FolderSimple size={15} />Open repository</button>}
-                  <button onClick={() => { setOpenMenu(null); togglePin("project", item.id); }} role="menuitem" type="button"><PushPin size={15} />{isPinned("project", item.id) ? "Unpin project" : "Pin project"}</button>
+                {openMenu?.key === `project-${item.id}` && createPortal(<div aria-label={`Actions for ${item.name}`} className="explorer-context-menu" onClick={(event) => event.stopPropagation()} role="group" style={{ left: openMenu.left, top: openMenu.top }}>
+                  <button onClick={() => { setOpenMenu(null); onCreateMission(item); }} type="button"><ChatCircleDots size={15} />New chat</button>
+                  <button onClick={() => { setOpenMenu(null); onOpenProjectSettings?.(item, openMenu?.trigger); }} type="button"><Gear size={15} />Project settings</button>
+                  {item.repository && <button onClick={() => { setOpenMenu(null); onSelectProject(item); onNavigate("Code"); }} type="button"><FolderSimple size={15} />Open repository</button>}
+                  <button onClick={() => { setOpenMenu(null); togglePin("project", item.id); }} type="button"><PushPin size={15} />{isPinned("project", item.id) ? "Unpin project" : "Pin project"}</button>
                   <div className="explorer-context-menu-divider" />
-                  <button className="explorer-context-menu-danger" onClick={() => { setOpenMenu(null); onDeleteProject(item.id); }} role="menuitem" type="button"><Trash size={15} />Delete project</button>
+                  <button className="explorer-context-menu-danger" onClick={() => { setOpenMenu(null); onDeleteProject(item.id); }} type="button"><Trash size={15} />Delete project</button>
                 </div>, document.body)}
               </div>
             </div>

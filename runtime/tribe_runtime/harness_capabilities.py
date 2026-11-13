@@ -137,6 +137,18 @@ def build_capabilities(
             return False
         executable = Path(parts[0].replace("\\", "/")).name.casefold()
         arguments = [part.casefold() for part in parts[1:]]
+        if executable == "gh":
+            read_only_operations = {
+                ("auth", "status"), ("repo", "view"),
+                ("pr", "view"), ("pr", "list"), ("pr", "status"), ("pr", "checks"),
+                ("issue", "view"), ("issue", "list"), ("issue", "status"),
+                ("run", "view"), ("run", "list"),
+                ("release", "view"), ("release", "list"),
+                ("workflow", "view"), ("workflow", "list"),
+                ("search", "repos"), ("search", "issues"),
+            }
+            if tuple(arguments[:2]) in read_only_operations:
+                return False
         risky_executables = {
             "rm", "rmdir", "del", "erase", "remove-item", "format", "mkfs", "dd",
             "shutdown", "reboot", "curl", "wget", "ssh", "scp", "sftp", "ftp",
@@ -403,10 +415,11 @@ def build_capabilities(
                 defer_loading=True,
             ))
         if shell_tools:
-            # This is an accident-prevention allowlist, not a security boundary. High-risk
-            # operations remain exposed through Tribe's exact-action approval tools.
+            # Shell access is granted by the reusable role profile. Do not maintain an
+            # executable-name allowlist here; Tribe's hook applies approval policy to each
+            # command, and Harness runs it in the selected project workspace.
             capabilities.append(Shell(
-                allowed_commands=["pytest", "node", "npm", "pnpm", "yarn", "cargo", "go", "dotnet"],
+                denied_commands=[],
                 id="tribe_shell", tools=shell_tools, defer_loading=True,
             ))
     capabilities.extend([

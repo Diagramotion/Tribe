@@ -61,7 +61,7 @@ export function notebookCellDiff(beforeContent, afterContent) {
       newSource,
       outputsChanged,
       lines: diffLines(oldSource, newSource).flatMap((part) =>
-        (part.value.match(/[^\n]*\n|[^\n]+$/g) ?? []).map((value) => ({
+        (part.value.match(/(?:[^\n]*\n|[^\n]+$)/g) ?? []).map((value) => ({
           kind: part.added ? "added" : part.removed ? "removed" : "context",
           text: value.replace(/\n$/, ""),
         }))),
@@ -78,7 +78,7 @@ export function notebookCellDiff(beforeContent, afterContent) {
       newSource: "",
       outputsChanged: false,
       lines: diffLines(notebookSourceText(cell?.source), "").flatMap((part) =>
-        (part.value.match(/[^\n]*\n|[^\n]+$/g) ?? []).map((value) => ({
+        (part.value.match(/(?:[^\n]*\n|[^\n]+$)/g) ?? []).map((value) => ({
           kind: part.added ? "added" : part.removed ? "removed" : "context",
           text: value.replace(/\n$/, ""),
         }))),
@@ -88,7 +88,7 @@ export function notebookCellDiff(beforeContent, afterContent) {
 }
 
 export function notebookSourceLines(source) {
-  return source.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+  return source.match(/(?:[^\n]*\n|[^\n]+$)/g) ?? [];
 }
 
 export function updateNotebookCell(notebook, index, source) {
