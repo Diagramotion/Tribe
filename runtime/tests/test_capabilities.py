@@ -57,6 +57,12 @@ class CapabilityContractTests(unittest.TestCase):
     def test_builder_profile_can_use_the_visible_browser_for_web_app_delivery(self) -> None:
         definitions = discover_agents(RUNTIME_ROOT.parent / "agents")
         builder = next(definition for definition in definitions if definition.id == "builder")
+        self.assertIn("direct user requests", builder.role)
+        self.assertIn("Planner and pre-existing work item are not required", builder.instructions)
+        self.assertIn("work items only when shared tracking", builder.instructions)
+        self.assertIn("latest user request and its acceptance criteria as your task", builder.instructions)
+        self.assertIn("project documents are constraints and context, not a replacement task", builder.instructions)
+        self.assertIn("Do not summarise project guidance unless asked", builder.instructions)
         self.assertIn("browser", builder.capabilities)
         self.assertIn("browser_snapshot", builder.tool_permissions)
         self.assertIn("browser_diagnostics", builder.tool_permissions)
