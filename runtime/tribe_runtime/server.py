@@ -1597,12 +1597,12 @@ class Handler(BaseHTTPRequestHandler):
                 if (not isinstance(mentions, list) or len(mentions) > 20
                         or any(not isinstance(item, str) for item in mentions)):
                     return self._json(422, {"error": "message_mentions_invalid"})
-                project_agent_ids = STORE.project_agent_ids(
-                    mission["project_id"], _workspace_agent_ids(),
+                chat_agent_ids = STORE.mission_agent_ids(
+                    mission_id, _workspace_agent_ids(),
                 )
                 mentions = list(dict.fromkeys(item.strip() for item in mentions if item.strip()))
-                if any(agent_id not in project_agent_ids for agent_id in mentions):
-                    return self._json(422, {"error": "message_mention_not_in_project_roster"})
+                if any(agent_id not in chat_agent_ids for agent_id in mentions):
+                    return self._json(422, {"error": "message_mention_not_in_chat_team"})
                 deep_research = body.get("deepResearch") is True
                 lead_agent_id = STORE.mission_lead_agent_id(mission_id)
                 if deep_research and not lead_agent_id:

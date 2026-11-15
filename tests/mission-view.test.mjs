@@ -144,7 +144,7 @@ test("a direct @mention renders the addressed role while it replies", () => {
   assert.match(html, /Waiting for Security Auditor…/);
 });
 
-test("choosing a suggestion inserts an explicit mention and resolves its project-roster recipient", () => {
+test("choosing a suggestion inserts an explicit mention and resolves its chat-team recipient", () => {
   const draft = insertAgentMention("Please check @Rev", "Reviewer");
   assert.equal(draft, "Please check @Reviewer ");
   const roster = [
@@ -270,7 +270,7 @@ test("composer arrow keys, Enter and Escape operate the active mention suggestio
   assert.equal(key("Enter", true).handled, false);
 });
 
-test("@Reviewer is suggested from the project roster without changing chat participants", () => {
+test("@Reviewer is not suggested until the role joins the chat team", () => {
   const html = renderChat({
     team: [{ id: "builder", name: "Builder", role: "Implement work", status: "Ready" }],
     roster: [
@@ -280,9 +280,23 @@ test("@Reviewer is suggested from the project roster without changing chat parti
     composerDraft: { text: "@Rev", token: "mention-suggestions-roster" },
     participantPickerOpen: true,
   });
-  assert.match(html, /<strong>Reviewer<\/strong>/);
-  assert.match(html, /aria-pressed="true"[^>]*><i[^>]*><\/i><span><strong>Builder/);
+  assert.doesNotMatch(html, /aria-label="Mention an agent"/);
   assert.match(html, /aria-pressed="false"[^>]*><i[^>]*><\/i><span><strong>Reviewer/);
+  assert.match(html, /aria-pressed="true"[^>]*><i[^>]*><\/i><span><strong>Builder/);
+});
+
+test("the accessible mention menu offers selected chat roles", () => {
+  const html = renderChat({
+    team: [
+      { id: "builder", name: "Builder", role: "Implement work", status: "Ready" },
+      { id: "reviewer", name: "Reviewer", role: "Quality review", status: "Ready" },
+    ],
+    roster: [
+      { id: "builder", name: "Builder", role: "Implement work", status: "Ready" },
+      { id: "reviewer", name: "Reviewer", role: "Quality review", status: "Ready" },
+    ],
+    composerDraft: { text: "@Rev", token: "selected-mention-suggestion" },
+  });
   assert.match(html, /role="listbox"[\s\S]*<button[^>]*role="option"[^>]*>[\s\S]*<strong>Reviewer<\/strong>/);
   assert.deepEqual(mentionedAgentIds(insertAgentMention("@Rev", "Reviewer"), [
     { id: "builder", name: "Builder", role: "Implement work" },
@@ -312,7 +326,7 @@ test("a direct recipient renders the addressed role while it replies", () => {
   assert.match(html, /Waiting for Security Auditor…/);
 });
 
-test("a mentioned project role outside chat participants is shown as awaiting a reply", () => {
+test("a mention outside the chat team is not shown as awaiting a reply", () => {
   const html = renderChat({
     mentions: ["reviewer"],
     team: [{ id: "builder", name: "Builder", role: "Implement work", status: "Ready" }],
@@ -322,7 +336,7 @@ test("a mentioned project role outside chat participants is shown as awaiting a 
     ],
   });
 
-  assert.match(html, /Waiting for Reviewer…/);
+  assert.doesNotMatch(html, /Waiting for Reviewer…/);
 });
 
 test("a remembered repository edit explains its chat and project scope", () => {

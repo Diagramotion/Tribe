@@ -935,7 +935,7 @@ function MessageComposer({ agents, teamAgents = agents, mission, workspaceModel,
     if ((!value.trim() && attachments.length === 0) || sending) return;
     setSending(true);
     try {
-      const mentions = resolveMentionedAgentIds(value, teamAgents, selectedMentions);
+      const mentions = resolveMentionedAgentIds(value, agents, selectedMentions);
       const saved = await onSend(value.trim() || "Please review the attached files.", null, canvasContext, attachments, { deepResearch, mentions });
       if (saved === false) return;
       setValue("");
@@ -1071,7 +1071,7 @@ function MessageComposer({ agents, teamAgents = agents, mission, workspaceModel,
 
   const mentionMatch = value.match(/(^|\s)@([^\n]*)$/);
   const mentionQuery = mentionMatch?.[2]?.toLowerCase() ?? null;
-  const mentionOptions = mentionQuery === null || mentionDismissed ? [] : teamAgents
+  const mentionOptions = mentionQuery === null || mentionDismissed ? [] : agents
     .filter((agent) => `${agent.name} ${agent.role}`.toLowerCase().includes(mentionQuery))
     .slice(0, 6);
 
@@ -1287,7 +1287,6 @@ function RightRail({ artifacts, activeInteraction, queuedInteractions, onSelectA
 
 export function MissionView({ mission, agents, teamAgents = agents, agentDefinitions = agents, messages, artifacts, hasOlderEvents, loadingOlderEvents, onLoadOlderEvents, workItems, query = "", isolatedWorkspaces, activeInteraction, queuedInteractions, runtimeStatus, workspaceModel, onSend, onRecoverAgent, onStopAgentRun, onResolve, onSelectArtifact, onOpenCanvas, composerDraft, onComposerDraftConsumed, onActivateInteraction, onAttach, onDiscardIsolation, onConnectModel, onManageModelMetadata, onManageTeam, onUpdateMissionTeam, onOpenUsageSettings, onSaveModelPreferences, interactiveResponsesEnabled = false, onShareInteractiveAction, onOpenAgentActivity = () => {}, initialTeamMenuOpen = false }) {
   const activityRows = useMemo(() => groupActivityMessages(messages), [messages]);
-  const workingAgents = teamAgents.filter((agent) => agent.status === "Working");
   let latestHumanMessage = null;
   let latestAgentMessage = null;
   for (const message of messages) {
@@ -1297,6 +1296,7 @@ export function MissionView({ mission, agents, teamAgents = agents, agentDefinit
   }
   const selectedTeamAgents = teamAgents.filter((agent) =>
     (mission?.agentIds ?? teamAgents.map((member) => member.id)).includes(agent.id));
+  const workingAgents = selectedTeamAgents.filter((agent) => agent.status === "Working");
   const preferredIntakeAgentId = latestHumanMessage?.leadAgentId ?? mission?.leadAgentId;
   const intakeAgent = selectedTeamAgents.find((agent) =>
     agent.id === preferredIntakeAgentId && agent.status === "Ready")
@@ -1306,11 +1306,11 @@ export function MissionView({ mission, agents, teamAgents = agents, agentDefinit
     : latestHumanMessage?.mentionedAgentIds?.length
       ? latestHumanMessage.mentionedAgentIds
       : intakeAgent ? [intakeAgent.id] : [];
-  const awaitingAgentNames = teamAgents
+  const awaitingAgentNames = selectedTeamAgents
     .filter((agent) => addressedAgentIds.includes(agent.id))
     .map((agent) => agent.name);
   const awaitingLabel = awaitingAgentNames.length === 1 ? awaitingAgentNames[0] : "the team";
-  const awaitingRole = teamAgents.some((agent) => addressedAgentIds.includes(agent.id) && agent.status === "Ready");
+  const awaitingRole = selectedTeamAgents.some((agent) => addressedAgentIds.includes(agent.id) && agent.status === "Ready");
   const awaitingAgentResponse = mission?.status === "active" && !mission.archived_at
     && runtimeStatus === "connected" && latestHumanMessage
     && latestHumanMessage.sequence > (latestAgentMessage?.sequence ?? -1)

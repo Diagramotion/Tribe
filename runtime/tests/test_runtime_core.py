@@ -10100,7 +10100,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             self.store, self.mission["id"], reviewer, None, threading.Event(),
             project_team=_project_team_context([builder], {"builder"}),
         )
-        self.assertTrue(nonparticipant_reviewer._should_run(
+        self.assertFalse(nonparticipant_reviewer._should_run(
             {**user_message, "payload": {"mentions": ["reviewer"]}},
         ))
         self.assertFalse(nonparticipant_reviewer._should_run(user_message))
@@ -11379,12 +11379,33 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                     "a new message must wake the already active chat team",
                 )
 
-                # Mention targets may be in the configured project roster without
-                # being participants managed by this chat's team picker.
+                # Mentions route only to roles selected by this chat's team picker.
                 roster_ids = [definition.id for definition in definitions]
                 self.store.set_project_agent_ids(self.project["id"], roster_ids, roster_ids)
                 self.store.set_mission_agent_ids(
                     self.mission["id"], ["builder"], roster_ids, lead_agent_id=None,
+                )
+                unselected_mention_request = urllib.request.Request(
+                    f"http://127.0.0.1:{http.server_port}/api/messages",
+                    data=json.dumps({
+                        "missionId": self.mission["id"],
+                        "text": "Please review this @Reviewer",
+                        "mentions": ["reviewer"],
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Origin": "http://localhost:5173"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as rejected_mention:
+                    urllib.request.urlopen(unselected_mention_request, timeout=3)
+                self.assertEqual(rejected_mention.exception.code, 422)
+                self.assertEqual(
+                    json.loads(rejected_mention.exception.read())["error"],
+                    "message_mention_not_in_chat_team",
+                )
+
+                self.store.set_mission_agent_ids(
+                    self.mission["id"], ["builder", "reviewer"], roster_ids,
+                    lead_agent_id=None,
                 )
                 mention_request = urllib.request.Request(
                     f"http://127.0.0.1:{http.server_port}/api/messages",
@@ -11400,7 +11421,10 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                     mentioned = json.loads(response.read())["event"]
                 self.assertEqual(mentioned["payload"]["mentions"], ["reviewer"])
                 self.assertEqual(supervisor.resumed_mentions, ["reviewer"])
-                self.assertEqual(self.store.mission_agent_ids(self.mission["id"], roster_ids), ["builder"])
+                self.assertEqual(
+                    self.store.mission_agent_ids(self.mission["id"], roster_ids),
+                    ["builder", "reviewer"],
+                )
 
                 with self.store._connect() as db:
                     db.execute("UPDATE missions SET status='completed' WHERE id=?", (self.mission["id"],))
@@ -14683,7 +14707,7 @@ class SupervisorResumeCase(unittest.TestCase):
         self.store.save_agent_offset("builder", self.mission["id"], message["sequence"] - 1)
         self.store.create_work_item(self.mission["id"], "Keep the worker lifecycle task active")
 
-    def test_mention_starts_a_project_role_not_selected_for_the_chat(self) -> None:
+    def test_mention_starts_a_selected_chat_role(self) -> None:
         mentioned = threading.Event()
         received = []
 
@@ -14695,6 +14719,47 @@ class SupervisorResumeCase(unittest.TestCase):
                 if event["type"] == "message.created" and "reviewer" in event["payload"].get("mentions", []):
                     received.append((inner_self.agent_id, event["payload"]["mentions"]))
                     mentioned.set()
+                return "Mention received"
+
+        class EnabledSupervisor(AgentSupervisor):
+            @property
+            def enabled(self) -> bool:
+                return True
+
+        definitions = [
+            AgentDefinition("builder", "Builder", "Implementation", "", "builder.md"),
+            AgentDefinition("reviewer", "Reviewer", "Quality review", "", "reviewer.md"),
+        ]
+        role_ids = [definition.id for definition in definitions]
+        self.store.set_project_agent_ids(self.project["id"], role_ids, role_ids)
+        self.store.set_mission_agent_ids(self.mission["id"], role_ids, role_ids)
+        self.store.activate_mission(self.mission["id"])
+        event = self.store.append("message.created", "user", self.mission["id"], {
+            "text": "Please review this change @Reviewer", "recipient": None, "mentions": ["reviewer"],
+        })
+        self.store.save_agent_offset("builder", self.mission["id"], event["sequence"])
+        supervisor = EnabledSupervisor(
+            self.store, definitions,
+            provider_factory=lambda definition, model: MentionProvider(definition.id),
+        )
+        try:
+            supervisor.resume_after_user_message(self.mission["id"], event["sequence"], ["reviewer"])
+            self.assertTrue(mentioned.wait(5), "the selected chat mention target should receive its user message")
+            self.assertEqual(received, [("reviewer", ["reviewer"])])
+            self.assertEqual(self.store.mission_agent_ids(self.mission["id"], role_ids), role_ids)
+        finally:
+            supervisor.close()
+
+    def test_mention_does_not_start_a_project_role_outside_the_chat_team(self) -> None:
+        received = []
+
+        class MentionProvider:
+            def __init__(self, agent_id: str):
+                self.agent_id = agent_id
+
+            async def run(inner_self, store: MissionStore, mission_id: str, event: dict) -> str:
+                if event["type"] == "message.created":
+                    received.append(inner_self.agent_id)
                 return "Mention received"
 
         class EnabledSupervisor(AgentSupervisor):
@@ -14720,8 +14785,9 @@ class SupervisorResumeCase(unittest.TestCase):
         )
         try:
             supervisor.resume_after_user_message(self.mission["id"], event["sequence"], ["reviewer"])
-            self.assertTrue(mentioned.wait(5), "the project-roster mention target should receive its user message")
-            self.assertEqual(received, [("reviewer", ["reviewer"])])
+            time.sleep(0.3)
+            self.assertNotIn((self.mission["id"], "reviewer"), supervisor._workers)
+            self.assertEqual(received, [])
             self.assertEqual(self.store.mission_agent_ids(self.mission["id"], role_ids), ["builder"])
         finally:
             supervisor.close()

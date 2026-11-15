@@ -4010,6 +4010,12 @@ class AgentWorker:
                 return recipient in {self.definition.id, self.definition.role}
             mentions = event["payload"].get("mentions", [])
             if isinstance(mentions, list) and mentions:
+                selected_ids = {
+                    member.get("id") for member in self.project_team
+                    if isinstance(member, dict) and isinstance(member.get("id"), str)
+                }
+                if self.definition.id not in selected_ids:
+                    return False
                 return (
                     any(mention in {self.definition.id, self.definition.role} for mention in mentions)
                     or (
@@ -4629,7 +4635,7 @@ class AgentSupervisor:
 
     def resume_after_user_message(self, mission_id: str, message_sequence: int,
                                   mentioned_agent_ids: list[str] | None = None) -> None:
-        """Resume selected consumers and deliver explicit mentions from the project roster."""
+        """Resume selected consumers and deliver explicit mentions from the chat team."""
         if self._shutdown.is_set():
             return
         mentioned_agent_ids = mentioned_agent_ids or []
@@ -4781,8 +4787,8 @@ class AgentSupervisor:
             available = [definition.id for definition in self.definitions]
             selected = set(self.store.mission_agent_ids(mission_id, available))
             roster = set(self.store.project_agent_ids(mission["project_id"], available))
-            mentioned = set(mentioned_agent_ids or ()) & roster
-            worker_ids = selected | mentioned
+            mentioned = set(mentioned_agent_ids or ()) & roster & selected
+            worker_ids = selected
             project_definitions = [definition for definition in self.definitions if definition.id in selected]
             worker_definitions = [definition for definition in self.definitions if definition.id in worker_ids]
             mission_stop = self._mission_stops.get(mission_id)
