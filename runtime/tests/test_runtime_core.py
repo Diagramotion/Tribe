@@ -59,6 +59,7 @@ from tribe_runtime.agent_runtime import (
     _provider_result_usage_values,
     _requires_initial_repository_tool_call,
     _run_model_settings,
+    _validate_repository_tool_call,
     _reject_text_encoded_tool_call,
     _scheduled_provider_retry_delay,
     wait_for_harness_background_command,
@@ -254,14 +255,14 @@ class RuntimeCase(unittest.TestCase):
         self.assertFalse(_requires_initial_repository_tool_call("What is a Python closure?"))
 
     def test_repository_tool_requirement_clears_after_first_call(self) -> None:
-        context = SimpleNamespace(deps=SimpleNamespace(tool_call_count=0))
+        context = SimpleNamespace(deps=SimpleNamespace(repository_tool_call_count=0))
         settings = _run_model_settings(
             {"max_tokens": 512, "thinking": "low"}, require_initial_tool_call=True,
         )
         self.assertEqual(settings(context), {
             "max_tokens": 512, "thinking": "low", "tool_choice": "required",
         })
-        context.deps.tool_call_count = 1
+        context.deps.repository_tool_call_count = 1
         self.assertEqual(settings(context), {
             "max_tokens": 512, "thinking": "low", "tool_choice": "auto",
         })
@@ -269,6 +270,20 @@ class RuntimeCase(unittest.TestCase):
     def test_ordinary_chat_model_settings_remain_unchanged(self) -> None:
         base = {"max_tokens": 512}
         self.assertIs(_run_model_settings(base, require_initial_tool_call=False), base)
+
+    def test_repository_answer_requires_observed_tool_evidence(self) -> None:
+        from pydantic_ai.exceptions import ModelRetry
+
+        context = SimpleNamespace(deps=SimpleNamespace(
+            require_repository_tool_call=True, repository_tool_call_count=0,
+        ))
+        with self.assertRaises(ModelRetry):
+            _validate_repository_tool_call(context, "The repository is clean.")
+        context.deps.repository_tool_call_count = 1
+        self.assertEqual(
+            _validate_repository_tool_call(context, "The repository is clean."),
+            "The repository is clean.",
+        )
 
     def test_compaction_retained_context_scales_with_harness_model_windows(self) -> None:
         self.assertEqual(_compaction_keep_tokens(16_000), 3_200)

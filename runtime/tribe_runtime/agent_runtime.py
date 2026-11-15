@@ -908,6 +908,15 @@ class AgentDependencies:
     context_pruning_metrics: dict[str, int] = field(default_factory=dict)
     reply_root_sequence: int | None = None
     tool_call_count: int = 0
+    repository_tool_call_count: int = 0
+    require_repository_tool_call: bool = False
+
+
+_REPOSITORY_EVIDENCE_TOOL_NAMES = frozenset({
+    "read_repository_file", "search_repository", "run_repository_tests",
+    "read_file", "list_directory", "search_files", "find_files", "file_info",
+    "run_command", "start_command", "check_command", "wait_background_command",
+})
 
 
 def _requires_initial_repository_tool_call(request: str) -> bool:
@@ -931,10 +940,23 @@ def _run_model_settings(
 
     def settings_for_step(ctx: Any) -> dict[str, Any]:
         settings = dict(base_settings)
-        settings["tool_choice"] = "required" if ctx.deps.tool_call_count == 0 else "auto"
+        settings["tool_choice"] = "required" if ctx.deps.repository_tool_call_count == 0 else "auto"
         return settings
 
     return settings_for_step
+
+
+def _validate_repository_tool_call(ctx: Any, output: str) -> str:
+    """Reject repository claims until an actual repository or read-only service tool ran."""
+    deps = ctx.deps
+    if deps.require_repository_tool_call and deps.repository_tool_call_count == 0:
+        from pydantic_ai.exceptions import ModelRetry
+
+        raise ModelRetry(
+            "This request asks about the live project or repository. Use an available repository, shell, "
+            "or read-only connected-service tool before answering. Do not claim an inspection unless a tool ran."
+        )
+    return output
 
 
 def _next_agent_reply_metadata(
@@ -1384,6 +1406,12 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
     agent = Agent(_model_for_identifier(model, api_key, base_url), deps_type=AgentDependencies,
                   output_type=str, instructions=instructions)
 
+    @agent.output_validator
+    def require_repository_tool_evidence(
+        ctx: RunContext[AgentDependencies], output: str,
+    ) -> str:
+        return _validate_repository_tool_call(ctx, output)
+
     try:
         from pydantic_ai.messages import FunctionToolCallEvent, FunctionToolResultEvent
         from pydantic_ai_harness.filesystem import (
@@ -1400,6 +1428,12 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
     @agent.on_event(FunctionToolCallEvent)
     async def record_tool_start(ctx: RunContext[AgentDependencies], event) -> None:
         ctx.deps.tool_call_count += 1
+        tool_name = event.part.tool_name
+        if event.args_valid and (
+            tool_name in _REPOSITORY_EVIDENCE_TOOL_NAMES
+            or tool_name in ctx.deps.mcp_read_only_tool_names
+        ):
+            ctx.deps.repository_tool_call_count += 1
         if ctx.deps.tool_call_summaries is None:
             ctx.deps.tool_call_summaries = {}
         activity_labels = browser_activity_labels(event.part.tool_name)
@@ -3312,6 +3346,11 @@ class PydanticAIProvider:
         current_user_request = _current_user_request(
             store, mission_id, self.definition.id, event, direct_message_context,
         )
+        require_repository_tool_call = (
+            event.get("type") == "message.created"
+            and event.get("actorId") == "user"
+            and _requires_initial_repository_tool_call(current_user_request)
+        )
         verification_context = store.agent_verification_context(mission_id)
         initial_events, _ = store.events_after_page(mission_id, 0, limit=1)
         mission_created = next(
@@ -3462,6 +3501,7 @@ class PydanticAIProvider:
             mcp_read_only_tool_names=mcp_read_only_tool_names,
             project_team=event.get("projectTeam") or [],
             deep_research=deep_research,
+            require_repository_tool_call=require_repository_tool_call,
         )
         trigger_sequence = event["sequence"]
         resume_saved_frontier = bool(event.get("resumeCheckpoint"))
@@ -3806,14 +3846,9 @@ class PydanticAIProvider:
                         "Choose a supported level in Agent roles or leave the effort on Auto."
                     )
                 base_model_settings["thinking"] = active_effort
-            require_initial_tool_call = (
-                event.get("type") == "message.created"
-                and event.get("actorId") == "user"
-                and _requires_initial_repository_tool_call(current_user_request)
-            )
-            if base_model_settings or require_initial_tool_call:
+            if base_model_settings or require_repository_tool_call:
                 run_arguments["model_settings"] = _run_model_settings(
-                    base_model_settings, require_initial_tool_call=require_initial_tool_call,
+                    base_model_settings, require_initial_tool_call=require_repository_tool_call,
                 )
             tool_override = (
                 active_agent.override(tools=_tools_for_agent(
