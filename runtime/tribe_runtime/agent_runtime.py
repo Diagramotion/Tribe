@@ -853,20 +853,30 @@ def _reject_text_encoded_tool_call(output: str) -> None:
     try:
         value = json.loads(output)
     except (TypeError, json.JSONDecodeError):
-        return
-    if not isinstance(value, dict):
-        return
-    tool_name = value.get("name")
-    if tool_name is None and isinstance(value.get("function"), str):
-        tool_name = value["function"]
-    looks_like_tool_call = (
-        isinstance(value.get("arguments"), dict)
-        and (tool_name in AGENT_TOOL_NAMES or tool_name == "search_tools")
-    )
+        # Small local models sometimes emit the beginning of a tool call as text,
+        # then truncate its arguments. It is still unsafe to present that as a
+        # successful answer, even though the fragment is not valid JSON.
+        match = re.match(
+            r"^\s*(?:```(?:json)?\s*)?\{\s*['\"]name['\"]\s*:\s*['\"]([^'\"]+)['\"]\s*,\s*"
+            r"['\"]arguments['\"]\s*:",
+            output,
+            re.IGNORECASE,
+        )
+        looks_like_tool_call = bool(match and match.group(1) in AGENT_TOOL_NAMES | {"search_tools"})
+    else:
+        if not isinstance(value, dict):
+            return
+        tool_name = value.get("name")
+        if tool_name is None and isinstance(value.get("function"), str):
+            tool_name = value["function"]
+        looks_like_tool_call = (
+            isinstance(value.get("arguments"), dict)
+            and (tool_name in AGENT_TOOL_NAMES or tool_name == "search_tools")
+        )
     if looks_like_tool_call:
         raise RuntimeError(
-            "The selected model described a tool call as plain text instead of invoking it, so no browser "
-            "action was performed. Choose a model with working native tool-calling support."
+            "The selected model described a tool call as plain text instead of invoking it. No tool was run; "
+            "choose a model with working native tool-calling support."
         )
 
 

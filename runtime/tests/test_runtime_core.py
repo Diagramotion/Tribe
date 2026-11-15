@@ -225,9 +225,15 @@ class RuntimeCase(unittest.TestCase):
         self.assertEqual(_browser_api_request_timeout("snapshot"), 10)
 
     def test_rejects_plain_text_browser_tool_call(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "no browser action was performed"):
+        with self.assertRaisesRegex(RuntimeError, "No tool was run"):
             _reject_text_encoded_tool_call(
                 '{"name":"browser_navigate","arguments":{"url":"https://example.com"}}'
+            )
+
+    def test_rejects_truncated_plain_text_tool_call(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "native tool-calling support"):
+            _reject_text_encoded_tool_call(
+                '{ "name": "run_repository_tests", "arguments": { "argv": ["uv", "run",...],'
             )
 
     def test_rejects_plain_text_deferred_tool_search(self) -> None:
