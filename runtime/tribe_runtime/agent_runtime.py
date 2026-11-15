@@ -907,6 +907,34 @@ class AgentDependencies:
     deep_research: bool = False
     context_pruning_metrics: dict[str, int] = field(default_factory=dict)
     reply_root_sequence: int | None = None
+    tool_call_count: int = 0
+
+
+def _requires_initial_repository_tool_call(request: str) -> bool:
+    """Avoid unsupported claims when a user asks about the live project workspace."""
+    text = request.casefold()
+    repository_references = (
+        "repository", "repo", "codebase", "git status", "github", "sonar",
+        "this project", "the project", "project code", "project files",
+        "code quality", "security scan", "test suite", "check it", "check this",
+        "inspect it", "verify that", "test it", "look into it",
+    )
+    return any(reference in text for reference in repository_references)
+
+
+def _run_model_settings(
+    base_settings: dict[str, Any], *, require_initial_tool_call: bool,
+) -> Any:
+    """Require one real capability call for repository requests, then restore auto selection."""
+    if not require_initial_tool_call:
+        return base_settings
+
+    def settings_for_step(ctx: Any) -> dict[str, Any]:
+        settings = dict(base_settings)
+        settings["tool_choice"] = "required" if ctx.deps.tool_call_count == 0 else "auto"
+        return settings
+
+    return settings_for_step
 
 
 def _next_agent_reply_metadata(
@@ -1371,6 +1399,7 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
 
     @agent.on_event(FunctionToolCallEvent)
     async def record_tool_start(ctx: RunContext[AgentDependencies], event) -> None:
+        ctx.deps.tool_call_count += 1
         if ctx.deps.tool_call_summaries is None:
             ctx.deps.tool_call_summaries = {}
         activity_labels = browser_activity_labels(event.part.tool_name)
@@ -3736,9 +3765,10 @@ class PydanticAIProvider:
                     )),
                 ),
             }
+            base_model_settings: dict[str, Any] = {}
             if (isinstance(model_output_limit, int) and not isinstance(model_output_limit, bool)
                     and model_output_limit > 0):
-                run_arguments["model_settings"] = {"max_tokens": model_output_limit}
+                base_model_settings["max_tokens"] = model_output_limit
             user_prompt: str | list[Any] = prompt
             attachments = event["payload"].get("attachments", [])
             native_media = []
@@ -3775,7 +3805,16 @@ class PydanticAIProvider:
                         f"The {active_effort} effort override is not supported by {active_model}. "
                         "Choose a supported level in Agent roles or leave the effort on Auto."
                     )
-                run_arguments["model_settings"] = {"thinking": active_effort}
+                base_model_settings["thinking"] = active_effort
+            require_initial_tool_call = (
+                event.get("type") == "message.created"
+                and event.get("actorId") == "user"
+                and _requires_initial_repository_tool_call(current_user_request)
+            )
+            if base_model_settings or require_initial_tool_call:
+                run_arguments["model_settings"] = _run_model_settings(
+                    base_model_settings, require_initial_tool_call=require_initial_tool_call,
+                )
             tool_override = (
                 active_agent.override(tools=_tools_for_agent(
                     active_agent, self.definition.repository_access,
