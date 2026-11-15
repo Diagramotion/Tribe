@@ -8,12 +8,14 @@ import { citationsFromMarkdown } from "../src/domain/citations.js";
 let vite;
 const hmrPort = 40_000 + (process.pid % 5_000) * 3 + 4;
 let GeneralChatView;
+let extractPreviewUrls;
 const originalWindow = globalThis.window;
 
 before(async () => {
   globalThis.window = { setTimeout };
   vite = await createServer({ server: { middlewareMode: true, hmr: { port: hmrPort } }, appType: "custom" });
   ({ GeneralChatView } = await vite.ssrLoadModule("/src/views/GeneralChatView.jsx"));
+  ({ extractPreviewUrls } = await vite.ssrLoadModule("/src/components/LinkPreviews.jsx"));
 });
 
 after(async () => {
@@ -91,6 +93,13 @@ test("projectless research turns retain their mode label and source links", () =
   assert.match(html, /class="general-chat-sources"/);
   assert.match(html, /Study/);
   assert.match(html, /example\.org/);
+});
+
+test("link preview URL extraction strips long trailing punctuation and ignores non-preview links", () => {
+  const punctuation = ".,!?:)}]".repeat(128);
+  assert.deepEqual(extractPreviewUrls(
+    `See https://example.test/path${punctuation} and \`https://code.test\` [linked](https://linked.test/path).`,
+  ), ["https://example.test/path"]);
 });
 
 test("research citations expose verified web domains and ignore non-web links", () => {

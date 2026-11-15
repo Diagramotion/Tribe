@@ -8,15 +8,33 @@ import { scheduleRunNotifications } from "../src/domain/schedules.js";
 let vite;
 const hmrPort = 40_000 + (process.pid % 5_000) * 3 + 1;
 let SchedulesView;
+let eventTriggerOptions;
 let EventTriggerFailureQueue;
+let RunsView;
 
 before(async () => {
   vite = await createServer({ server: { middlewareMode: true, hmr: { port: hmrPort } }, appType: "custom" });
-  ({ SchedulesView, EventTriggerFailureQueue } = await vite.ssrLoadModule("/src/views/BackgroundWorkViews.jsx"));
+  ({ SchedulesView, eventTriggerOptions, EventTriggerFailureQueue, RunsView } = await vite.ssrLoadModule("/src/views/BackgroundWorkViews.jsx"));
 });
 
 after(async () => {
   await vite?.close();
+});
+
+test("interrupted command history retains argv, working directory, and status", () => {
+  const html = renderToStaticMarkup(React.createElement(RunsView, {
+    mission: { id: "chat-1" },
+    runs: [{
+      id: "command-1", status: "interrupted", argv: ["npm", "run", "build"],
+      cwd: "/project/repository", started_at: "2026-11-01T10:00:00Z", output: "",
+    }],
+    onStop() {},
+  }));
+
+  assert.match(html, /npm run build/);
+  assert.match(html, /Working directory: <code>\/project\/repository<\/code>/);
+  assert.match(html, /Interrupted/);
+  assert.match(html, /Check the project before running this command again/);
 });
 
 test("schedule history shows the loaded range and offers older pages", () => {
@@ -97,6 +115,30 @@ test("event schedule cards show the repository path filter", () => {
 
   assert.match(html, /A repository file changes · Build · src\/\*\.py/);
   assert.match(html, /Up to 2 automatic retries before work starts/);
+});
+
+test("local test event cards disclose the agent repository-test capability scope", () => {
+  const html = renderToStaticMarkup(React.createElement(SchedulesView, {
+    project: { id: "project-1", name: "Example", missions: [{ id: "chat-1", title: "Build" }] },
+    schedules: [{
+      id: "schedule-1", project_id: "project-1", title: "Review completed tests",
+      prompt: "Summarize test results", cadence: "event", status: "active",
+      trigger_event_type: "repo.test_run.completed", event_source_mission_id: "chat-1",
+      event_source_mission_title: "Build", next_run_at: "", runs_total: 0, runs: [],
+    }],
+    agentsConfigured: true,
+    onCreate: async () => true,
+    onEdit: async () => true,
+    onAction() {},
+    onLoadMoreRuns: async () => ({ runs: [], total: 0, has_more: false }),
+  }));
+
+  assert.match(html, /A repository test run succeeds · Build/);
+  assert.match(html, /Source: recognized repository test commands started by agents or through Runs\./);
+});
+
+test("event trigger choices include user-originated chat messages", () => {
+  assert.ok(eventTriggerOptions.some((option) => option.value === "message.created" && option.label === "A user sends a message"));
 });
 
 test("GitHub Actions schedules identify the public repository and report access errors", () => {
@@ -233,7 +275,7 @@ test("event failure queue shows cross-project context and review actions", () =>
   }));
 
   assert.match(html, /Event runs needing review/);
-  assert.match(html, /Research · A test run fails · Test run/);
+  assert.match(html, /Research · A repository test run succeeds · Test run/);
   assert.match(html, /Run in Failure investigation/);
   assert.match(html, /Agent run failed/);
   assert.match(html, />Retry</);

@@ -22,6 +22,30 @@ from tribe_runtime.windows_job import WindowsProcessJob
 
 
 class BackgroundCommandLaunchTests(unittest.TestCase):
+    def test_foreground_executable_lookup_uses_the_supplied_environment_path(self) -> None:
+        search_path = os.pathsep.join(("/project/.venv/bin", "/usr/bin"))
+        with patch("tribe_runtime.commands.shutil.which", return_value=None) as locate:
+            result = run_foreground_process(
+                ["python", "-m", "pytest"], cwd=Path.cwd(), timeout=1,
+                env={"PATH": search_path},
+            )
+
+        locate.assert_called_once_with("python", path=search_path)
+        self.assertEqual(result["exit_code"], 127)
+        self.assertEqual(result["stderr"], "executable not found: python")
+        self.assertFalse(result["started"])
+
+    def test_foreground_process_start_failure_is_not_a_started_test_run(self) -> None:
+        with patch("tribe_runtime.commands.shutil.which", return_value="/usr/bin/python"), \
+                patch("tribe_runtime.commands.subprocess.Popen", side_effect=OSError("injected spawn failure")):
+            result = run_foreground_process(
+                ["python", "-m", "pytest"], cwd=Path.cwd(), timeout=1,
+            )
+
+        self.assertEqual(result["exit_code"], 127)
+        self.assertIn("injected spawn failure", result["stderr"])
+        self.assertFalse(result["started"])
+
     def test_foreground_command_stops_when_agent_run_is_cancelled(self) -> None:
         cancelled = threading.Event()
         timer = threading.Timer(0.25, cancelled.set)
@@ -171,6 +195,7 @@ class BackgroundCommandLaunchTests(unittest.TestCase):
             store.project_repository.return_value = root
             store.project_command_tools.return_value = []
             store.create_background_run.return_value = {"id": "run-1"}
+            store.mark_background_run_running.return_value = {"id": "run-1"}
             process = Mock(pid=4321, stdout=io.StringIO(""), returncode=0)
             process.poll.return_value = 0
             runner = BackgroundCommandRunner(store)
@@ -204,6 +229,7 @@ class BackgroundCommandLaunchTests(unittest.TestCase):
             store.project_repository.return_value = root
             store.project_command_tools.return_value = []
             store.create_background_run.return_value = {"id": "run-1"}
+            store.mark_background_run_running.return_value = {"id": "run-1"}
             process = Mock(pid=4321, stdout=io.StringIO(""), returncode=0)
             process.poll.return_value = 0
             runner = BackgroundCommandRunner(store)
@@ -239,6 +265,7 @@ class BackgroundCommandLaunchTests(unittest.TestCase):
             store.project_repository.return_value = root
             store.project_command_tools.return_value = []
             store.create_background_run.return_value = {"id": "run-1"}
+            store.mark_background_run_running.return_value = {"id": "run-1"}
             process = Mock(pid=4321, stdout=io.StringIO(""), returncode=0)
             process.poll.return_value = 0
             runner = BackgroundCommandRunner(store)
@@ -445,6 +472,8 @@ class BackgroundCommandShutdownTests(unittest.TestCase):
         completed = self.store.background_run(run["id"])
         self.assertEqual(completed["status"], "cancelled")
         self.assertIsNotNone(completed["exit_code"])
+        if os.name == "posix":
+            self.assertEqual(completed["exit_code"], -signal.SIGTERM)
         self.assertIn("started", completed["output"])
 
     def test_runner_launches_an_executable_approved_for_its_project(self) -> None:
@@ -465,6 +494,110 @@ class BackgroundCommandShutdownTests(unittest.TestCase):
             saved = self.store.background_run(run["id"])
         self.assertIsNotNone(saved)
         self.assertEqual(saved["status"], "completed")
+
+    def test_runs_test_command_publishes_project_scoped_test_event(self) -> None:
+        target = self.store.create_mission(
+            self.mission["project_id"], "Selected test review", "Review the completed test run",
+        )
+        schedule = self.store.create_schedule(
+            self.mission["project_id"], "Review passing tests", "Summarize the passing run", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=self.mission["id"], target_mission_id=target["id"],
+        )
+        test_file = self.repository / "test_background_event.py"
+        test_file.write_text("def test_background_event():\n    assert 2 + 2 == 4\n", encoding="utf-8")
+        with patch(
+            "tribe_runtime.commands.shutil.which",
+            side_effect=lambda name: sys.executable if name == "python" else which(name),
+        ):
+            run = self.runner.start(
+                self.mission["id"],
+                ["python", "-m", "pytest", "-q", "test_background_event.py"],
+            )
+
+        deadline = time.monotonic() + 10
+        saved = self.store.background_run(run["id"])
+        while saved and saved["status"] in {"starting", "running"} and time.monotonic() < deadline:
+            time.sleep(0.05)
+            saved = self.store.background_run(run["id"])
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved["status"], "completed", saved)
+        events = [event for event in self.store.events_after(self.mission["id"], 0)
+                  if event["type"] == "repo.test_run.completed"]
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["payload"]["source"], "background_command")
+        self.assertEqual(event["payload"]["runId"], run["id"])
+        self.assertEqual(event["payload"]["argv"], run["argv"])
+        self.assertEqual(event["payload"]["exitCode"], 0)
+        self.assertIn("1 passed", event["payload"]["stdout"])
+        with self.store._connect() as db:
+            project_id = db.execute(
+                "SELECT project_id FROM events WHERE id=?", (event["id"],),
+            ).fetchone()[0]
+        self.assertEqual(project_id, self.mission["project_id"])
+
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0]["missionId"], target["id"])
+        runs = self.store.schedule_runs(schedule["id"])["runs"]
+        self.assertEqual(runs[0]["source_event_sequence"], event["sequence"])
+        messages = [item for item in self.store.events_after(target["id"], 0)
+                    if item["type"] == "message.created"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["payload"]["sourceEventSequence"], event["sequence"])
+
+    def test_start_intent_is_persisted_before_process_spawn(self) -> None:
+        executable = which("python") or which("python3")
+        self.assertIsNotNone(executable)
+        real_popen = subprocess.Popen
+        observed = []
+
+        def assert_intent_precedes_spawn(*args, **kwargs):
+            current = self.store.background_runs(self.mission["id"])
+            self.assertEqual(len(current), 1)
+            self.assertEqual(current[0]["status"], "starting")
+            self.assertIsNone(current[0]["pid"])
+            observed.append(current[0]["id"])
+            return real_popen(*args, **kwargs)
+
+        with patch("tribe_runtime.commands.subprocess.Popen", side_effect=assert_intent_precedes_spawn):
+            run = self.runner.start(self.mission["id"], [executable, "-c", "print('launched')"])
+
+        self.assertEqual(observed, [run["id"]])
+        self.assertEqual(run["status"], "running")
+
+    def test_process_launch_failure_settles_the_start_intent(self) -> None:
+        executable = which("python") or which("python3")
+        self.assertIsNotNone(executable)
+        with patch("tribe_runtime.commands.subprocess.Popen", side_effect=OSError("injected spawn failure")):
+            with self.assertRaisesRegex(ValueError, "command_could_not_start"):
+                self.runner.start(self.mission["id"], [executable, "-c", "pass"])
+
+        [run] = self.store.background_runs(self.mission["id"])
+        self.assertEqual(run["status"], "failed")
+        self.assertIsNone(run["pid"])
+        self.assertEqual(run["argv"], [executable, "-c", "pass"])
+        self.assertEqual(run["cwd"], str(self.repository.resolve()))
+
+    def test_starting_intent_is_recovered_without_relaunch_and_keeps_command_details(self) -> None:
+        run = self.store.create_background_run(
+            self.mission["id"], ["npm", "run", "build"], str(self.repository),
+        )
+        self.runner.close()
+        restarted = None
+        try:
+            with patch("tribe_runtime.commands.subprocess.Popen") as popen:
+                restarted = BackgroundCommandRunner(self.store)
+            popen.assert_not_called()
+            recovered = self.store.background_run(run["id"])
+            self.assertEqual(recovered["status"], "interrupted")
+            self.assertEqual(recovered["argv"], ["npm", "run", "build"])
+            self.assertEqual(recovered["cwd"], str(self.repository))
+            self.assertIsNone(recovered["pid"])
+        finally:
+            if restarted:
+                restarted.close()
 
     @unittest.skipIf(os.name == "nt", "The command ignores POSIX SIGTERM specifically")
     def test_stop_escalates_when_command_ignores_graceful_termination(self) -> None:

@@ -22,6 +22,7 @@ import { SelectControl } from "../components/SelectControl.jsx";
 import { useDialogFocus } from "../hooks/useDialogFocus.js";
 import { runtime } from "../api/runtime.js";
 import { formatUsd } from "../domain/activity.js";
+import { formatAccessGrant } from "../domain/access-grants.js";
 import { modelDisplayName, sortModelCatalog } from "../domain/model-catalog.js";
 
 const settingsSections = [
@@ -175,7 +176,7 @@ function ModelCatalog({ models, onModelsChange, onToggle, onSetDefault, defaultM
         <label>Context window<input min="1" onChange={(event) => setField("contextWindow", event.target.value)} placeholder="Unknown" type="number" value={draft.contextWindow} /></label>
         <label>Maximum output<input min="1" onChange={(event) => setField("maxOutputTokens", event.target.value)} placeholder="Unknown" type="number" value={draft.maxOutputTokens} /></label>
         <h4 className="model-metadata-heading">Capabilities and pricing</h4>
-        <p className="model-metadata-note">Leave values blank when the provider has not reported them.</p>
+        <p className="model-metadata-note">Leave values blank when the provider has not reported them. If no source reports a context window, Tribe assumes 16,000 tokens when deciding when to summarise.</p>
         {[["inputModalities", "Input modalities"], ["outputModalities", "Output modalities"]].map(([field, label]) => {
           const options = [...new Set([...modalities, ...draft[field]])];
           return <fieldset className="model-capability-options" key={field}><legend>{label}</legend><div>{options.map((modality) => { const Icon = modalityIcon[modality]; const labelText = modalityLabel[modality] ?? modality; return <button aria-label={`${labelText} ${field === "inputModalities" ? "input" : "output"}`} aria-pressed={draft[field].includes(modality)} className={`model-modality-option${draft[field].includes(modality) ? " model-modality-option--selected" : ""}`} key={modality} onClick={() => setDraft((current) => ({ ...current, [field]: current[field].includes(modality) ? current[field].filter((item) => item !== modality) : [...current[field], modality] }))} title={`${labelText} ${field === "inputModalities" ? "input" : "output"}`} type="button">{Icon ? <Icon aria-hidden="true" size={16} /> : labelText}</button>; })}</div></fieldset>;
@@ -750,9 +751,12 @@ export function SettingsView({ project, runtimeStatus, agentRuntime, usage, webA
           </>}
           {activeSection === "web-search" && <>
             <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><MagnifyingGlass size={18} /></span><div><h3>Web search for projectless chats</h3><p>Let agents find current public information and cite the pages they use. Search does not grant access to local files, repositories or shell tools.</p></div></div><form className="image-generation-form" onSubmit={saveWebSearchPreference}><label htmlFor="web-search-preference">Search provider</label><SelectControl id="web-search-preference" onChange={setWebSearchDraft} options={[{ value: "automatic", label: "Automatic · model provider, with DuckDuckGo fallback" }, { value: "duckduckgo", label: "DuckDuckGo only" }, { value: "off", label: "Off" }]} size="full" value={webSearchDraft} /><p className="settings-note">Automatic uses the selected model provider’s built-in search when supported, then falls back to DuckDuckGo. The provider or search service receives the search query when an agent searches. Project web access remains controlled in Project settings.</p>{webSearchError && <p className="recipe-error" role="alert">{webSearchError}</p>}<button className="button button--quiet" disabled={webSearchSaving || webSearchDraft === webSearchPreference} type="submit">{webSearchSaving ? "Saving…" : "Save preference"}</button></form></section>
-            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><ShieldCheck size={18} /></span><div><h3>Ongoing research access</h3><p>Manage approvals for read-only public web search and page fetches. Existing project website settings and role permissions still apply.</p></div></div>
+            <section className="settings-card"><div className="settings-card-heading"><span className="settings-symbol"><ShieldCheck size={18} /></span><div><h3>Remembered approvals</h3><p>Manage ongoing public web access and approvals saved for exact tool requests. Role permissions and project access settings still apply.</p></div></div>
               {accessGrantsError && <p className="recipe-error" role="alert">{accessGrantsError}</p>}
-              {accessGrants.length === 0 ? <p className="settings-note">No ongoing research approvals.</p> : <div className="research-access-list">{accessGrants.map((grant) => <div className="research-access-row" key={grant.id}><div><strong>{grant.scope === "workspace" ? "All projects" : grant.scope === "project" ? grant.project_name : grant.mission_title}</strong><small>{grant.scope === "workspace" ? "Workspace access" : grant.scope === "project" ? "Project access" : `Chat access${grant.project_name ? ` · ${grant.project_name}` : ""}`}</small></div><button className="button button--quiet" disabled={revokingGrantId === grant.id} onClick={() => void revokeResearchAccess(grant.id)} type="button">{revokingGrantId === grant.id ? "Revoking…" : "Revoke"}</button></div>)}</div>}
+              {accessGrants.length === 0 ? <p className="settings-note">No remembered approvals.</p> : <div className="research-access-list">{accessGrants.map((grant) => {
+                const { subject, scope } = formatAccessGrant(grant);
+                return <div className="research-access-row" key={grant.id}><div><strong>{subject}</strong><small>{scope}</small></div><button className="button button--quiet" disabled={revokingGrantId === grant.id} onClick={() => void revokeResearchAccess(grant.id)} type="button">{revokingGrantId === grant.id ? "Revoking…" : "Revoke"}</button></div>;
+              })}</div>}
             </section>
           </>}
           {activeSection === "experimental" && <>

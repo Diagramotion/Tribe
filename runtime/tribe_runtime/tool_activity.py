@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from .credentials import redact_shell_command
 
 _NODE_TAP_SUMMARY = {
     "tests": re.compile(r"(?m)^# tests (\d+)\s*$"),
@@ -16,13 +19,145 @@ _NODE_TAP_SUMMARY = {
 _EXIT_CODE = re.compile(r"(?m)^\[exit code: (-?\d+)\]\s*$")
 
 
-def node_test_run_evidence(command: str, output: object) -> dict[str, object] | None:
-    """Recognise a completed Node TAP test run emitted by Harness Shell.
+def _is_executing_pytest(argv: list[str]) -> bool:
+    """Exclude successful pytest information/collection commands from test events."""
+    test_argv = argv
+    if argv[:2] == ["uv", "run"]:
+        index = 2
+        while index < len(argv):
+            if argv[index] in {"--project", "--extra"} and index + 1 < len(argv):
+                index += 2
+            else:
+                break
+        test_argv = argv[index:]
 
-    Harness returns output as a string and omits a zero exit-code marker. Only
-    accept a direct `node --test` invocation with a complete TAP summary so an
-    arbitrary shell command or partial/timeout output cannot satisfy review.
-    """
+    if test_argv[:1] == ["pytest"]:
+        options = test_argv[1:]
+    elif len(test_argv) >= 3 and test_argv[0] in {"python", "python3"} and test_argv[1:3] == ["-m", "pytest"]:
+        options = test_argv[3:]
+    else:
+        return True
+
+    # These options exit successfully without executing tests. Keep this guard
+    # separate from the execution allowlist: such commands may still be run in Runs.
+    non_run_options = {
+        "-h", "--help", "-V", "--version", "--collect-only", "--co", "-co",
+        "--fixtures", "--fixtures-per-test", "--markers", "--setup-plan", "--setup-only",
+    }
+    return not any(option in non_run_options for option in options)
+
+
+def local_repository_test_argv(argv: object, cwd: str | Path | None = None) -> list[str] | None:
+    """Return argv only for an allowlisted local test command with repository paths."""
+    if (not isinstance(argv, list) or not argv or len(argv) > 16
+            or any(not isinstance(arg, str) or len(arg) > 500 for arg in argv)):
+        return None
+    # Import lazily: workspace owns the allowlist and imports MissionStore.
+    from .workspace import is_approved_repository_test_command
+
+    if not is_approved_repository_test_command(argv) or not _is_executing_pytest(argv):
+        return None
+    # A repository trigger must not be caused by a command that explicitly points
+    # outside the project checkout, including through an in-repository symlink.
+    root = None
+    if cwd is not None:
+        try:
+            root = Path(cwd).resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+    for argument in argv:
+        normalized = argument.replace("\\", "/")
+        if normalized.startswith("/") or re.match(r"^[A-Za-z]:/", normalized):
+            return None
+        if ".." in normalized.split("/"):
+            return None
+        # Also inspect option values such as --rootdir=/tmp/outside.
+        option_value = normalized.partition("=")[2] if normalized.startswith("-") else normalized
+        if option_value.startswith("/") or re.match(r"^[A-Za-z]:/", option_value):
+            return None
+        if root is not None and not argument.startswith("-"):
+            path_value = argument.split("::", 1)[0]
+            candidate = Path(path_value)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            try:
+                resolved = candidate.resolve(strict=False)
+                if resolved.exists() and not resolved.is_relative_to(root):
+                    return None
+            except (OSError, RuntimeError):
+                return None
+    return list(argv)
+
+
+def repository_test_command_argv(command: object, cwd: str | Path | None = None) -> list[str] | None:
+    """Return argv only for a single, allowlisted repository test command."""
+    if not isinstance(command, str) or not command or len(command) > 8_000 or "\n" in command or "\r" in command:
+        return None
+    # Harness commands are shell strings. Do not infer a repository test run
+    # when shell expansion can change the path after this classification.
+    if "$" in command or "`" in command or "~" in command:
+        return None
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>`$()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        shell_tokens = list(lexer)
+        if any(token and all(char in ";&|<>`$()" for char in token) for token in shell_tokens):
+            return None
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    return local_repository_test_argv(argv, cwd)
+
+
+def repository_test_run_evidence(
+    command: str, output: object, cwd: str | Path | None = None,
+) -> dict[str, object] | None:
+    """Recognise a completed local repository test command and its process exit code."""
+    argv = repository_test_command_argv(command, cwd)
+    if argv is None or not isinstance(output, str):
+        return None
+    lowered = output.casefold()
+    if any(marker in lowered for marker in (
+        "[command timed out", "[command cancelled", "[command canceled",
+        "[command could not start", "command not found",
+    )):
+        return None
+    node_evidence = node_test_run_evidence(command, output)
+    if node_evidence is not None:
+        return node_evidence
+    exit_match = _EXIT_CODE.search(output)
+    if not exit_match:
+        return None
+    exit_code = int(exit_match.group(1))
+    if exit_code == 127:
+        return None
+    # Harness exposes the shell process exit code but not a separate timeout or
+    # cancellation field. Preserve the conventional shell statuses so callers
+    # do not mistake timeout (GNU timeout: 124) or SIGINT (128 + SIGINT: 130)
+    # for an ordinary test failure that should trigger failure-only schedules.
+    return {
+        "argv": argv, "exitCode": exit_code, "stdout": output, "stderr": "",
+        "timedOut": exit_code == 124, "cancelled": exit_code == 130 or exit_code < 0,
+    }
+
+
+def background_test_run_evidence(
+    argv: object, output: object, exit_code: object, cwd: str | Path | None = None,
+) -> dict[str, object] | None:
+    """Build event evidence for a completed Runs command, using its stored argv."""
+    safe_argv = local_repository_test_argv(argv, cwd)
+    if (safe_argv is None or not isinstance(exit_code, int) or isinstance(exit_code, bool)
+            or not isinstance(output, str)):
+        return None
+    return {
+        "argv": safe_argv, "exitCode": exit_code, "stdout": output, "stderr": "",
+        "timedOut": exit_code == 124, "cancelled": exit_code == 130 or exit_code < 0,
+    }
+
+
+def node_test_run_evidence(command: str, output: object) -> dict[str, object] | None:
+    """Recognise complete Node TAP test output for legacy verification history."""
     if not isinstance(output, str) or "[Command timed out" in output:
         return None
     try:
@@ -33,7 +168,6 @@ def node_test_run_evidence(command: str, output: object) -> dict[str, object] | 
         return None
     if any(token in {"&&", "||", ";", "|", ">", "<"} for token in argv):
         return None
-
     counts: dict[str, int] = {}
     for label, pattern in _NODE_TAP_SUMMARY.items():
         match = pattern.search(output)
@@ -42,14 +176,15 @@ def node_test_run_evidence(command: str, output: object) -> dict[str, object] | 
         counts[label] = int(match.group(1))
     if counts["tests"] < 1 or counts["pass"] + counts["fail"] != counts["tests"]:
         return None
-
     exit_match = _EXIT_CODE.search(output)
     exit_code = int(exit_match.group(1)) if exit_match else (0 if counts["fail"] == 0 else 1)
     if exit_code == 0 and counts["fail"] != 0:
         return None
-    return {"argv": argv, "exitCode": exit_code, "stdout": output, "stderr": "",
-            "testCount": counts["tests"], "passed": counts["pass"], "failed": counts["fail"]}
-
+    return {
+        "argv": argv, "exitCode": exit_code, "stdout": output, "stderr": "",
+        "testCount": counts["tests"], "passed": counts["pass"], "failed": counts["fail"],
+        "timedOut": exit_code == 124, "cancelled": exit_code == 130 or exit_code < 0,
+    }
 
 _BROWSER_ACTIONS = {
     "open": ("opening a page", "opened a page"),
@@ -151,11 +286,7 @@ def summarize_tool_arguments(tool_name: str, value: Any) -> str:
         return path[:240]
     command = arguments.get("command")
     if isinstance(command, str):
-        command = re.sub(
-            r"(?i)(api[_-]?key|token|password|secret)(\s*[=:]\s*)([^\s]+)",
-            r"\1\2[redacted]", command,
-        )
-        return command[:240]
+        return redact_shell_command(command, limit=240)
     argv = arguments.get("argv")
     if isinstance(argv, list):
         return " ".join(str(item) for item in argv[:8])[:240]

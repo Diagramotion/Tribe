@@ -55,8 +55,8 @@ export function PlanView({ workItems, agents, project, mission, agentConfigured,
       {workItems.length === 0 ? <div className="plan-empty plan-empty--state">
         <span className="plan-empty-icon"><ListChecks size={19} /></span>
         <div><h3>No task plan yet</h3><p>{agentConfigured
-          ? "The Planner will add tasks here when the work needs them."
-          : "Connect a model to let the Planner create tasks. Your chat and project goal are saved."
+          ? "The team will add tasks here when the work needs them."
+          : "Connect a model to let the team create tasks. Your chat and project goal are saved."
         }</p></div>
         {!agentConfigured && <button className="button button--quiet" onClick={onConnectModel} type="button">Connect model</button>}
       </div> : <div className="kanban-board">

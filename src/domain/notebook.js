@@ -61,7 +61,7 @@ export function notebookCellDiff(beforeContent, afterContent) {
       newSource,
       outputsChanged,
       lines: diffLines(oldSource, newSource).flatMap((part) =>
-        (part.value.match(/(?:[^\n]*\n|[^\n]+$)/g) ?? []).map((value) => ({
+        part.value.split(/(?<=\n)/).filter(Boolean).map((value) => ({
           kind: part.added ? "added" : part.removed ? "removed" : "context",
           text: value.replace(/\n$/, ""),
         }))),

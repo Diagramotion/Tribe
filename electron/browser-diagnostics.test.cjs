@@ -18,6 +18,10 @@ test("diagnostic URLs redact secret and high-entropy path segments", () => {
     sanitiseDiagnosticUrl("https://example.test/reset/token/very-secret-value-012345678901234567890/path"),
     "https://example.test/reset/token/[redacted]/path",
   );
+  assert.equal(
+    sanitiseDiagnosticUrl("https://example.test/users/person+tag@example.test/profile"),
+    "https://example.test/users/[redacted]/profile",
+  );
 });
 
 test("diagnostic messages redact common credentials, email addresses and phone numbers", () => {
@@ -36,4 +40,10 @@ test("diagnostic limits stay between one and one hundred entries", () => {
   assert.equal(boundedDiagnosticLimit(0), 1);
   assert.equal(boundedDiagnosticLimit(500), 100);
   assert.equal(boundedDiagnosticLimit("many"), 50);
+});
+test("email redaction handles long separator-heavy addresses", () => {
+  const address = `${"user.".repeat(250)}@${"domain.".repeat(200)}example`;
+  const message = sanitiseDiagnosticMessage(address);
+  assert.equal(message.includes(address), false);
+  assert.equal(message.includes("[email]"), true);
 });

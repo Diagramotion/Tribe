@@ -31,6 +31,8 @@ from pydantic_ai import RunContext
 from tribe_runtime import project_memory
 from tribe_runtime.design_systems import export_design_system_package
 from tribe_runtime.agent_runtime import (
+    _approval_review_scope,
+    _approval_review_scope_is_current,
     _design_system_context,
     AgentDependencies,
     AgentSupervisor,
@@ -38,18 +40,26 @@ from tribe_runtime.agent_runtime import (
     PydanticAIProvider,
     _agent_can_read_context_event,
     _agent_conversation_id,
+    _agent_reply_context,
+    _current_user_request,
     _agent_failure_kind,
+    _connected_service_context,
+    _automatic_review_failure_reason,
     _browser_api_request_timeout,
     _build_agent,
     _continuable_prior_runs,
     _count_compaction_receipts,
+    _deferred_tool_results_for_saved_batch,
+    _deferred_approval_frontier,
     _durable_tool_output,
     _has_unresolved_harness_tool_effects,
     _next_agent_reply_metadata,
     _project_team_context,
     _provider_retry_delay,
+    _provider_result_usage_values,
     _reject_text_encoded_tool_call,
     _scheduled_provider_retry_delay,
+    wait_for_harness_background_command,
     _tools_for_agent,
     _user_facing_agent_text,
 )
@@ -62,11 +72,21 @@ from tribe_runtime.agents import (
     write_agent_definition,
 )
 from tribe_runtime.general_chats import GeneralChatService
-from tribe_runtime.harness_capabilities import _compaction_keep_tokens, build_capabilities
+from tribe_runtime.harness_capabilities import (
+    UNKNOWN_MODEL_CONTEXT_WINDOW,
+    _automatic_review_error_reason,
+    _compaction_keep_tokens,
+    build_capabilities,
+    command_is_reviewable,
+    command_needs_approval,
+    persistent_tool_approval_allowed,
+    repository_change_approval_preview,
+    _references_path_outside_project,
+)
 from tribe_runtime.mcp_registry import MCPRegistry
 from tribe_runtime.recipes import get_recipe, list_recipes, save_recipe
 from tribe_runtime.skills import SkillCatalog
-from tribe_runtime.store import SCHEMA_VERSION, MissionStore
+from tribe_runtime.store import SCHEMA_VERSION, MissionStore, tool_action_approval_capability
 from tribe_runtime.workspace import (
     WorkspaceTools,
     browse_repository,
@@ -92,6 +112,111 @@ def _database_connection(path: Path):
 
 
 class RuntimeCase(unittest.TestCase):
+    def _deferred_approval(self, mission_id: str, tool_name: str, capability: str,
+                           tool_arguments: dict[str, Any] | None = None):
+        interaction_suffix = uuid.uuid4().hex
+        with patch("tribe_runtime.secure_storage.encrypt_approval_history", return_value="v1:test"):
+            return self.store.create_deferred_tool_interaction(
+                mission_id=mission_id, requested_by="builder", title="Approve action",
+                details="Exact test action", target="Test target", trigger_sequence=1,
+                run_id=f"test-run-{interaction_suffix}", conversation_id=f"test:{mission_id}",
+                tool_call_id=f"call-{interaction_suffix}", tool_name=tool_name,
+                tool_arguments=tool_arguments or {"query": "read-only"}, message_history="[]",
+                approval_capability=capability,
+            )
+
+    def test_persistent_approval_policy_excludes_external_and_risky_actions(self) -> None:
+        self.assertTrue(persistent_tool_approval_allowed("write_file", {"path": "note.txt"}))
+        self.assertTrue(persistent_tool_approval_allowed("read_repository_file", {"path": "README.md"}))
+        self.assertTrue(persistent_tool_approval_allowed("get_artifact", {"artifact_id": "artifact"}))
+        self.assertTrue(persistent_tool_approval_allowed("duckduckgo_search", {"query": "docs"}))
+        self.assertTrue(persistent_tool_approval_allowed("run_command", {"command": "git status --short"}))
+        self.assertTrue(persistent_tool_approval_allowed(
+            "run_repository_tests", {"argv": ["pytest", "tests"]},
+        ))
+        self.assertTrue(persistent_tool_approval_allowed(
+            "run_repository_tests", {"argv": [
+                "uv", "run", "--project", "runtime", "--extra", "test", "pytest",
+                "runtime/tests/test_runtime_core.py", "-k", "approval_review_scope", "-q",
+            ]},
+        ))
+        self.assertFalse(persistent_tool_approval_allowed(
+            "run_repository_tests", {"argv": [
+                "uv", "run", "--project", "../../outside", "pytest", "tests",
+            ]},
+        ))
+        self.assertFalse(persistent_tool_approval_allowed(
+            "run_repository_tests", {"argv": ["uv", "run", "python", "-c", "print(1)"]},
+        ))
+        self.assertFalse(persistent_tool_approval_allowed("run_repository_tests", {"command": "pytest tests"}))
+        self.assertFalse(persistent_tool_approval_allowed(
+            "run_repository_tests", {"argv": ["npm", "install"]},
+        ))
+        self.assertFalse(persistent_tool_approval_allowed(
+            "fixture_inspect", {}, requires_mcp_approval=True,
+        ))
+        self.assertFalse(persistent_tool_approval_allowed("generate_image", {"prompt": "image"}))
+        self.assertFalse(persistent_tool_approval_allowed("future_external_action", {"destination": "service"}))
+        self.assertFalse(persistent_tool_approval_allowed(
+            "request_file_deletion_approval", {"path": "note.txt"},
+        ))
+        self.assertFalse(persistent_tool_approval_allowed(
+            "delete_repository_file", {"path": "note.txt", "sha256": "0" * 64},
+        ))
+        self.assertFalse(persistent_tool_approval_allowed(
+            "integrate_isolated_changes", {"worktree_id": "worktree"},
+        ))
+        self.assertFalse(persistent_tool_approval_allowed("run_command", {"command": "git push"}))
+        self.assertFalse(persistent_tool_approval_allowed("run_command", {"command": "gh pr create"}))
+
+    def test_github_cli_requests_require_exact_approval(self) -> None:
+        for command in (
+            "gh auth status", "gh issue list", "gh pr view 123", "gh search issues Tribe",
+            "rtk gh issue list", "rtk proxy gh issue list",
+        ):
+            with self.subTest(command=command):
+                self.assertTrue(command_needs_approval(command))
+                self.assertFalse(persistent_tool_approval_allowed(
+                    "run_command", {"command": command},
+                ))
+
+    def test_deep_research_uses_a_capable_selected_role_without_planner(self) -> None:
+        researcher = AgentDefinition(
+            "researcher", "Researcher", "Investigate evidence", "", "user",
+            capabilities=("web", "artifacts", "task_coordination"),
+        )
+        coordinator = AgentDefinition(
+            "research_lead", "Research lead", "Coordinate research", "", "user",
+            capabilities=("planning", "task_coordination", "artifacts"),
+        )
+        supervisor = AgentSupervisor(self.store, [researcher, coordinator])
+
+        self.assertIsNone(self.store.mission_lead_agent_id(self.mission["id"]))
+        self.assertEqual(supervisor.research_lead_for_mission(self.mission["id"]), "research_lead")
+
+    def test_chat_team_persists_a_specialist_without_planner_or_default_lead(self) -> None:
+        available = ["security_auditor", "marketing_writer"]
+        self.store.set_project_agent_ids(self.project["id"], available, available)
+        self.store.set_mission_agent_ids(
+            self.mission["id"], ["security_auditor"], available, lead_agent_id=None,
+        )
+
+        reopened = MissionStore(self.store.path)
+        selected = reopened.mission_agent_ids(self.mission["id"], available)
+        self.assertEqual(selected, ["security_auditor"])
+        self.assertIsNone(reopened.mission_lead_agent_id(self.mission["id"]))
+        self.assertNotIn("planner", selected)
+
+        specialist = AgentWorker(
+            reopened, self.mission["id"],
+            AgentDefinition("security_auditor", "Security Auditor", "Review security", "", ""),
+            None, threading.Event(),
+        )
+        self.assertTrue(specialist._should_run({
+            "actorId": "user", "type": "message.created",
+            "payload": {"text": "Review this @Security Auditor", "mentions": ["security_auditor"]},
+        }))
+
     def test_browser_actions_allow_time_for_native_user_confirmation(self) -> None:
         for action in ("click", "fill", "type", "press", "upload"):
             with self.subTest(action=action):
@@ -114,10 +239,13 @@ class RuntimeCase(unittest.TestCase):
     def test_keeps_ordinary_json_response(self) -> None:
         _reject_text_encoded_tool_call('{"name":"example","arguments":{}}')
 
-    def test_compaction_retained_context_scales_below_eight_thousand_tokens(self) -> None:
+    def test_compaction_retained_context_scales_with_harness_model_windows(self) -> None:
         self.assertEqual(_compaction_keep_tokens(16_000), 3_200)
         self.assertEqual(_compaction_keep_tokens(1_000_000), 200_000)
-        self.assertEqual(_compaction_keep_tokens(None), 32_000)
+        from pydantic_ai_harness.compaction import DEFAULT_CONTEXT_WINDOW
+
+        self.assertEqual(UNKNOWN_MODEL_CONTEXT_WINDOW, DEFAULT_CONTEXT_WINDOW)
+        self.assertEqual(_compaction_keep_tokens(None), 40_000)
 
     def test_agent_channel_copy_removes_internal_identifiers(self) -> None:
         text = (
@@ -129,9 +257,76 @@ class RuntimeCase(unittest.TestCase):
         self.assertNotIn("call_abcdefghijklmnop", cleaned)
         self.assertIn("Tests passed", cleaned)
 
+    def test_auto_review_failure_diagnostic_redacts_credentials_and_is_bounded(self) -> None:
+        secret = "provider-secret-value"
+        with patch("tribe_runtime.agent_runtime.get_api_key", return_value=secret):
+            reason = _automatic_review_failure_reason(
+                TypeError(f"invalid authorization value {secret}\n" + ("detail " * 100)),
+                "openai:test-model",
+            )
+
+        self.assertIn("Automatic review failed (TypeError:", reason)
+        self.assertIn("[redacted]", reason)
+        self.assertNotIn(secret, reason)
+        self.assertLessEqual(len(reason), 300)
+
+    def test_auto_review_exception_reason_redacts_environment_credentials(self) -> None:
+        secret = "openai-test-credential"
+        with patch.dict(os.environ, {"OPENAI_API_KEY": secret}):
+            reason = _automatic_review_error_reason(
+                TypeError(f"invalid value {secret}\n" + ("detail " * 100)),
+            )
+
+        self.assertIn("Automatic review failed (TypeError:", reason)
+        self.assertIn("[redacted]", reason)
+        self.assertNotIn(secret, reason)
+        self.assertLessEqual(len(reason), 300)
+
+    def test_connected_service_context_separates_configuration_from_role_grants(self) -> None:
+        config = {"mcpServers": {
+            "sonar": {"url": "http://localhost:9000/mcp"},
+            "disabled": {"url": "https://example.test/mcp", "disabled": True},
+            "github": {"url": "https://github.example.test/mcp"},
+        }}
+        self.assertEqual(
+            _connected_service_context(config, ("mcp:sonar.issues",)),
+            {"configured_services": ["github", "sonar"], "available_to_this_role": ["sonar"]},
+        )
+        self.assertEqual(
+            _connected_service_context({"mcpServers": {}}, ("mcp:*",)),
+            {"configured_services": [], "available_to_this_role": []},
+        )
+
+    def test_auto_review_reads_provider_usage_from_result_property(self) -> None:
+        from decimal import Decimal
+        from pydantic_ai.usage import RunUsage
+
+        result = SimpleNamespace(usage=RunUsage(
+            tool_calls=2, input_tokens=120, output_tokens=18,
+            cache_read_tokens=40, cache_write_tokens=8, cost=Decimal("0.0123"),
+        ))
+
+        self.assertEqual(_provider_result_usage_values(result), {
+            "tool_calls": 2, "input_tokens": 120, "output_tokens": 18,
+            "cache_read_tokens": 40, "cache_write_tokens": 8, "cost_usd": "0.0123",
+        })
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="tribe-runtime-test-")
         self.root = Path(self.temp.name)
+        secure_storage_key = patch(
+            "tribe_runtime.secure_storage.workspace_key", return_value=b"t" * 32,
+        )
+        secure_storage_key.start()
+        self.addCleanup(secure_storage_key.stop)
+        provider_key_lookup = patch("tribe_runtime.agent_runtime.get_api_key", return_value=None)
+        provider_key_lookup.start()
+        self.addCleanup(provider_key_lookup.stop)
+        self._provider_environment = patch.dict(
+            os.environ, {"OPENAI_API_KEY": "tribe-test-placeholder"},
+        )
+        self._provider_environment.start()
+        self.addCleanup(self._provider_environment.stop)
         self._smriti_environment = patch.dict(
             os.environ, {"SMRITI_MEMORY_ROOT": str(self.root / "smriti")}
         )
@@ -612,7 +807,7 @@ class RuntimeCase(unittest.TestCase):
                 return None
 
         toolset = Toolset()
-        with patch("pydantic_ai.mcp.load_mcp_toolsets", return_value=[toolset]):
+        with patch("tribe_runtime.mcp_registry._load_mcp_toolsets", return_value=[toolset]):
             tools = asyncio.run(registry.discover_tools(
                 self.project["id"], "playwright", verify_browser_launch=True,
             ))
@@ -707,11 +902,11 @@ class RuntimeCase(unittest.TestCase):
 
         local_toolset = FilterableToolset()
 
-        def load_standard_toolsets(path):
-            loaded_configurations.append(json.loads(Path(path).read_text(encoding="utf-8")))
+        def load_standard_toolsets(config):
+            loaded_configurations.append(config)
             return [local_toolset]
 
-        with patch("pydantic_ai.mcp.load_mcp_toolsets", side_effect=load_standard_toolsets):
+        with patch("tribe_runtime.mcp_registry._load_mcp_toolsets", side_effect=load_standard_toolsets):
             toolsets = registry.load_toolsets(self.project["id"], ("mcp:*",))
 
         self.assertEqual(len(toolsets), 2)
@@ -752,6 +947,107 @@ class RuntimeCase(unittest.TestCase):
                 "url": "https://tools.example.com/mcp", "oauth": {"scopes": ["read", "read"]},
             }}})
 
+    def test_workspace_and_project_mcp_read_routes_return_scoped_configuration(self) -> None:
+        from unittest.mock import AsyncMock
+        from tribe_runtime import server as runtime_server
+
+        registry = MCPRegistry(self.store)
+        registry.save_workspace_config({"mcpServers": {
+            "docs": {"url": "https://docs.example.com/mcp", "oauth": {"scopes": ["read"]}},
+        }})
+        registry.save_exclusions(self.project["id"], {"docs"})
+        with (
+            patch.object(runtime_server, "STORE", self.store),
+            patch.object(MCPRegistry, "oauth_status", new=AsyncMock(return_value={"state": "connected"})),
+        ):
+            http = runtime_server.LocalHTTPServer(("127.0.0.1", 0), runtime_server.Handler)
+            thread = threading.Thread(target=http.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{http.server_port}"
+            try:
+                with urllib.request.urlopen(f"{base_url}/api/mcp", timeout=3) as response:
+                    workspace = json.loads(response.read())
+                self.assertEqual(workspace["config"]["mcpServers"]["docs"]["url"], "https://docs.example.com/mcp")
+                self.assertEqual(workspace["secretStatus"], {})
+
+                with urllib.request.urlopen(
+                    f"{base_url}/api/projects/{self.project['id']}/mcp-exclusions", timeout=3,
+                ) as response:
+                    exclusions = json.loads(response.read())
+                self.assertEqual(exclusions, {"servers": ["docs"], "excluded": ["docs"]})
+
+                with urllib.request.urlopen(
+                    f"{base_url}/api/projects/{self.project['id']}/mcp", timeout=3,
+                ) as response:
+                    project_config = json.loads(response.read())
+                self.assertEqual(project_config["config"], {"mcpServers": {}})
+
+                with urllib.request.urlopen(
+                    f"{base_url}/api/mcp/oauth/docs/status", timeout=3,
+                ) as response:
+                    self.assertEqual(json.loads(response.read()), {"state": "connected"})
+
+                with patch.object(MCPRegistry, "get_exclusions", side_effect=ValueError("project_not_found")):
+                    with self.assertRaises(urllib.error.HTTPError) as failure:
+                        urllib.request.urlopen(
+                            f"{base_url}/api/projects/{self.project['id']}/mcp-exclusions", timeout=3,
+                        )
+                    self.assertEqual(failure.exception.code, 404)
+
+                with patch.object(MCPRegistry, "workspace_config", side_effect=ValueError("invalid_config")):
+                    with self.assertRaises(urllib.error.HTTPError) as failure:
+                        urllib.request.urlopen(f"{base_url}/api/mcp", timeout=3)
+                    self.assertEqual(failure.exception.code, 500)
+            finally:
+                http.shutdown()
+                http.server_close()
+                thread.join(timeout=2)
+
+    def test_mission_team_route_accepts_optional_lead_and_rejects_unselected_lead(self) -> None:
+        from tribe_runtime import server as runtime_server
+
+        available = ["security_auditor", "marketing_writer"]
+        self.store.set_project_agent_ids(self.project["id"], available, available)
+        with (
+            patch.object(runtime_server, "STORE", self.store),
+            patch.object(runtime_server, "_workspace_agent_ids", return_value=available),
+            patch.object(runtime_server.SUPERVISOR, "update_mission_team") as update_team,
+        ):
+            http = runtime_server.LocalHTTPServer(("127.0.0.1", 0), runtime_server.Handler)
+            thread = threading.Thread(target=http.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{http.server_port}/api/missions/{self.mission['id']}/team"
+            try:
+                request = urllib.request.Request(
+                    base_url,
+                    data=json.dumps({"agentIds": ["security_auditor"], "leadAgentId": None}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="PUT",
+                )
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    self.assertEqual(json.loads(response.read()), {
+                        "missionId": self.mission["id"],
+                        "agentIds": ["security_auditor"],
+                        "leadAgentId": None,
+                    })
+                update_team.assert_called_once_with(self.mission["id"])
+
+                request = urllib.request.Request(
+                    base_url,
+                    data=json.dumps({
+                        "agentIds": ["security_auditor"], "leadAgentId": "marketing_writer",
+                    }).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="PUT",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(request, timeout=3)
+                self.assertEqual(failure.exception.code, 422)
+            finally:
+                http.shutdown()
+                http.server_close()
+                thread.join(timeout=2)
+
     def test_mcp_server_and_tool_disablement_is_enforced_when_loading_toolsets(self) -> None:
         from types import SimpleNamespace
 
@@ -769,7 +1065,7 @@ class RuntimeCase(unittest.TestCase):
                 return self
 
         toolset = FilterableToolset()
-        with patch("pydantic_ai.mcp.load_mcp_toolsets", return_value=[toolset]) as load:
+        with patch("tribe_runtime.mcp_registry._load_mcp_toolsets", return_value=[toolset]) as load:
             loaded = registry.load_toolsets(self.project["id"], ("mcp:*",))
         load.assert_called_once()
         self.assertEqual(loaded, [toolset])
@@ -823,6 +1119,29 @@ for line in sys.stdin:
         }])
         self.assertFalse(list(registry.root.glob("check-*.json")))
 
+    def test_mcp_toolsets_allow_slow_servers_to_finish_initialising(self) -> None:
+        from tribe_runtime.mcp_registry import MCP_SERVER_INIT_TIMEOUT, _load_mcp_toolsets
+
+        with patch("fastmcp.client.transports.StdioTransport") as transport, \
+             patch("pydantic_ai.mcp.MCPToolset") as toolset_factory:
+            _load_mcp_toolsets({"mcpServers": {
+                "sonarqube": {
+                    "command": "docker",
+                    "args": ["run", "sonarsource/sonarqube-mcp"],
+                    "env": {"SONARQUBE_TOKEN": "secret"},
+                    "cwd": "/repo",
+                },
+            }})
+
+        transport.assert_called_once_with(
+            command="docker", args=["run", "sonarsource/sonarqube-mcp"],
+            env={"SONARQUBE_TOKEN": "secret"}, cwd="/repo",
+        )
+        toolset_factory.assert_called_once_with(
+            transport.return_value, id="sonarqube", init_timeout=MCP_SERVER_INIT_TIMEOUT,
+        )
+        self.assertGreaterEqual(MCP_SERVER_INIT_TIMEOUT, 60)
+
     def test_playwright_preset_is_pinned_isolated_and_gates_browser_actions(self) -> None:
         from types import SimpleNamespace
 
@@ -870,7 +1189,7 @@ for line in sys.stdin:
 
         docs_toolset = FilterableToolset()
         browser_toolset = FilterableToolset()
-        with patch("pydantic_ai.mcp.load_mcp_toolsets", return_value=[docs_toolset, browser_toolset]):
+        with patch("tribe_runtime.mcp_registry._load_mcp_toolsets", return_value=[docs_toolset, browser_toolset]):
             registry.load_toolsets(self.project["id"], ("mcp:*",))
         self.assertTrue(browser_toolset.predicate(None, SimpleNamespace(name="playwright_browser_navigate")))
         self.store.set_project_web_access(self.project["id"], False, ["docs.python.org"])
@@ -1115,6 +1434,128 @@ for line in sys.stdin:
             }
         ))
 
+    def test_agent_instructions_include_specialist_guidance_only_for_granted_capabilities(self) -> None:
+        base = AgentDefinition(
+            "researcher", "Researcher", "Research", "", "researcher.md",
+            capabilities=("repository_read",),
+        )
+        base_instructions = _build_agent(base, "openai:test-model")._instructions[0].instruction
+        self.assertIn("user-selected project team", base_instructions)
+        self.assertNotIn("claim it before repository changes or commands", base_instructions)
+        self.assertNotIn("Use update_state", base_instructions)
+        self.assertNotIn("interactive-app-authoring", base_instructions)
+        self.assertNotIn("data-visualisation", base_instructions)
+        self.assertNotIn("computer_observe only", base_instructions)
+        self.assertIn("tribe_filesystem", base_instructions)
+        self.assertNotIn("tribe_shell", base_instructions)
+
+        specialist = AgentDefinition(
+            "specialist", "Specialist", "Research", "", "specialist.md",
+            capabilities=(
+                "repository_read", "task_coordination", "artifacts", "data_analysis",
+                "computer_observation",
+            ),
+        )
+        specialist_instructions = _build_agent(specialist, "openai:test-model")._instructions[0].instruction
+        self.assertIn("claim it before repository changes or commands", specialist_instructions)
+        self.assertIn("Use update_state", specialist_instructions)
+        self.assertIn("interactive-app-authoring", specialist_instructions)
+        self.assertIn("data-visualisation", specialist_instructions)
+        self.assertIn("computer_observe only", specialist_instructions)
+        self.assertLess(len(base_instructions), len(specialist_instructions))
+
+        repository_worker = AgentDefinition(
+            "repository_worker", "Repository worker", "Engineering", "", "worker.md",
+            repository_access="workspace_write",
+            tool_permissions=("read_file", "edit_file", "run_command"),
+        )
+        repository_instructions = _build_agent(repository_worker, "openai:test-model")._instructions[0].instruction
+        self.assertIn("tribe_filesystem, tribe_shell", repository_instructions)
+        self.assertIn("exact ID at most once", repository_instructions)
+        self.assertIn("without loading it again", repository_instructions)
+
+    def test_read_only_role_instructions_separate_filesystem_access_from_shell_grants(self) -> None:
+        definition = AgentDefinition(
+            "reviewer", "Reviewer", "Review", "Inspect project state", "reviewer.md",
+            repository_access="read_only", tool_permissions=("read_file", "run_command"),
+        )
+        instructions = _build_agent(definition, "openai:test-model")._instructions[0].instruction
+
+        self.assertIn("repository_access=read_only limits repository FileSystem capabilities", instructions)
+        self.assertIn("profile's explicit tool_permissions and normal command approval policy", instructions)
+        self.assertIn("do not infer that repository_access disables or makes Shell read-only", instructions)
+        self.assertNotIn("Do not edit repository files, integrate isolated work, or delete files", instructions)
+        self.assertIn("Your profile grants these tools:", instructions)
+        self.assertIn("run_command", instructions)
+
+    def test_deferred_approval_resume_skips_unrecorded_sibling_calls(self) -> None:
+        from pydantic_ai import Agent
+        from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart, UserPromptPart
+        from pydantic_ai.models.test import TestModel
+        from pydantic_ai.tools import ToolDenied
+
+        history = [
+            ModelRequest(parts=[UserPromptPart(content="Run one approved check")]),
+            ModelResponse(parts=[ToolCallPart(
+                tool_name="earlier_tool", args={}, tool_call_id="earlier-call",
+            )]),
+            ModelRequest(parts=[ToolReturnPart(
+                tool_name="earlier_tool", content="already completed", tool_call_id="earlier-call",
+            )]),
+            ModelResponse(parts=[
+            ToolCallPart(tool_name="read_repository_file", args={"path": "src/a.py"},
+                         tool_call_id="read-call"),
+            ToolCallPart(tool_name="run_check", args={"command": "git status"},
+                         tool_call_id="approved-call"),
+            ]),
+        ]
+        results = _deferred_tool_results_for_saved_batch(history, {"approved-call": True})
+
+        self.assertEqual(set(results.approvals), {"approved-call", "read-call"})
+        self.assertTrue(results.approvals["approved-call"])
+        self.assertIsInstance(results.approvals["read-call"], ToolDenied)
+        self.assertIn("not replayed", results.approvals["read-call"].message)
+
+        calls = []
+        agent = Agent(TestModel(custom_output_text="The approved check is complete."))
+
+        @agent.tool_plain
+        def read_repository_file(path: str) -> str:
+            calls.append("read")
+            return "file contents"
+
+        @agent.tool_plain
+        def run_check(command: str) -> str:
+            calls.append("approved")
+            return "clean"
+
+        result = agent.run_sync(
+            "Continue the saved run", message_history=history, deferred_tool_results=results,
+        )
+        self.assertEqual(result.output, "The approved check is complete.")
+        self.assertEqual(calls, ["approved"])
+
+    def test_deferred_approvals_are_scoped_to_one_saved_response(self) -> None:
+        rows = [
+            {"interaction_id": "first", "trigger_sequence": 7,
+             "message_history": "batch-a", "created_at": "2026-01-01T00:00:00Z"},
+            {"interaction_id": "parallel", "trigger_sequence": 7,
+             "message_history": "batch-a", "created_at": "2026-01-01T00:00:01Z"},
+            {"interaction_id": "later", "trigger_sequence": 7,
+             "message_history": "batch-b", "created_at": "2026-01-01T00:00:02Z"},
+            {"interaction_id": "other-chat", "trigger_sequence": 8,
+             "message_history": "batch-c", "created_at": "2026-01-01T00:00:03Z"},
+        ]
+
+        self.assertEqual(
+            {row["interaction_id"] for row in _deferred_approval_frontier(rows, 7, "first")},
+            {"first", "parallel"},
+        )
+        self.assertEqual(
+            {row["interaction_id"] for row in _deferred_approval_frontier(rows, 7)},
+            {"later"},
+        )
+
     def test_scheduler_tools_are_exposed_only_by_profile_permission(self) -> None:
         permitted = AgentDefinition(
             "planner", "Planner", "Planning", "", "planner.md",
@@ -1213,18 +1654,17 @@ for line in sys.stdin:
                 http.server_close()
                 thread.join(timeout=3)
 
-    def test_workflow_choice_does_not_gate_profile_granted_repository_actions(self) -> None:
+    def test_workflow_choice_does_not_gate_profile_granted_repository_actions_on_claimed_work(self) -> None:
         mission = self.store.create_mission(
             self.project["id"], "Guided delivery", "Implement a change",
             {"id": "goal-driven-sdlc", "version": 7, "title": "Goal-driven SDLC"},
         )
-        workspace = WorkspaceTools(self.store, mission["id"], "builder")
-        workspace.write_file("without-plan.txt", "profile access is the repository boundary")
-        self.assertTrue((self.repository / "without-plan.txt").is_file())
-
         first = self.store.create_work_item(mission["id"], "Implement change")
         claim = self.store.claim_work(mission["id"], "builder", work_item_id=first["id"])
         self.assertEqual(claim["id"], first["id"])
+        workspace = WorkspaceTools(self.store, mission["id"], "builder", first["id"])
+        workspace.write_file("claimed-work.txt", "profile access and a live claim permit this change")
+        self.assertTrue((self.repository / "claimed-work.txt").is_file())
         second = self.store.create_work_item(mission["id"], "Verify the change")
         self.assertEqual(self.store.work_items(mission["id"])[0]["status"], "claimed")
         self.store.complete_work(first["id"], "builder", "Implemented the requested change")
@@ -1611,15 +2051,21 @@ for line in sys.stdin:
 
     def test_project_approval_policy_is_persisted_validated_and_does_not_grant_tools(self) -> None:
         self.assertEqual(self.store.project_approval_policy(self.project["id"]), {"mode": "standard"})
-        for mode in ("review_changes", "confirm_every_call"):
+        for mode in ("review_changes", "auto_review", "confirm_every_call"):
             self.assertEqual(self.store.set_project_approval_policy(self.project["id"], mode), {"mode": mode})
             self.assertEqual(
                 self.store.project_approval_policy_for_mission(self.mission["id"]), mode,
             )
+            self.assertEqual(self.store.project_approval_policy(self.project["id"]), {"mode": mode})
         with self.assertRaisesRegex(ValueError, "approval_mode_invalid"):
             self.store.set_project_approval_policy(self.project["id"], "allow_all")
+        reopened_store = MissionStore(self.root / "data" / "tribe.sqlite3")
         self.assertEqual(
-            self.store.project_approval_policy_for_mission(self.mission["id"]),
+            reopened_store.project_approval_policy(self.project["id"]),
+            {"mode": "confirm_every_call"},
+        )
+        self.assertEqual(
+            reopened_store.project_approval_policy_for_mission(self.mission["id"]),
             "confirm_every_call",
         )
 
@@ -1643,22 +2089,200 @@ for line in sys.stdin:
         )
         self.assertNotIn("write_file", set(getattr(filesystem, "tools", ()) or ()))
 
+    def test_persistent_action_approval_scopes_are_project_and_chat_bound(self) -> None:
+        other_mission = self.store.create_mission(
+            self.project["id"], "Another chat", "Check project-scoped grants",
+        )
+        other_repository = self.root / "other-repository"
+        other_repository.mkdir()
+        other_project, other_project_mission = self.store.create_project(
+            str(other_repository), "Other project", "Other chat", "Isolate persistent grants",
+        )
+        action = {"path": "safe-note.txt", "content": "approved note", "expected_hash": None}
+        capability = tool_action_approval_capability("write_file", action, self.store.data_dir)
+        other_file_change = tool_action_approval_capability(
+            "edit_file", {"path": "src/feature.js", "old_text": "before", "new_text": "after"},
+            self.store.data_dir,
+        )
+        self.assertEqual(capability, other_file_change)
+        self.assertNotEqual(
+            tool_action_approval_capability(
+                "run_command", {
+                    "command": "git status --short", "timeout_seconds": None,
+                }, self.store.data_dir,
+            ),
+            tool_action_approval_capability(
+                "run_command", {"command": "git diff"}, self.store.data_dir,
+            ),
+        )
+        self.assertEqual(
+            tool_action_approval_capability(
+                "run_command", {"command": "git status --short", "timeout_seconds": None},
+                self.store.data_dir,
+            ),
+            tool_action_approval_capability(
+                "run_command", {"command": "git status --short"}, self.store.data_dir,
+            ),
+        )
+        self.assertNotEqual(
+            tool_action_approval_capability(
+                "run_command", {"command": "git status --short", "timeout_seconds": 30},
+                self.store.data_dir,
+            ),
+            tool_action_approval_capability(
+                "run_command", {"command": "git status --short"}, self.store.data_dir,
+            ),
+        )
+
+        chat_approval = self._deferred_approval(
+            self.mission["id"], "write_file", capability, action,
+        )
+        chat_resolution = self.store.resolve_interaction(
+            chat_approval["id"], "approved_once", access_scope="chat",
+        )
+        self.assertEqual(chat_resolution["access_grant"]["scope"], "chat")
+        self.assertTrue(self.store.has_access_grant(
+            self.mission["id"], self.project["id"], capability,
+        ))
+        self.assertFalse(self.store.has_access_grant(
+            other_mission["id"], self.project["id"], capability,
+        ))
+
+        project_approval = self._deferred_approval(
+            self.mission["id"], "write_file", capability, action,
+        )
+        project_resolution = self.store.resolve_interaction(
+            project_approval["id"], "approved_once", access_scope="project",
+        )
+        self.assertEqual(project_resolution["access_grant"]["scope"], "project")
+        self.assertTrue(self.store.has_access_grant(
+            other_mission["id"], self.project["id"], capability,
+        ))
+        self.assertFalse(self.store.has_access_grant(
+            other_project_mission["id"], other_project["id"], capability,
+        ))
+
+        reopened_store = MissionStore(self.store.path)
+        self.assertTrue(reopened_store.has_access_grant(
+            other_mission["id"], self.project["id"], other_file_change,
+        ))
+        reopened_store.revoke_access_grant(project_resolution["access_grant"]["id"])
+        self.assertFalse(reopened_store.has_access_grant(
+            other_mission["id"], self.project["id"], capability,
+        ))
+        self.assertTrue(reopened_store.has_access_grant(
+            self.mission["id"], self.project["id"], capability,
+        ), "revoking the project grant must leave the narrower chat grant intact")
+
+    def test_persistent_action_fingerprint_uses_a_restart_stable_keyed_digest(self) -> None:
+        import tribe_runtime.secure_storage as secure_storage
+
+        original_cache = dict(secure_storage._KEY_CACHE)
+        secure_storage._KEY_CACHE.clear()
+        keyring_values: dict[tuple[str, str], str] = {}
+
+        def get_workspace_key(data_dir, *, create=True):
+            account = secure_storage._workspace_account(data_dir)
+            return secure_storage._workspace_key(account, create=create)
+
+        with (
+            patch("tribe_runtime.secure_storage.workspace_key", side_effect=get_workspace_key),
+            patch("keyring.get_password", side_effect=lambda service, account: keyring_values.get((service, account))),
+            patch("keyring.set_password", side_effect=lambda service, account, value: keyring_values.__setitem__((service, account), value)),
+        ):
+            try:
+                action = {"url": "https://docs.example/page", "token": "low-entropy-secret"}
+                original = secure_storage.action_fingerprint(self.store.data_dir, "web_fetch", action)
+                secure_storage._KEY_CACHE.clear()
+                after_restart = secure_storage.action_fingerprint(
+                    self.store.data_dir, "web_fetch", action,
+                )
+                changed = secure_storage.action_fingerprint(
+                    self.store.data_dir, "web_fetch", {**action, "url": "https://docs.example/other"},
+                )
+                other_workspace = secure_storage.action_fingerprint(
+                    self.store.data_dir / "other", "web_fetch", action,
+                )
+            finally:
+                secure_storage._KEY_CACHE.clear()
+                secure_storage._KEY_CACHE.update(original_cache)
+
+        self.assertEqual(original, after_restart)
+        self.assertNotEqual(original, changed)
+        self.assertNotEqual(original, other_workspace)
+        self.assertTrue(original.startswith("tool_action_hmac:web_fetch:"))
+        self.assertNotIn("low-entropy-secret", original)
+
+    def test_one_time_tool_approval_does_not_create_a_persistent_grant(self) -> None:
+        capability = "tool_action_hmac:write_file:one-time"
+        interaction = self._deferred_approval(
+            self.mission["id"], "write_file", capability,
+        )
+
+        resolved = self.store.resolve_interaction(interaction["id"], "approved_once")
+
+        self.assertEqual(resolved["resolution"], "approved_once")
+        self.assertNotIn("access_grant", resolved)
+        self.assertFalse(self.store.has_access_grant(
+            self.mission["id"], self.project["id"], capability,
+        ))
+
+    def test_workspace_persistent_access_is_limited_to_public_web_reads(self) -> None:
+        web_approval = self._deferred_approval(
+            self.mission["id"], "duckduckgo_search", "public_web_read",
+        )
+        resolved = self.store.resolve_interaction(
+            web_approval["id"], "approved_once", access_scope="workspace",
+        )
+        self.assertEqual(resolved["access_grant"]["scope"], "workspace")
+        self.assertTrue(self.store.has_access_grant(
+            self.mission["id"], self.project["id"], "public_web_read",
+        ))
+        other_repository = self.root / "web-project"
+        other_repository.mkdir()
+        other_project, other_mission = self.store.create_project(
+            str(other_repository), "Web project", "Web chat", "Check workspace web grants",
+        )
+        self.assertTrue(self.store.has_access_grant(
+            other_mission["id"], other_project["id"], "public_web_read",
+        ))
+
+        action_approval = self._deferred_approval(
+            self.mission["id"], "write_file", "tool_action_hmac:write_file:test",
+        )
+        with self.assertRaisesRegex(ValueError, "workspace_access_only_available"):
+            self.store.resolve_interaction(
+                action_approval["id"], "approved_once", access_scope="workspace",
+            )
+        self.assertFalse(self.store.has_access_grant(
+            self.mission["id"], self.project["id"], "tool_action_hmac:sonar:test",
+        ))
+
     def test_approval_modes_pause_only_the_configured_harness_actions(self) -> None:
         if os.name != "posix":
             self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
         from pydantic_ai.models.test import TestModel
 
+        keyring_patch = patch("tribe_runtime.secure_storage.workspace_key", return_value=b"t" * 32)
+        keyring_patch.start()
+        self.addCleanup(keyring_patch.stop)
+
         definition = AgentDefinition(
             "builder", "Builder", "Implementation", "Build work", "builder.md",
             tool_permissions=("read_repository_file", "write_file"),
         )
-        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
+        work_item = self.store.create_work_item(self.mission["id"], "Write and inspect a file")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], definition.id, work_item_id=work_item["id"],
+        ))
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, work_item["id"])
         skills = SkillCatalog(self.repository)
         trigger = self.store.append(
             "message.created", "user", self.mission["id"], {"text": "Write and inspect a file"}
         )
         dependencies = AgentDependencies(
             self.store, self.mission["id"], definition, workspace, skills,
+            active_work_item_id=work_item["id"],
             file_locks={}, pending_file_changes={}, trigger_sequence=trigger["sequence"],
         )
         agent = _build_agent(definition, "openai:test-model")
@@ -1743,6 +2367,1387 @@ for line in sys.stdin:
                             lock.close()
                         dependencies.file_locks.clear()
 
+    def test_harness_file_write_recovers_by_claiming_work_after_feedback(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
+        from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+        from pydantic_ai.models.function import DeltaToolCall, FunctionModel
+
+        self.store.select_mission_workflow(self.mission["id"], "user", {
+            "id": "goal-driven-sdlc", "version": 1,
+            "instructions": "Claim a plan item before repository changes.",
+        })
+
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build work", "builder.md",
+            capabilities=("task_coordination",), tool_permissions=("write_file",),
+        )
+        work_item = self.store.create_work_item(self.mission["id"], "Write the requested file")
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"], {"text": "Write a file"},
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
+        skills = SkillCatalog(self.repository)
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, skills,
+            trigger_sequence=trigger["sequence"], file_locks={}, pending_file_changes={},
+        )
+        agent = _build_agent(definition, "openai:test-model")
+        capabilities = build_capabilities(
+            workspace, skills, trigger_sequence=trigger["sequence"],
+            tool_permissions=definition.tool_permissions,
+        )
+        self.reveal_deferred_test_tools(agent, capabilities)
+
+        calls = 0
+
+        def recover_after_claim_feedback(_messages, _agent_info):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                part = ToolCallPart(
+                    "write_file", {"path": "claimed-write.txt", "content": "written after claim"},
+                    tool_call_id="write-before-claim",
+                )
+                return ModelResponse(parts=[part])
+            if calls == 2:
+                part = ToolCallPart(
+                    "update_state", {
+                        "target": "task", "action": "claim", "target_id": work_item["id"],
+                    },
+                    tool_call_id="claim-for-write",
+                )
+                return ModelResponse(parts=[part])
+            if calls == 3:
+                part = ToolCallPart(
+                    "write_file", {"path": "claimed-write.txt", "content": "written after claim"},
+                    tool_call_id="write-after-claim",
+                )
+                return ModelResponse(parts=[part])
+            return ModelResponse(parts=[TextPart("The requested file is written.")])
+
+        def stream_after_claim_feedback(messages, agent_info):
+            response = recover_after_claim_feedback(messages, agent_info)
+
+            async def chunks():
+                for index, part in enumerate(response.parts):
+                    if isinstance(part, ToolCallPart):
+                        yield {index: DeltaToolCall(
+                            name=part.tool_name, json_args=part.args_as_json_str(),
+                            tool_call_id=part.tool_call_id,
+                        )}
+                    elif isinstance(part, TextPart):
+                        yield part.content
+
+            return chunks()
+
+        with agent.override(model=FunctionModel(
+            recover_after_claim_feedback, stream_function=stream_after_claim_feedback,
+            model_name="test-claim-recovery",
+        )):
+            result = asyncio.run(agent.run(
+                "Write a file.", deps=dependencies, capabilities=capabilities,
+                conversation_id=f"tribe:{self.mission['id']}:builder:claim-recovery",
+            ))
+        self.assertEqual(result.output, "The requested file is written.")
+        self.assertEqual(calls, 4)
+        self.assertEqual((self.repository / "claimed-write.txt").read_text(encoding="utf-8"), "written after claim")
+        self.assertEqual(self.store.work_items(self.mission["id"])[0]["owner"], definition.id)
+
+    def test_pull_request_creation_command_requires_a_fresh_one_time_approval(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
+        from pydantic_ai.models.test import TestModel
+
+        marker = self.repository / "fake-gh-calls.txt"
+        fake_bin = self.repository / "fake-bin"
+        fake_bin.mkdir()
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> fake-gh-calls.txt\n",
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+        work_item = self.store.create_work_item(self.mission["id"], "Prepare a pull request")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], "builder", work_item_id=work_item["id"],
+        ))
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Prepare a pull request", "builder.md",
+            tool_permissions=("run_command",),
+        )
+        command = "./fake-bin/gh pr create --draft"
+
+        def start_attempt(attempt: int):
+            trigger = self.store.append(
+                "message.created", "user", self.mission["id"],
+                {"text": "Prepare the pull request as a draft."},
+            )
+            workspace = WorkspaceTools(
+                self.store, self.mission["id"], definition.id, work_item["id"],
+            )
+            dependencies = AgentDependencies(
+                self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+                active_work_item_id=work_item["id"], trigger_sequence=trigger["sequence"],
+                file_locks={}, pending_file_changes={},
+            )
+            capabilities = build_capabilities(
+                workspace, dependencies.skills, trigger_sequence=trigger["sequence"],
+                tool_permissions=definition.tool_permissions, approval_mode="standard",
+            )
+            agent = _build_agent(definition, "openai:test-model")
+            self.reveal_deferred_test_tools(agent, capabilities)
+            outcome: list[Any] = []
+            failures: list[BaseException] = []
+
+            class PullRequestModel(TestModel):
+                def gen_tool_args(self, tool_def):
+                    if tool_def.name == "run_command":
+                        return {"command": command}
+                    return super().gen_tool_args(tool_def)
+
+            def run_agent() -> None:
+                try:
+                    with agent.override(model=PullRequestModel(
+                        call_tools=["run_command"], custom_output_text="Draft pull request prepared.",
+                    )):
+                        outcome.append(asyncio.run(agent.run(
+                            "Prepare the pull request as a draft.", deps=dependencies,
+                            capabilities=capabilities,
+                            conversation_id=f"test:{self.mission['id']}:builder:pull-request-{attempt}",
+                        )))
+                except BaseException as error:
+                    failures.append(error)
+
+            worker = threading.Thread(target=run_agent, daemon=True)
+            worker.start()
+            return worker, outcome, failures
+
+        for attempt in (1, 2):
+            worker, outcome, failures = start_attempt(attempt)
+            interaction = None
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                pending = [item for item in self.store.pending_interactions()
+                           if item["mission_id"] == self.mission["id"]]
+                if pending:
+                    interaction = pending[0]
+                    break
+                if not worker.is_alive():
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(interaction, f"PR command did not request approval: {failures}")
+            self.assertFalse(interaction["persistent_access_available"])
+            before_approval = marker.read_text(encoding="utf-8").splitlines() if marker.exists() else []
+            self.assertEqual(before_approval, ["pr create --draft"] * (attempt - 1))
+            with self.assertRaisesRegex(ValueError, "persistent_access_not_available_for_this_action"):
+                self.store.resolve_interaction(
+                    interaction["id"], "approved_once", access_scope="project",
+                )
+            self.store.resolve_interaction(interaction["id"], "approved_once")
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive(), "approved PR command did not settle")
+            self.assertFalse(failures, str(failures))
+            self.assertEqual(len(outcome), 1)
+            self.assertEqual(outcome[0].output, "Draft pull request prepared.")
+            self.assertEqual(marker.read_text(encoding="utf-8").splitlines(), ["pr create --draft"] * attempt)
+
+    def test_project_approval_grant_allows_future_file_changes_in_confirm_every_call_mode(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build work", "builder.md",
+            tool_permissions=("write_file",),
+        )
+        approved_action = {"path": "first-note.txt", "content": "first approved content", "expected_hash": None}
+        action = {"path": "later-note.txt", "content": "later approved content", "expected_hash": None}
+        with patch("tribe_runtime.secure_storage.workspace_key", return_value=b"t" * 32):
+            capability = tool_action_approval_capability("write_file", approved_action, self.store.data_dir)
+            approval = self._deferred_approval(self.mission["id"], "write_file", capability)
+            self.store.resolve_interaction(approval["id"], "approved_once", access_scope="project")
+
+            work_item = self.store.create_work_item(self.mission["id"], "Write the approved file")
+            self.assertIsNotNone(self.store.claim_work(
+                self.mission["id"], definition.id, work_item_id=work_item["id"],
+            ))
+
+            self.store.set_project_approval_policy(self.project["id"], "confirm_every_call")
+            trigger = self.store.append(
+                "message.created", "user", self.mission["id"],
+                {"text": "Write a later project file."},
+            )
+            workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, work_item["id"])
+            dependencies = AgentDependencies(
+                self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+                active_work_item_id=work_item["id"], file_locks={}, pending_file_changes={},
+                trigger_sequence=trigger["sequence"],
+            )
+            agent = _build_agent(definition, "openai:test-model")
+
+            class RememberedWriteModel(TestModel):
+                def gen_tool_args(self, tool_def):
+                    if tool_def.name == "write_file":
+                        return action
+                    return super().gen_tool_args(tool_def)
+
+            capabilities = build_capabilities(
+                workspace, dependencies.skills, trigger_sequence=trigger["sequence"],
+                project_id=self.project["id"], tool_permissions=definition.tool_permissions,
+                approval_mode="confirm_every_call",
+            )
+            self.reveal_deferred_test_tools(agent, capabilities)
+            results: list[Any] = []
+            failures: list[BaseException] = []
+
+            def run_agent() -> None:
+                try:
+                    with agent.override(model=RememberedWriteModel(
+                        call_tools=["write_file"], custom_output_text="The later file is written.",
+                    )):
+                        results.append(asyncio.run(agent.run(
+                            "Write a later project file.", deps=dependencies,
+                            capabilities=capabilities,
+                            conversation_id=f"tribe:{self.mission['id']}:builder:remembered-write",
+                        )))
+                except BaseException as error:
+                    failures.append(error)
+
+            worker = threading.Thread(target=run_agent, daemon=True)
+            worker.start()
+            pending_approval = None
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    pending = [item for item in self.store.pending_interactions()
+                               if item["mission_id"] == self.mission["id"]]
+                    if pending:
+                        pending_approval = pending[0]
+                        self.store.resolve_interaction(pending_approval["id"], "approved_once")
+                        break
+                    if not worker.is_alive():
+                        break
+                    time.sleep(0.05)
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive(), "remembered action did not settle")
+                self.assertFalse(failures, str(failures))
+                self.assertEqual(len(results), 1)
+            finally:
+                if dependencies.file_locks is not None:
+                    for lock in dependencies.file_locks.values():
+                        lock.close()
+                    dependencies.file_locks.clear()
+
+        self.assertIsNone(pending_approval, "the project file-change grant was ignored")
+        self.assertEqual(results[0].output, "The later file is written.")
+        self.assertEqual((self.repository / action["path"]).read_text(encoding="utf-8"), action["content"])
+        self.assertEqual(self.store.pending_interactions(), [])
+
+    def test_auto_review_approves_a_bounded_read_only_inspection_chain_and_records_the_decision(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Inspect project state", "builder.md",
+            repository_access="read_only", tool_permissions=("run_command",),
+        )
+        item = self.store.create_work_item(self.mission["id"], "Inspect the local checkout")
+        claim = self.store.claim_work(self.mission["id"], definition.id, work_item_id=item["id"])
+        self.assertIsNotNone(claim)
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Inspect the local checkout without changing it."},
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"], file_locks={}, pending_file_changes={},
+            trigger_sequence=trigger["sequence"],
+        )
+        reviewed: list[dict[str, str]] = []
+        command = (
+            "ls -d runtime/.venv/lib/python*/site-packages/pydantic_ai_harness* 2>/dev/null "
+            "|| true; find runtime/.venv/lib -path '*pydantic_ai_harness*' "
+            "-maxdepth 6 -type f 2>/dev/null | head"
+        )
+
+        async def reviewer(**request):
+            reviewed.append(request)
+            return {"decision": "approve", "reason": "Bounded read-only checkout inspection."}
+
+        capabilities = build_capabilities(
+            workspace, dependencies.skills, trigger_sequence=trigger["sequence"],
+            repository_access=definition.repository_access,
+            tool_permissions=definition.tool_permissions, approval_mode="auto_review",
+            approval_reviewer=reviewer,
+        )
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()):
+            agent = _build_agent(definition, "openai:test-model")
+        self.reveal_deferred_test_tools(agent, capabilities)
+
+        class ReadOnlyCommandModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "run_command":
+                    return {"command": command}
+                return super().gen_tool_args(tool_def)
+
+        try:
+            with agent.override(model=ReadOnlyCommandModel(
+                call_tools=["run_command"], custom_output_text="The checkout is clean.",
+            )):
+                result = asyncio.run(agent.run(
+                    "Inspect the local checkout.", deps=dependencies,
+                    capabilities=capabilities,
+                    conversation_id=f"tribe:{self.mission['id']}:builder:auto-review-approve",
+                ))
+        finally:
+            if dependencies.file_locks is not None:
+                for lock in dependencies.file_locks.values():
+                    lock.close()
+                dependencies.file_locks.clear()
+
+        review_events = [
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "agent.tool.auto_reviewed"
+        ]
+        self.assertEqual(result.output, "The checkout is clean.")
+        self.assertEqual(len(reviewed), 1)
+        self.assertEqual(reviewed[0]["command"], command)
+        self.assertEqual(len(review_events), 1)
+        self.assertEqual(review_events[0]["payload"]["decision"], "approved")
+        self.assertEqual(self.store.pending_interactions(), [])
+        self.assertIn(str(self.repository), str(result.all_messages()))
+
+    def test_auto_review_assesses_a_bounded_local_node_eval_probe(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Measure a local parser probe", "builder.md",
+            repository_access="read_only", tool_permissions=("run_command",),
+        )
+        item = self.store.create_work_item(self.mission["id"], "Measure the local parser probe")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], definition.id, work_item_id=item["id"],
+        ))
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Measure this bounded local parser probe without changing files."},
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"], file_locks={}, pending_file_changes={},
+            trigger_sequence=trigger["sequence"],
+        )
+        reviewed: list[dict[str, str]] = []
+
+        async def reviewer(**request):
+            reviewed.append(request)
+            return {"decision": "approve", "reason": "A bounded local calculation with no file writes."}
+
+        capabilities = build_capabilities(
+            workspace, dependencies.skills, trigger_sequence=trigger["sequence"],
+            repository_access=definition.repository_access,
+            tool_permissions=definition.tool_permissions, approval_mode="auto_review",
+            approval_reviewer=reviewer,
+        )
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()):
+            agent = _build_agent(definition, "openai:test-model")
+        self.reveal_deferred_test_tools(agent, capabilities)
+        command = "node -e 'console.log(\"reviewed-probe\")'"
+
+        class NodeProbeModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "run_command":
+                    return {"command": command}
+                return super().gen_tool_args(tool_def)
+
+        try:
+            with agent.override(model=NodeProbeModel(
+                call_tools=["run_command"], custom_output_text="The local probe completed.",
+            )):
+                result = asyncio.run(agent.run(
+                    "Measure the bounded local parser probe.", deps=dependencies,
+                    capabilities=capabilities,
+                    conversation_id=f"tribe:{self.mission['id']}:builder:auto-review-node-probe",
+                ))
+            class NodeVersionModel(TestModel):
+                def gen_tool_args(self, tool_def):
+                    if tool_def.name == "run_command":
+                        return {"command": "node --version"}
+                    return super().gen_tool_args(tool_def)
+
+            with agent.override(model=NodeVersionModel(
+                call_tools=["run_command"], custom_output_text="The profile-granted shell command completed.",
+            )):
+                version_result = asyncio.run(agent.run(
+                    "Report the installed local Node version.", deps=dependencies,
+                    capabilities=capabilities,
+                    conversation_id=f"tribe:{self.mission['id']}:builder:auto-review-node-version",
+                ))
+        finally:
+            if dependencies.file_locks is not None:
+                for lock in dependencies.file_locks.values():
+                    lock.close()
+                dependencies.file_locks.clear()
+
+        review_events = [
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "agent.tool.auto_reviewed"
+        ]
+        self.assertEqual(result.output, "The local probe completed.")
+        self.assertEqual([request["command"] for request in reviewed], [command])
+        self.assertEqual(reviewed[0]["role_access"]["repository_access"], "read_only")
+        self.assertIn("run_command", reviewed[0]["role_access"]["tool_permissions"])
+        self.assertNotIn("write_file", reviewed[0]["role_access"]["tool_permissions"])
+        self.assertEqual(review_events[-1]["payload"]["decision"], "approved")
+        self.assertEqual(self.store.pending_interactions(), [])
+        self.assertIn("reviewed-probe", str(result.all_messages()))
+        self.assertIn("Auto-review approved this action", str(result.all_messages()))
+        self.assertEqual(version_result.output, "The profile-granted shell command completed.")
+        self.assertRegex(str(version_result.all_messages()), r"v\d+\.\d+")
+        self.assertEqual(len(reviewed), 1, "the ordinary profile-granted command should not be auto-review-gated")
+
+    def test_auto_review_denies_file_writing_eval_for_read_only_role(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "reviewer", "Reviewer", "Review", "Inspect project state", "reviewer.md",
+            repository_access="read_only", tool_permissions=("run_command",),
+        )
+        item = self.store.create_work_item(self.mission["id"], "Review a local eval command")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], definition.id, work_item_id=item["id"],
+        ))
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Inspect a local eval command; do not write project files."},
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"], file_locks={}, pending_file_changes={},
+            trigger_sequence=trigger["sequence"],
+        )
+        reviewed: list[dict[str, Any]] = []
+
+        async def reviewer(**request):
+            reviewed.append(request)
+            self.assertEqual(request["role_access"]["repository_access"], "read_only")
+            self.assertIn("run_command", request["role_access"]["tool_permissions"])
+            self.assertIn("writeFileSync", request["command"])
+            return {"decision": "deny", "reason": "Read-only roles must not execute file-writing code."}
+
+        capabilities = build_capabilities(
+            workspace, dependencies.skills, trigger_sequence=trigger["sequence"],
+            repository_access=definition.repository_access,
+            tool_permissions=definition.tool_permissions, approval_mode="auto_review",
+            approval_reviewer=reviewer,
+        )
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()):
+            agent = _build_agent(definition, "openai:test-model")
+        self.reveal_deferred_test_tools(agent, capabilities)
+        target = self.repository / "read-only-eval-must-not-exist.txt"
+        command = (
+            "node -e 'require(\"node:fs\").writeFileSync("
+            "\"read-only-eval-must-not-exist.txt\", \"blocked\")'"
+        )
+
+        class FileWritingEvalModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "run_command":
+                    return {"command": command}
+                return super().gen_tool_args(tool_def)
+
+        try:
+            with agent.override(model=FileWritingEvalModel(
+                call_tools=["run_command"], custom_output_text="The write command was blocked.",
+            )):
+                result = asyncio.run(agent.run(
+                    "Review and block local file-writing eval code.", deps=dependencies,
+                    capabilities=capabilities,
+                    conversation_id=f"tribe:{self.mission['id']}:reviewer:read-only-eval-write",
+                ))
+        finally:
+            if dependencies.file_locks is not None:
+                for lock in dependencies.file_locks.values():
+                    lock.close()
+                dependencies.file_locks.clear()
+
+        review_events = [
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "agent.tool.auto_reviewed"
+        ]
+        self.assertEqual(result.output, "The write command was blocked.")
+        self.assertEqual([request["command"] for request in reviewed], [command])
+        self.assertEqual(review_events[-1]["payload"]["decision"], "denied")
+        self.assertFalse(target.exists(), "a read-only eval wrote a project file")
+        self.assertEqual(self.store.pending_interactions(), [])
+
+    def test_read_only_profile_granted_shell_waits_for_exact_external_approval(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "reviewer", "Reviewer", "Review", "Use granted shell commands with normal approval.", "reviewer.md",
+            repository_access="read_only", tool_permissions=("run_command",),
+        )
+        item = self.store.create_work_item(self.mission["id"], "Inspect the checkout")
+        self.assertIsNotNone(self.store.claim_work(self.mission["id"], definition.id, work_item_id=item["id"]))
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Pause for exact user approval before running external shell actions."},
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"], file_locks={}, pending_file_changes={},
+            trigger_sequence=trigger["sequence"],
+        )
+        capabilities = build_capabilities(
+            workspace, dependencies.skills, trigger_sequence=trigger["sequence"],
+            repository_access="read_only", tool_permissions=definition.tool_permissions,
+            approval_mode="standard",
+        )
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()):
+            agent = _build_agent(definition, "openai:test-model")
+        self.reveal_deferred_test_tools(agent, capabilities)
+
+        class ExternalCommandModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "run_command":
+                    return {"command": "git push origin main"}
+                return super().gen_tool_args(tool_def)
+
+        shim_dir = self.root / "git-shim"
+        shim_dir.mkdir()
+        invocation_marker = self.root / "git-was-not-approved.txt"
+        git_shim = shim_dir / "git"
+        git_shim.write_text(
+            "#!/bin/sh" + chr(10) + f"printf invoked > {invocation_marker}" + chr(10),
+            encoding="utf-8",
+        )
+        os.chmod(git_shim, 0o755)
+        failures: list[BaseException] = []
+        results: list[Any] = []
+
+        def run_agent() -> None:
+            try:
+                with agent.override(model=ExternalCommandModel(
+                    call_tools=["run_command"], custom_output_text="The external command was approved for this test.",
+                )):
+                    results.append(asyncio.run(agent.run(
+                        "Run the external shell action only after exact approval.", deps=dependencies,
+                        capabilities=capabilities,
+                        conversation_id=f"tribe:{self.mission['id']}:reviewer:read-only-command-boundary",
+                    )))
+            except BaseException as error:
+                failures.append(error)
+
+        worker = threading.Thread(target=run_agent)
+        interaction = None
+        environment = {"PATH": f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}"}
+        with patch.dict(os.environ, environment), patch(
+            "tribe_runtime.secure_storage.workspace_key", return_value=b"t" * 32,
+        ):
+            worker.start()
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    pending = [row for row in self.store.pending_interactions()
+                               if row["mission_id"] == self.mission["id"]]
+                    if pending:
+                        interaction = pending[0]
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(interaction, f"external shell action did not request approval: {failures}")
+                self.assertEqual(interaction["title"], "Run a command outside the safe set")
+                self.assertIn("git push origin main", interaction["details"])
+                self.assertTrue(worker.is_alive(), "the external command ran before approval")
+                self.assertFalse(invocation_marker.exists())
+                self.store.resolve_interaction(interaction["id"], "approved_once")
+                interaction = None
+                worker.join(timeout=10)
+                self.assertFalse(worker.is_alive(), "the approved external command did not settle")
+                self.assertFalse(failures, str(failures))
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0].output, "The external command was approved for this test.")
+                self.assertTrue(invocation_marker.exists(), "the profile-granted shell command did not run after approval")
+                self.assertEqual(invocation_marker.read_text(encoding="utf-8"), "invoked")
+                self.assertEqual(self.store.pending_interactions(), [])
+            finally:
+                if interaction and interaction["status"] == "pending":
+                    self.store.resolve_interaction(interaction["id"], "denied")
+                worker.join(timeout=1)
+
+    def test_auto_review_assesses_allowlisted_repository_test_runs(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Verify work", "builder.md",
+            tool_permissions=("run_repository_tests",),
+        )
+        item = self.store.create_work_item(self.mission["id"], "Check the local test runner")
+        self.assertIsNotNone(self.store.claim_work(self.mission["id"], definition.id, work_item_id=item["id"]))
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Check the local test runner."},
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"], file_locks={}, pending_file_changes={},
+            trigger_sequence=trigger["sequence"],
+        )
+        reviewed: list[dict[str, Any]] = []
+
+        async def reviewer(**request):
+            reviewed.append(request)
+            return {"decision": "approve", "reason": "This is an allowlisted local test-runner check."}
+
+        capabilities = build_capabilities(
+            workspace, dependencies.skills, trigger_sequence=trigger["sequence"],
+            tool_permissions=definition.tool_permissions, approval_mode="auto_review",
+            approval_reviewer=reviewer,
+        )
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()):
+            agent = _build_agent(definition, "openai:test-model")
+        self.reveal_deferred_test_tools(agent, capabilities)
+
+        class TestRunnerModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "run_repository_tests":
+                    return {"argv": ["python", "-m", "pytest", "tests"]}
+                return super().gen_tool_args(tool_def)
+
+        try:
+            with agent.override(model=TestRunnerModel(
+                call_tools=["run_repository_tests"],
+                custom_output_text="The local test runner is available.",
+            )):
+                result = asyncio.run(agent.run(
+                    "Check the local test runner.", deps=dependencies, capabilities=capabilities,
+                    conversation_id=f"tribe:{self.mission['id']}:builder:auto-review-tests",
+                ))
+        finally:
+            if dependencies.file_locks is not None:
+                for lock in dependencies.file_locks.values():
+                    lock.close()
+                dependencies.file_locks.clear()
+
+        review_events = [
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "agent.tool.auto_reviewed"
+        ]
+        test_runs = [
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.started"
+        ]
+        self.assertEqual(result.output, "The local test runner is available.")
+        self.assertEqual(len(reviewed), 1)
+        self.assertEqual(reviewed[0]["tool_name"], "run_repository_tests")
+        self.assertEqual(reviewed[0]["command"], "python -m pytest tests")
+        self.assertEqual(len(review_events), 1)
+        self.assertEqual(review_events[0]["payload"]["decision"], "approved")
+        self.assertEqual(len(test_runs), 1)
+        self.assertEqual(test_runs[0]["payload"]["argv"], ["python", "-m", "pytest", "tests"])
+        self.assertEqual(self.store.pending_interactions(), [])
+
+    def test_auto_review_command_boundary_excludes_external_and_destructive_actions(self) -> None:
+        from tribe_runtime.credentials import redact_shell_command
+
+        local_pytest = self.repository / "runtime" / ".venv" / "bin" / "pytest"
+        local_pytest.parent.mkdir(parents=True, exist_ok=True)
+        local_pytest.write_text("", encoding="utf-8")
+        if os.name == "posix":
+            local_python = local_pytest.parent / "python"
+            local_python.symlink_to(Path(sys.executable).resolve())
+            (local_pytest.parent.parent / "pyvenv.cfg").write_text(
+                f"home = {Path(sys.executable).resolve().parent}\n", encoding="utf-8",
+            )
+        for command in (
+            "git status --short",
+            "rtk git diff --stat",
+            "rg TODO src",
+            "python -m pytest runtime/tests -q",
+            "rtk python -m pytest runtime/tests -q",
+            "rtk proxy python -m pytest runtime/tests -q",
+            "runtime/.venv/bin/python -m pytest runtime/tests -q",
+            "runtime/.venv/bin/python -m pytest -q runtime/tests/test_runtime_core.py::RuntimeCase::test_plan_claims_gate_goal_driven_repository_actions_only",
+            "runtime/.venv/bin/pytest -q runtime/tests/test_commands.py",
+            "pwd && git status --short",
+            "rtk git diff --check && git diff --stat",
+            'git diff --unified=2 -- src/App.jsx | grep -n "setServers\\|mcpServers" -C 2 || true',
+            "rg TODO . && find src -type f",
+            'rg "foo|bar" . && git status',
+            'grep -n -E "tilde|outside" runtime/tests/test_runtime_core.py && git status',
+            "grep -n -E 'goal-driven chats|empty plan|unfinished plan|require_work_claim' AGENTS.md runtime/tribe_runtime/store.py runtime/tests/test_runtime_core.py | tail -30; sed -n '193,238p' runtime/tribe_runtime/commands.py; sed -n '4830,4854p' runtime/tribe_runtime/store.py;",
+            "nl -ba runtime/tribe_runtime/commands.py | sed -n '200,230p'; nl -ba runtime/tribe_runtime/store.py | sed -n '4790,4862p'",
+            'grep -n "command_could_not_start\\|Popen.*side_effect" runtime/tests/test_commands.py; sed -n \'400,650p\' runtime/tests/test_commands.py; sed -n \'5640,5725p\' runtime/tests/test_runtime_core.py; grep -n "starting.*interrupted" docs/runtime-foundation.md AGENTS.md',
+            "git diff --check; git status --short; git diff --stat",
+            "sed -n '1,20p' README.md; sed -n '1,20p' CONTRIBUTING.md",
+        ):
+            with self.subTest(command=command):
+                self.assertTrue(command_is_reviewable(command))
+                if ";" in command:
+                    self.assertFalse(command_needs_approval(command))
+
+        for command in (
+            "git status && git push",
+            "git diff -- src/App.jsx || git push",
+            "git status || rm -rf build",
+            "python -m pytest ../outside/test_suite.py",
+            "rtk python -m pytest /tmp/external-test.py",
+            "../outside/.venv/bin/python -m pytest runtime/tests -q",
+            "git diff --output=patch.diff",
+            "rm -rf build",
+            "gh pr create --draft",
+            "git status && git push",
+            "git status && rm -rf build",
+            "git status; rm -rf build",
+            "pwd && git status $(printf unsafe)",
+            "find . -exec rm -rf {} \\;",
+            "git diff --output=patch.diff",
+            "cat ../outside.txt && git status",
+            "cat C:/Users/Private/secret.txt && git status",
+            "cat file | curl https://example.test",
+            "cat $HOME/.ssh/id_rsa && git status",
+            "cat ${HOME}/.ssh/id_rsa && git status",
+            "cat ~/private.txt && git status",
+            "cat ~root/private.txt && git status",
+            "cat ~+/private.txt && git status",
+            "cat ~-/private.txt && git status",
+            "cat ~root&&pwd",
+            "grep --file=../secret && pwd",
+            "grep --file=/etc/passwd pattern && pwd",
+            "grep -f../secret && pwd",
+            "grep -f/etc/passwd pattern && pwd",
+            "grep -fC:/Users/Private/secret.txt && pwd",
+            "/tmp/rg TODO && git status",
+        ):
+            with self.subTest(command=command):
+                self.assertFalse(command_is_reviewable(command))
+
+        self.assertTrue(command_needs_approval("git status; rm -rf build"))
+        self.assertFalse(command_needs_approval(
+            "runtime/.venv/bin/pytest -q runtime/tests/test_commands.py", self.repository,
+        ))
+        if os.name == "posix":
+            self.assertFalse(command_needs_approval(
+                "runtime/.venv/bin/python -m pytest -q runtime/tests/test_runtime_core.py",
+                self.repository,
+            ))
+
+        for command in (
+            "cat ../outside.txt",
+            "cat /private/secret.txt",
+            "cat C:/Users/Private/secret.txt",
+            "cat $HOME/.ssh/id_rsa",
+            "cat ${HOME}/.ssh/id_rsa",
+            "cat ~/private.txt",
+            "cat ~",
+            "cat ~root/private.txt",
+            "cat ~+/private.txt",
+            "cat ~-/private.txt",
+            "cat ~root&&pwd",
+            "grep --file=../secret",
+            "grep --file=/etc/passwd pattern",
+            "grep -f../secret",
+            "grep -f/etc/passwd pattern",
+            "grep -fC:/Users/Private/secret.txt",
+            "/tmp/rg TODO",
+        ):
+            with self.subTest(command=command):
+                self.assertTrue(command_needs_approval(command))
+                self.assertFalse(persistent_tool_approval_allowed(
+                    "run_command", {"command": command},
+                ))
+
+        for command in (
+            "grep --file=../secret && pwd",
+            "grep --file=/etc/passwd pattern && pwd",
+            "grep -f../secret && pwd",
+            "grep -f/etc/passwd pattern && pwd",
+            "grep -fC:/Users/Private/secret.txt && pwd",
+            "/tmp/rg TODO && git status",
+            "cat ~root/private.txt && git status",
+        ):
+            with self.subTest(command=command):
+                self.assertFalse(command_is_reviewable(command))
+
+        self.assertTrue(_references_path_outside_project([
+            r"..\outside.txt", r"--file=C:\Users\Private\secret.txt", "-f../outside.txt",
+        ]))
+        self.assertFalse(command_needs_approval("grep 'foo|bar' src"))
+        self.assertFalse(command_needs_approval("cat file | grep secret"))
+        self.assertFalse(command_needs_approval(
+            "grep -n -E 'goal-driven chats|empty plan|unfinished plan|require_work_claim' "
+            "AGENTS.md runtime/tribe_runtime/store.py runtime/tests/test_runtime_core.py | tail -30; "
+            "sed -n '193,238p' runtime/tribe_runtime/commands.py; "
+            "sed -n '4830,4854p' runtime/tribe_runtime/store.py;",
+        ))
+        self.assertEqual(
+            redact_shell_command("curl -H 'X-Auth: abc123' https://example.test"),
+            "curl -H 'X-Auth: [redacted]' https://example.test",
+        )
+        self.assertEqual(
+            redact_shell_command('curl --header="Authorization: Bearer abc123" https://example.test'),
+            'curl --header="Authorization: [redacted]" https://example.test',
+        )
+        self.assertEqual(
+            redact_shell_command("curl -H X-Auth:abc123 https://example.test"),
+            "curl -H X-Auth:[redacted] https://example.test",
+        )
+        truncated = redact_shell_command("git status " + "x" * 4200)
+        self.assertEqual(len(truncated), 4000)
+        self.assertIn("command preview truncated; 211 characters omitted", truncated)
+
+    def test_external_symlink_paths_require_exact_shell_approval(self) -> None:
+        outside = self.root / "outside-secret.txt"
+        outside.write_text("private", encoding="utf-8")
+        external_link = self.repository / "External-Link"
+        external_link.symlink_to(outside)
+        internal_target = self.repository / "src" / "internal.txt"
+        internal_target.parent.mkdir(exist_ok=True)
+        internal_target.write_text("project data", encoding="utf-8")
+        internal_link = self.repository / "internal-link"
+        internal_link.symlink_to(internal_target)
+
+        self.assertTrue(_references_path_outside_project(["External-Link"], self.repository))
+        self.assertTrue(command_needs_approval("cat External-Link", self.repository))
+        self.assertFalse(command_is_reviewable("cat External-Link", self.repository))
+        self.assertFalse(persistent_tool_approval_allowed(
+            "run_command", {"command": "cat External-Link"}, project_root=self.repository,
+        ))
+        self.assertFalse(_references_path_outside_project(["internal-link"], self.repository))
+        self.assertTrue(command_is_reviewable("cat internal-link", self.repository))
+
+    def test_command_approval_redacts_auth_headers_from_persisted_details(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native local shell is supported on POSIX hosts only")
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Inspect a remote API", "builder.md",
+            tool_permissions=("run_command",),
+        )
+        item = self.store.create_work_item(self.mission["id"], "Request one approved API call")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], definition.id, work_item_id=item["id"],
+        ))
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Prepare an API request for review without sending it."},
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"], file_locks={}, pending_file_changes={},
+            trigger_sequence=trigger["sequence"],
+        )
+        capabilities = build_capabilities(
+            workspace, dependencies.skills, trigger_sequence=trigger["sequence"],
+            tool_permissions=definition.tool_permissions, approval_mode="standard",
+        )
+        agent = _build_agent(definition, "openai:test-model")
+        self.reveal_deferred_test_tools(agent, capabilities)
+        secret = "tribe-test-auth-secret"
+
+        class AuthHeaderModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "run_command":
+                    return {"command": f"curl -H 'X-Auth: {secret}' https://example.test"}
+                return super().gen_tool_args(tool_def)
+
+        failures: list[BaseException] = []
+
+        def run_agent() -> None:
+            try:
+                with agent.override(model=AuthHeaderModel(call_tools=["run_command"])):
+                    asyncio.run(agent.run(
+                        "Prepare the request for review.", deps=dependencies,
+                        capabilities=capabilities,
+                        conversation_id=f"tribe:{self.mission['id']}:builder:auth-header-approval",
+                    ))
+            except BaseException as error:
+                failures.append(error)
+
+        with patch("tribe_runtime.secure_storage.workspace_key", return_value=b"t" * 32):
+            worker = threading.Thread(target=run_agent, daemon=True)
+            worker.start()
+            interaction = None
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    pending = [row for row in self.store.pending_interactions()
+                               if row["mission_id"] == self.mission["id"]]
+                    if pending:
+                        interaction = pending[0]
+                        break
+                    if not worker.is_alive():
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(interaction, f"curl should pause before network access: {failures}")
+                self.assertNotIn(secret, interaction["details"])
+                approval = self.store.deferred_tool_approvals(
+                    self.mission["id"], definition.id,
+                )[0]
+                self.assertNotIn(secret, str(approval["tool_arguments"]))
+                self.assertNotIn(secret, str(self.store.events_after(self.mission["id"], 0)))
+                self.store.resolve_interaction(interaction["id"], "denied")
+                worker.join(timeout=10)
+                self.assertFalse(worker.is_alive(), "denied command did not settle")
+            finally:
+                if interaction and interaction["status"] == "pending":
+                    self.store.resolve_interaction(interaction["id"], "denied")
+                worker.join(timeout=1)
+                if dependencies.file_locks is not None:
+                    for lock in dependencies.file_locks.values():
+                        lock.close()
+                    dependencies.file_locks.clear()
+
+    def test_attached_grep_file_path_waits_for_approval_before_execution(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native local shell is supported on POSIX hosts only")
+        from pydantic_ai.models.test import TestModel
+
+        outside_patterns = self.repository.parent / "outside-patterns.txt"
+        outside_patterns.write_text("test-pattern\n", encoding="utf-8")
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Inspect source", "builder.md",
+            tool_permissions=("run_command",),
+        )
+        item = self.store.create_work_item(self.mission["id"], "Inspect a path outside the checkout")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], definition.id, work_item_id=item["id"],
+        ))
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Search using the external pattern file without reading it first."},
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"], file_locks={}, pending_file_changes={},
+            trigger_sequence=trigger["sequence"],
+        )
+        capabilities = build_capabilities(
+            workspace, dependencies.skills, trigger_sequence=trigger["sequence"],
+            tool_permissions=definition.tool_permissions, approval_mode="standard",
+        )
+        agent = _build_agent(definition, "openai:test-model")
+        self.reveal_deferred_test_tools(agent, capabilities)
+
+        class ExternalPatternModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "run_command":
+                    return {"command": "grep -f../outside-patterns.txt README.md"}
+                return super().gen_tool_args(tool_def)
+
+        failures: list[BaseException] = []
+
+        def run_agent() -> None:
+            try:
+                with agent.override(model=ExternalPatternModel(call_tools=["run_command"])):
+                    asyncio.run(agent.run(
+                        "Search README for the selected pattern.", deps=dependencies,
+                        capabilities=capabilities,
+                        conversation_id=f"tribe:{self.mission['id']}:builder:path-approval",
+                    ))
+            except BaseException as error:
+                failures.append(error)
+
+        with patch("tribe_runtime.secure_storage.workspace_key", return_value=b"t" * 32):
+            worker = threading.Thread(target=run_agent, daemon=True)
+            worker.start()
+            interaction = None
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    pending = [row for row in self.store.pending_interactions()
+                               if row["mission_id"] == self.mission["id"]]
+                    if pending:
+                        interaction = pending[0]
+                        break
+                    if not worker.is_alive():
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(interaction, f"outside path must pause before execution: {failures}")
+                self.assertIn("grep -f../outside-patterns.txt README.md", interaction["details"])
+                self.assertTrue(worker.is_alive(), "the command ran before the user decided")
+                self.store.resolve_interaction(interaction["id"], "denied")
+                worker.join(timeout=10)
+                self.assertFalse(worker.is_alive(), "denied path command did not settle")
+            finally:
+                if interaction and interaction["status"] == "pending":
+                    self.store.resolve_interaction(interaction["id"], "denied")
+                worker.join(timeout=1)
+                if dependencies.file_locks is not None:
+                    for lock in dependencies.file_locks.values():
+                        lock.close()
+                    dependencies.file_locks.clear()
+
+    def test_auto_review_assesses_and_approves_a_project_file_change(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Build work", "builder.md",
+            tool_permissions=("write_file",),
+        )
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Add a short local acceptance note."},
+        )
+        work_item = self.store.create_work_item(self.mission["id"], "Add the accepted local note")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], definition.id, work_item_id=work_item["id"],
+        ))
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, work_item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=work_item["id"], file_locks={}, pending_file_changes={},
+            trigger_sequence=trigger["sequence"],
+        )
+        reviewed: list[dict[str, Any]] = []
+
+        async def reviewer(**request):
+            reviewed.append(request)
+            return {"decision": "approve", "reason": "The requested note is bounded to the project."}
+
+        capabilities = build_capabilities(
+            workspace, dependencies.skills, trigger_sequence=trigger["sequence"],
+            tool_permissions=definition.tool_permissions, approval_mode="auto_review",
+            approval_reviewer=reviewer,
+        )
+        agent = _build_agent(definition, "openai:test-model")
+        self.reveal_deferred_test_tools(agent, capabilities)
+
+        class FileChangeModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "write_file":
+                    return {"path": "auto-reviewed-note.txt", "content": "Reviewed locally."}
+                return super().gen_tool_args(tool_def)
+
+        try:
+            with agent.override(model=FileChangeModel(
+                call_tools=["write_file"], custom_output_text="The note is written.",
+            )):
+                result = asyncio.run(agent.run(
+                    "Add a short local acceptance note.", deps=dependencies,
+                    capabilities=capabilities,
+                    conversation_id=f"tribe:{self.mission['id']}:builder:auto-review-file",
+                ))
+        finally:
+            if dependencies.file_locks is not None:
+                for lock in dependencies.file_locks.values():
+                    lock.close()
+                dependencies.file_locks.clear()
+
+        review_events = [
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "agent.tool.auto_reviewed"
+        ]
+        self.assertEqual(result.output, "The note is written.")
+        self.assertEqual((self.repository / "auto-reviewed-note.txt").read_text(encoding="utf-8"), "Reviewed locally.")
+        self.assertEqual(len(reviewed), 1)
+        self.assertEqual(reviewed[0]["tool_name"], "write_file")
+        self.assertEqual(reviewed[0]["arguments"]["content"], "Reviewed locally.")
+        self.assertEqual(review_events[0]["payload"]["decision"], "approved")
+        self.assertEqual(self.store.pending_interactions(), [])
+
+    def test_file_change_approval_displays_a_redacted_before_and_after_preview(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Make a small file change", "builder.md",
+            tool_permissions=("write_file",),
+        )
+        work_item = self.store.create_work_item(self.mission["id"], "Write a small code file")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], definition.id, work_item_id=work_item["id"],
+        ))
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Write the proposed code file."},
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, work_item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=work_item["id"], file_locks={}, pending_file_changes={},
+            trigger_sequence=trigger["sequence"],
+        )
+        capabilities = build_capabilities(
+            workspace, dependencies.skills, trigger_sequence=trigger["sequence"],
+            tool_permissions=definition.tool_permissions, approval_mode="review_changes",
+        )
+        agent = _build_agent(definition, "openai:test-model")
+        self.reveal_deferred_test_tools(agent, capabilities)
+        target = self.repository / "approved-preview.js"
+
+        class ProposedFileModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "write_file":
+                    return {
+                        "path": "approved-preview.js",
+                        "content": "const result = 'visible preview';\nconst TOKEN = 'preview-secret';",
+                    }
+                return super().gen_tool_args(tool_def)
+
+        failures: list[BaseException] = []
+
+        def run_agent() -> None:
+            try:
+                with agent.override(model=ProposedFileModel(
+                    call_tools=["write_file"], custom_output_text="The file is written.",
+                )):
+                    asyncio.run(agent.run(
+                        "Write the proposed code file.", deps=dependencies,
+                        capabilities=capabilities,
+                        conversation_id=f"tribe:{self.mission['id']}:builder:approval-preview",
+                    ))
+            except BaseException as error:
+                failures.append(error)
+
+        worker = threading.Thread(target=run_agent, daemon=True)
+        interaction = None
+        worker.start()
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                pending = [row for row in self.store.pending_interactions()
+                           if row["mission_id"] == self.mission["id"]]
+                if pending:
+                    interaction = pending[0]
+                    break
+                if not worker.is_alive():
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(interaction, f"file change did not request approval: {failures}")
+            self.assertIn("File: approved-preview.js", interaction["details"])
+            self.assertIn("Proposed contents:\nconst result = 'visible preview';", interaction["details"])
+            self.assertNotIn("preview-secret", interaction["details"])
+            self.assertFalse(target.exists(), "the file changed before the user approved it")
+            self.store.resolve_interaction(interaction["id"], "denied")
+            interaction = None
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive(), "denied file change did not settle")
+            self.assertFalse(failures, str(failures))
+            self.assertFalse(target.exists(), "the denied file change was applied")
+        finally:
+            if interaction and interaction["status"] == "pending":
+                self.store.resolve_interaction(interaction["id"], "denied")
+            worker.join(timeout=1)
+            if dependencies.file_locks is not None:
+                for lock in dependencies.file_locks.values():
+                    lock.close()
+                dependencies.file_locks.clear()
+
+    def test_auto_review_uncertainty_pauses_for_exact_user_approval(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's native workspace Harness is supported on POSIX hosts only")
+        from pydantic_ai.models.test import TestModel
+
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Inspect project state", "builder.md",
+            tool_permissions=("run_command",),
+        )
+        item = self.store.create_work_item(self.mission["id"], "Inspect the local checkout")
+        claim = self.store.claim_work(self.mission["id"], definition.id, work_item_id=item["id"])
+        self.assertIsNotNone(claim)
+        trigger = self.store.append(
+            "message.created", "user", self.mission["id"],
+            {"text": "Inspect the local checkout without changing it."},
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"], file_locks={}, pending_file_changes={},
+            trigger_sequence=trigger["sequence"],
+        )
+
+        async def failed_reviewer(**_request):
+            raise asyncio.TimeoutError()
+
+        capabilities = build_capabilities(
+            workspace, dependencies.skills, trigger_sequence=trigger["sequence"],
+            tool_permissions=definition.tool_permissions, approval_mode="auto_review",
+            approval_reviewer=failed_reviewer,
+        )
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()):
+            agent = _build_agent(definition, "openai:test-model")
+        self.reveal_deferred_test_tools(agent, capabilities)
+
+        class ReadOnlyCommandModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "run_command":
+                    return {"command": "git status --short"}
+                return super().gen_tool_args(tool_def)
+
+        failures: list[BaseException] = []
+        result_holder: list[Any] = []
+
+        def run_agent() -> None:
+            try:
+                with agent.override(model=ReadOnlyCommandModel(
+                    call_tools=["run_command"], custom_output_text="The checkout is clean.",
+                )):
+                    result_holder.append(asyncio.run(agent.run(
+                        "Inspect the local checkout.", deps=dependencies,
+                        capabilities=capabilities,
+                        conversation_id=f"tribe:{self.mission['id']}:builder:auto-review-ask",
+                    )))
+            except BaseException as error:
+                failures.append(error)
+
+        worker = threading.Thread(target=run_agent)
+        secure_key = patch("tribe_runtime.secure_storage.workspace_key", return_value=b"t" * 32)
+        secure_key.start()
+        worker.start()
+        try:
+            deadline = time.monotonic() + 10
+            interaction = None
+            while time.monotonic() < deadline:
+                pending = [row for row in self.store.pending_interactions()
+                           if row["mission_id"] == self.mission["id"]]
+                if pending:
+                    interaction = pending[0]
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(interaction, f"uncertain review did not ask the user: {failures}")
+            self.assertEqual(interaction["title"], "Review command")
+            self.assertIn("Automatic review timed out.", interaction["details"])
+            self.assertIn("git status --short", interaction["details"])
+            self.assertEqual(interaction["persistent_access_available"], 1)
+            self.assertTrue(worker.is_alive(), "the command ran before the user decided")
+            review_events = [
+                event for event in self.store.events_after(self.mission["id"], 0)
+                if event["type"] == "agent.tool.auto_reviewed"
+            ]
+            self.assertEqual(review_events[0]["payload"]["decision"], "needs_user")
+
+            project_resolution = self.store.resolve_interaction(
+                interaction["id"], "approved_once", access_scope="project",
+            )
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive(), "approved command did not resume")
+            self.assertFalse(failures, str(failures))
+            self.assertEqual(len(result_holder), 1)
+            self.assertIn(str(self.repository), str(result_holder[0].all_messages()))
+            approval = self.store.deferred_tool_approvals(self.mission["id"], definition.id)[0]
+            self.assertEqual(approval["status"], "consumed")
+            capability = tool_action_approval_capability(
+                "run_command", {"command": "git status --short"}, self.store.data_dir,
+            )
+            self.assertEqual(project_resolution["access_grant"]["capability"], capability)
+            other_mission = self.store.create_mission(
+                self.project["id"], "Another chat", "Reuse exact project-approved command",
+            )
+            self.assertTrue(self.store.has_access_grant(
+                other_mission["id"], self.project["id"], capability,
+            ))
+            different_command = tool_action_approval_capability(
+                "run_command", {"command": "git diff"}, self.store.data_dir,
+            )
+            self.assertFalse(self.store.has_access_grant(
+                other_mission["id"], self.project["id"], different_command,
+            ))
+
+            reopened_store = MissionStore(self.store.path)
+            follow_up = reopened_store.create_work_item(
+                other_mission["id"], "Inspect the checkout in a later chat",
+            )
+            self.assertIsNotNone(reopened_store.claim_work(
+                other_mission["id"], definition.id, work_item_id=follow_up["id"],
+            ))
+            follow_up_trigger = reopened_store.append(
+                "message.created", "user", other_mission["id"],
+                {"text": "Check the checkout status."},
+            )
+            follow_up_workspace = WorkspaceTools(
+                reopened_store, other_mission["id"], definition.id, follow_up["id"],
+            )
+            follow_up_dependencies = AgentDependencies(
+                reopened_store, other_mission["id"], definition,
+                follow_up_workspace, SkillCatalog(self.repository),
+                active_work_item_id=follow_up["id"], file_locks={}, pending_file_changes={},
+                trigger_sequence=follow_up_trigger["sequence"],
+            )
+            follow_up_capabilities = build_capabilities(
+                follow_up_workspace, follow_up_dependencies.skills,
+                trigger_sequence=follow_up_trigger["sequence"],
+                project_id=self.project["id"],
+                tool_permissions=definition.tool_permissions,
+                approval_mode="confirm_every_call",
+            )
+            self.reveal_deferred_test_tools(agent, follow_up_capabilities)
+            follow_up_results: list[Any] = []
+            follow_up_failures: list[BaseException] = []
+
+            def run_follow_up() -> None:
+                try:
+                    with agent.override(model=ReadOnlyCommandModel(
+                        call_tools=["run_command"], custom_output_text="The checkout is clean.",
+                    )):
+                        follow_up_results.append(asyncio.run(agent.run(
+                            "Check the checkout status.", deps=follow_up_dependencies,
+                            capabilities=follow_up_capabilities,
+                            conversation_id=f"tribe:{other_mission['id']}:builder:remembered-command",
+                        )))
+                except BaseException as error:  # noqa: BLE001 - surfaced below
+                    follow_up_failures.append(error)
+
+            follow_up_worker = threading.Thread(target=run_follow_up, daemon=True)
+            follow_up_worker.start()
+            try:
+                deadline = time.monotonic() + 10
+                pending_after_grant = []
+                while follow_up_worker.is_alive() and time.monotonic() < deadline:
+                    pending_after_grant = [
+                        row for row in reopened_store.pending_interactions()
+                        if row["mission_id"] == other_mission["id"]
+                    ]
+                    if pending_after_grant:
+                        break
+                    time.sleep(0.05)
+                if pending_after_grant:
+                    reopened_store.resolve_interaction(pending_after_grant[0]["id"], "denied")
+                follow_up_worker.join(timeout=2)
+                self.assertFalse(
+                    pending_after_grant,
+                    "the remembered project command asked again",
+                )
+                self.assertFalse(follow_up_worker.is_alive(), "the remembered command did not finish")
+                self.assertFalse(follow_up_failures, str(follow_up_failures))
+                self.assertEqual(len(follow_up_results), 1)
+                self.assertEqual(follow_up_results[0].output, "The checkout is clean.")
+                self.assertEqual(reopened_store.pending_interactions(), [])
+            finally:
+                follow_up_worker.join(timeout=1)
+                if follow_up_dependencies.file_locks is not None:
+                    for lock in follow_up_dependencies.file_locks.values():
+                        lock.close()
+                    follow_up_dependencies.file_locks.clear()
+        finally:
+            worker.join(timeout=1)
+            secure_key.stop()
+            if dependencies.file_locks is not None:
+                for lock in dependencies.file_locks.values():
+                    lock.close()
+                dependencies.file_locks.clear()
+
     def test_web_search_requires_exact_approval_then_resumes_once(self) -> None:
         from ddgs.ddgs import DDGS
         from pydantic_ai import Agent
@@ -1752,11 +3757,18 @@ for line in sys.stdin:
 
         workspace = WorkspaceTools(self.store, self.mission["id"], "researcher")
         skills = SkillCatalog(self.repository)
+        automatic_reviews: list[dict[str, Any]] = []
+
+        async def permissive_reviewer(**request):
+            automatic_reviews.append(request)
+            return {"decision": "approve", "reason": "Test reviewer approves everything."}
+
         capabilities = build_capabilities(
             workspace, skills, trigger_sequence=1,
             step_store=SqliteStepStore(database=self.store.data_dir / "web-approval-steps.sqlite3"),
             web_access={"enabled": True, "allowedDomains": ["docs.python.org"]},
             tool_permissions=("duckduckgo_search", "web_fetch"),
+            approval_mode="auto_review", approval_reviewer=permissive_reviewer,
         )
         self.assertTrue(any(isinstance(capability, WebSearch) for capability in capabilities))
         fetch = next(capability for capability in capabilities if isinstance(capability, WebFetch))
@@ -1775,10 +3787,12 @@ for line in sys.stdin:
                 failures.append(error)
 
         worker = threading.Thread(target=run_agent)
+        secure_key = patch("tribe_runtime.secure_storage.workspace_key", return_value=b"t" * 32)
         with patch.object(DDGS, "text", return_value=[{
             "title": "Python documentation", "href": "https://docs.python.org/",
             "body": "The Python documentation.",
         }]) as search:
+            secure_key.start()
             worker.start()
             try:
                 deadline = time.monotonic() + 10
@@ -1795,20 +3809,27 @@ for line in sys.stdin:
                 row = self.store.deferred_tool_approvals(self.mission["id"], "researcher")[0]
                 self.assertEqual(row["tool_name"], "duckduckgo_search")
                 self.assertFalse(search.called, "web search ran before the approval decision")
+                self.assertEqual(automatic_reviews, [], "auto-review must not approve external web requests")
                 self.store.resolve_interaction(interaction["id"], "approved_once")
                 worker.join(timeout=10)
                 self.assertFalse(worker.is_alive(), "approved web search did not resume")
                 self.assertFalse(failures, str(failures))
                 self.assertTrue(search.called)
+                self.assertEqual(automatic_reviews, [], "web access must stay outside command auto-review")
                 row = self.store.deferred_tool_approvals(self.mission["id"], "researcher")[0]
                 self.assertEqual(row["status"], "consumed")
             finally:
                 worker.join(timeout=1)
+                secure_key.stop()
 
     def test_browser_action_requires_exact_approval_and_redacts_form_values(self) -> None:
         from pydantic_ai import Agent
         from pydantic_ai.models.test import TestModel
         from pydantic_ai_harness.step_persistence import SqliteStepStore
+
+        keyring_patch = patch("tribe_runtime.secure_storage.workspace_key", return_value=b"t" * 32)
+        keyring_patch.start()
+        self.addCleanup(keyring_patch.stop)
 
         workspace = WorkspaceTools(self.store, self.mission["id"], "builder")
         capabilities = build_capabilities(
@@ -1854,8 +3875,8 @@ for line in sys.stdin:
             self.assertEqual(interaction["target"], "Browser session")
             self.assertIn("text omitted", interaction["details"])
             row = self.store.deferred_tool_approvals(self.mission["id"], "builder")[0]
-            self.assertEqual(row["tool_arguments"]["value"], "[redacted]")
-            self.assertEqual(row["tool_arguments"]["selector"], "[redacted]")
+            self.assertIn("text omitted", row["tool_arguments"]["value"])
+            self.assertIn("text omitted", row["tool_arguments"]["selector"])
             self.assertNotIn('"value":"a"', row["message_history"])
             self.assertEqual(called, [])
             self.store.resolve_interaction(interaction["id"], "approved_once")
@@ -1985,6 +4006,10 @@ for line in sys.stdin:
         from pydantic_ai.models.test import TestModel
         from pydantic_ai_harness.step_persistence import SqliteStepStore
 
+        keyring_patch = patch("tribe_runtime.secure_storage.workspace_key", return_value=b"t" * 32)
+        keyring_patch.start()
+        self.addCleanup(keyring_patch.stop)
+
         marker = self.root / "mcp-action-ran.txt"
         server_script = self.repository / "mcp_mutation_server.py"
         server_script.write_text(
@@ -2081,6 +4106,144 @@ for line in sys.stdin:
         finally:
             worker.join(timeout=1)
 
+    def test_non_read_only_mcp_approval_is_one_time_even_after_restart(self) -> None:
+        from pydantic_ai import Agent
+        from pydantic_ai.models.test import TestModel
+        from pydantic_ai_harness.step_persistence import SqliteStepStore
+
+        marker = self.root / "mcp-project-grant-ran.txt"
+        server_script = self.repository / "mcp_project_grant_server.py"
+        server_script.write_text(
+            """import json, pathlib, sys
+marker = pathlib.Path(sys.argv[1])
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get('method')
+    if not method or 'id' not in request:
+        continue
+    if method == 'initialize':
+        result = {'protocolVersion': request['params']['protocolVersion'],
+                  'capabilities': {'tools': {}}, 'serverInfo': {'name': 'test', 'version': '1'}}
+    elif method == 'tools/list':
+        result = {'tools': [{'name': 'inspect', 'description': 'Inspect the configured project',
+                             'inputSchema': {'type': 'object', 'properties': {}}}]}
+    elif method == 'tools/call':
+        with marker.open('a', encoding='utf-8') as output:
+            output.write('called\\n')
+        result = {'content': [{'type': 'text', 'text': 'inspection complete'}]}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}) + '\\n')
+    sys.stdout.flush()
+""",
+            encoding="utf-8",
+        )
+        self.store.set_project_approval_policy(self.project["id"], "confirm_every_call")
+        registry = MCPRegistry(self.store)
+        registry.save_config(self.project["id"], {
+            "mcpServers": {"fixture": {
+                "command": sys.executable,
+                "args": [str(server_script), str(marker)],
+                "cwd": ".",
+            }},
+        })
+
+        with patch("tribe_runtime.secure_storage.workspace_key", return_value=b"t" * 32):
+            action_capability = tool_action_approval_capability(
+                "fixture_inspect", {}, self.store.data_dir,
+            )
+            self.assertIsNotNone(action_capability)
+
+            def start_call(store: MissionStore, tool_registry: MCPRegistry, conversation: str):
+                workspace = WorkspaceTools(store, self.mission["id"], "tester")
+                capabilities = build_capabilities(
+                    workspace, SkillCatalog(self.repository), trigger_sequence=1,
+                    step_store=SqliteStepStore(
+                        database=store.data_dir / f"{conversation.rsplit(':', 1)[-1]}-steps.sqlite3",
+                    ),
+                    mcp_registry=tool_registry, project_id=self.project["id"],
+                    approval_mode="confirm_every_call",
+                )
+                agent = Agent(TestModel(
+                    call_tools=["fixture_inspect"], custom_output_text="Inspection complete."
+                ))
+                outcome: list[object] = []
+                failures: list[BaseException] = []
+
+                def run_agent() -> None:
+                    try:
+                        outcome.append(asyncio.run(agent.run(
+                            "Inspect the project metadata.", deps=None,
+                            capabilities=capabilities,
+                            toolsets=tool_registry.load_toolsets(self.project["id"], ("mcp:*",)),
+                            conversation_id=conversation,
+                        )))
+                    except Exception as error:  # noqa: BLE001 - capture provider-thread failures for assertions
+                        failures.append(error)
+
+                worker = threading.Thread(target=run_agent, daemon=True)
+                worker.start()
+                return worker, outcome, failures
+
+            worker, outcome, failures = start_call(
+                self.store, registry, f"test:{self.mission['id']}:tester:project-grant-first",
+            )
+            interaction = None
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                pending = [item for item in self.store.pending_interactions()
+                           if item["mission_id"] == self.mission["id"]]
+                if pending:
+                    interaction = pending[0]
+                    break
+                if not worker.is_alive():
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(interaction, f"MCP action did not ask first: {failures}")
+            self.assertFalse(marker.exists(), "MCP side effects must wait for approval")
+            self.assertFalse(interaction["persistent_access_available"])
+            with self.assertRaisesRegex(ValueError, "persistent_access_not_available_for_this_action"):
+                self.store.resolve_interaction(interaction["id"], "approved_once", access_scope="project")
+            self.store.resolve_interaction(interaction["id"], "approved_once")
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive(), "project-approved MCP call did not resume")
+            self.assertFalse(failures, str(failures))
+            self.assertEqual(len(outcome), 1)
+            self.assertEqual(outcome[0].output, "Inspection complete.")
+            self.assertEqual(marker.read_text(encoding="utf-8"), "called\n")
+
+            restarted_store = MissionStore(self.root / "data" / "tribe.sqlite3")
+            self.assertFalse(restarted_store.has_access_grant(
+                self.mission["id"], self.project["id"], action_capability,
+            ))
+            restarted_registry = MCPRegistry(restarted_store)
+            replay, replay_outcome, replay_failures = start_call(
+                restarted_store, restarted_registry,
+                f"test:{self.mission['id']}:tester:project-grant-replay",
+            )
+            replay_interaction = None
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                replay_pending = [item for item in restarted_store.pending_interactions()
+                                  if item["mission_id"] == self.mission["id"]]
+                if replay_pending:
+                    replay_interaction = replay_pending[0]
+                    break
+                if not replay.is_alive():
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(replay_interaction, f"MCP action did not ask again: {replay_failures}")
+            self.assertFalse(replay_interaction["persistent_access_available"])
+            self.assertEqual(marker.read_text(encoding="utf-8"), "called\n")
+            restarted_store.resolve_interaction(replay_interaction["id"], "approved_once")
+            replay.join(timeout=5)
+            self.assertFalse(replay.is_alive(), "one-time MCP approval did not settle")
+            self.assertFalse(replay_failures, str(replay_failures))
+            self.assertEqual(len(replay_outcome), 1)
+            self.assertEqual(replay_outcome[0].output, "Inspection complete.")
+            self.assertEqual(marker.read_text(encoding="utf-8"), "called\ncalled\n")
+            self.assertEqual(restarted_store.pending_interactions(), [])
+
     def test_claim_is_exclusive_per_agent_and_shared_across_agents(self) -> None:
         first = self.store.create_work_item(self.mission["id"], "First")
         second = self.store.create_work_item(self.mission["id"], "Second")
@@ -2093,6 +4256,54 @@ for line in sys.stdin:
         self.assertEqual(reviewer_claim["id"], second["id"])
         self.assertEqual(self.store.renew_work_claims(self.mission["id"], "builder"), 1)
         self.assertIsNone(self.store.complete_work(first["id"], "reviewer", "wrong owner"))
+
+    def test_plan_claims_gate_goal_driven_repository_actions_only(self) -> None:
+        # Ordinary chats keep repository work direct; only the optional SDLC workflow
+        # binds edits and commands to a claimed plan item.
+        self.store.require_work_claim(self.mission["id"], "builder", None)
+        self.store.select_mission_workflow(self.mission["id"], "user", {
+            "id": "goal-driven-sdlc", "version": 1,
+            "instructions": "Use claimed plan work for repository changes.",
+        })
+        # A selected workflow must not make a direct request wait for an empty
+        # planning board to be populated first.
+        self.store.require_work_claim(self.mission["id"], "builder", None)
+        item = self.store.create_work_item(self.mission["id"], "Change a repository file")
+        with self.assertRaisesRegex(PermissionError, "repository_action_requires_a_live_work_claim"):
+            self.store.require_work_claim(self.mission["id"], "builder", None)
+
+        claim = self.store.claim_work(self.mission["id"], "builder", work_item_id=item["id"])
+        self.assertIsNotNone(claim)
+        self.store.require_work_claim(self.mission["id"], "builder", item["id"])
+        self.store.require_work_claim(self.mission["id"], "builder", None)
+        with self.assertRaisesRegex(PermissionError, "repository_action_requires_a_live_work_claim"):
+            self.store.require_work_claim(self.mission["id"], "reviewer", item["id"])
+
+        self.store.release_work_claim(self.mission["id"], "builder", item["id"], "Done with this attempt")
+        with self.assertRaisesRegex(PermissionError, "repository_action_requires_a_live_work_claim"):
+            self.store.require_work_claim(self.mission["id"], "builder", item["id"])
+
+        # Once the tracked work is complete, a new direct request is actionable
+        # without an artificial placeholder item.
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], "builder", work_item_id=item["id"],
+        ))
+        self.assertIsNotNone(self.store.complete_work(
+            item["id"], "builder", "Tracked work is complete",
+        ))
+        self.store.require_work_claim(self.mission["id"], "builder", None)
+
+        expiring = self.store.create_work_item(self.mission["id"], "Run while the claim is current")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], "builder", work_item_id=expiring["id"],
+        ))
+        with self.store._connect() as db:
+            db.execute(
+                "UPDATE work_items SET lease_until = ? WHERE id = ?",
+                ("2000-01-01T00:00:00+00:00", expiring["id"]),
+            )
+        with self.assertRaisesRegex(PermissionError, "repository_action_requires_a_live_work_claim"):
+            self.store.require_work_claim(self.mission["id"], "builder", expiring["id"])
 
     def test_agent_can_release_only_its_own_claim_for_another_role(self) -> None:
         item = self.store.create_work_item(self.mission["id"], "Independent review")
@@ -2142,6 +4353,367 @@ TAP version 13
         self.assertEqual(first["payload"]["testCount"], 2)
         self.assertEqual(first["payload"]["sourceToolCallId"], "shell-call-1")
         self.assertEqual(first["payload"]["sourceToolEventId"], "tool-event-1")
+        run = self.store.background_run(first["payload"]["runId"])
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["argv"][:2], ["node", "--test"])
+        self.assertIn("# pass 2", run["output"])
+        self.assertEqual(len([
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.command.completed"
+            and event["payload"].get("runId") == first["payload"]["runId"]
+        ]), 1)
+
+    def test_harness_repository_test_run_evidence_is_durable_and_idempotent(self) -> None:
+        first = self.store.record_harness_test_run_result(
+            self.mission["id"], "builder", 19, "shell-pytest-call",
+            "pytest -q runtime/tests", "1 failed in 0.04s\n[exit code: 1]",
+            "task-1", "pytest-tool-event",
+        )
+        duplicate = self.store.record_harness_test_run_result(
+            self.mission["id"], "builder", 19, "shell-pytest-call",
+            "pytest -q runtime/tests", "1 failed in 0.04s\n[exit code: 1]", "task-1",
+        )
+
+        self.assertEqual(first["id"], duplicate["id"])
+        self.assertEqual(first["type"], "repo.test_run.completed")
+        self.assertEqual(first["payload"]["exitCode"], 1)
+        self.assertEqual(first["payload"]["argv"][0], "pytest")
+        self.assertEqual(first["payload"]["source"], "pydantic_ai_harness_test")
+        self.assertEqual(first["payload"]["sourceToolEventId"], "pytest-tool-event")
+        run = self.store.background_run(first["payload"]["runId"])
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["exit_code"], 1)
+        self.assertEqual(run["output"], "1 failed in 0.04s\n[exit code: 1]")
+        self.assertEqual(len([
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.completed"
+            and event["payload"].get("sourceToolCallId") == "shell-pytest-call"
+        ]), 1)
+
+    def test_harness_timeout_and_interrupt_statuses_are_not_ordinary_test_failures(self) -> None:
+        failure_schedule = self.store.create_schedule(
+            self.project["id"], "Review test failures", "Investigate a test failure", "event", "UTC",
+            trigger_event_type="repo.test_run.failed", event_source_mission_id=self.mission["id"],
+        )
+        results = (
+            ("timed-out-call", "[exit code: 124]", "failed", True, False),
+            ("interrupted-call", "[exit code: 130]", "cancelled", False, True),
+            ("signal-terminated-call", "[exit code: -15]", "cancelled", False, True),
+        )
+        for call_id, output, status, timed_out, cancelled in results:
+            with self.subTest(call_id=call_id):
+                event = self.store.record_harness_test_run_result(
+                    self.mission["id"], "builder", 20, call_id,
+                    "pytest -q tests", output, None,
+                )
+
+                self.assertTrue(event["payload"]["timedOut"] is timed_out)
+                self.assertTrue(event["payload"]["cancelled"] is cancelled)
+                run = self.store.background_run(event["payload"]["runId"])
+                self.assertEqual(run["status"], status)
+
+        self.assertNotIn(
+            failure_schedule["id"],
+            {entry["scheduleId"] for entry in self.store.claim_event_schedules()},
+        )
+
+    def test_harness_test_trigger_rejects_shell_expansion_and_symlink_escape(self) -> None:
+        from tribe_runtime.tool_activity import repository_test_command_argv
+
+        root = self.repository
+        self.assertEqual(
+            repository_test_command_argv("pytest -q tests/test_runtime_core.py", cwd=root),
+            ["pytest", "-q", "tests/test_runtime_core.py"],
+        )
+        self.assertIsNone(repository_test_command_argv('pytest "$HOME/tests"', cwd=root))
+        self.assertIsNone(repository_test_command_argv("pytest ~/tests", cwd=root))
+
+        with tempfile.TemporaryDirectory() as outside:
+            outside_tests = Path(outside) / "tests"
+            outside_tests.mkdir()
+            escape = root / "outside-tests"
+            escape.symlink_to(outside_tests, target_is_directory=True)
+            try:
+                self.assertIsNone(repository_test_command_argv(
+                    "pytest outside-tests", cwd=root,
+                ))
+            finally:
+                escape.unlink(missing_ok=True)
+
+    def test_harness_background_test_result_is_durable_and_idempotent(self) -> None:
+        command_id = "a" * 32
+        started = self.store.record_harness_test_run_started(
+            self.mission["id"], "builder", 21, command_id,
+            "pytest -q tests/test_runtime_core.py", "task-1",
+            str(self.repository), "start-tool-call",
+        )
+        duplicate_start = self.store.record_harness_test_run_started(
+            self.mission["id"], "builder", 21, command_id,
+            "pytest -q tests/test_runtime_core.py", "task-1",
+            str(self.repository), "start-tool-call",
+        )
+        running = self.store.background_run(started["payload"]["runId"])
+        self.assertEqual(running["status"], "running")
+        self.assertIsNone(running["exit_code"])
+        self.assertIsNone(running["finished_at"])
+        retried_start = self.store.record_harness_test_run_started(
+            self.mission["id"], "builder", 22, "c" * 32,
+            "pytest -q tests/test_runtime_core.py", "task-1",
+            str(self.repository), "start-tool-call",
+        )
+        output = "[stdout]\n1 passed in 0.04s\n[status: finished]\n[exit code: 0]"
+        completed = self.store.record_harness_test_run_result(
+            self.mission["id"], "builder", 22, "check-tool-call",
+            started["payload"]["command"], output, "task-1", "check-tool-event",
+            run_id=started["payload"]["runId"], cwd=started["payload"]["cwd"],
+            source="pydantic_ai_harness_background_test",
+        )
+        duplicate_completion = self.store.record_harness_test_run_result(
+            self.mission["id"], "builder", 23, "check-tool-call-retry",
+            started["payload"]["command"], output, "task-1",
+            run_id=started["payload"]["runId"], cwd=started["payload"]["cwd"],
+            source="pydantic_ai_harness_background_test",
+        )
+
+        retried_completion = self.store.record_harness_test_run_result(
+            self.mission["id"], "builder", 24, "retry-check-tool-call",
+            retried_start["payload"]["command"], output, "task-1",
+            run_id=retried_start["payload"]["runId"], cwd=retried_start["payload"]["cwd"],
+            source="pydantic_ai_harness_background_test",
+        )
+
+        self.assertEqual(started["id"], duplicate_start["id"])
+        self.assertNotEqual(started["id"], retried_start["id"])
+        self.assertEqual(started["payload"]["runId"], retried_start["payload"]["runId"])
+        self.assertEqual(retried_start["payload"]["harnessCommandId"], "c" * 32)
+        self.assertEqual(completed["id"], duplicate_completion["id"])
+        self.assertEqual(completed["id"], retried_completion["id"])
+        self.assertEqual(completed["payload"]["source"], "pydantic_ai_harness_background_test")
+        self.assertEqual(completed["payload"]["exitCode"], 0)
+        self.assertEqual(completed["payload"]["sourceToolEventId"], "check-tool-event")
+        run = self.store.background_run(started["payload"]["runId"])
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["exit_code"], 0)
+        self.assertIsNotNone(run["finished_at"])
+        self.assertIn("1 passed", run["output"])
+        self.assertEqual(len([
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.completed"
+            and event["payload"].get("runId") == started["payload"]["runId"]
+        ]), 1)
+        self.assertEqual(len([
+            run for run in self.store.background_runs(self.mission["id"])
+            if run["id"] == started["payload"]["runId"]
+        ]), 1)
+        self.assertIsNone(self.store.record_harness_test_run_started(
+            self.mission["id"], "builder", 24, "b" * 32,
+            "python -c print('not a test')", "task-1", str(self.repository),
+        ))
+
+    def test_harness_foreground_test_commands_reach_runs_once_and_ignore_generic_shell_output(self) -> None:
+        from pydantic_ai.messages import (
+            FunctionToolCallEvent, FunctionToolResultEvent, ToolCallPart, ToolReturnPart,
+        )
+        from pydantic_ai.models.test import TestModel
+
+        item = self.store.create_work_item(self.mission["id"], "Run Harness foreground tests")
+        self.assertIsNotNone(self.store.claim_work(self.mission["id"], "builder", work_item_id=item["id"]))
+        successful_schedule = self.store.create_schedule(
+            self.project["id"], "Review successful Harness tests", "Review the result", "event", "UTC",
+            trigger_event_type="repo.test_run.completed", event_source_mission_id=self.mission["id"],
+        )
+        failed_schedule = self.store.create_schedule(
+            self.project["id"], "Investigate Harness test failures", "Find the cause", "event", "UTC",
+            trigger_event_type="repo.test_run.failed", event_source_mission_id=self.mission["id"],
+        )
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Run repository tests", "builder.md",
+            tool_permissions=("run_command",),
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"], trigger_sequence=self.store.latest_sequence(self.mission["id"]),
+        )
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()):
+            agent = _build_agent(definition, "openai:test-model")
+        async def working_dir() -> str:
+            return str(self.repository)
+
+        context = SimpleNamespace(deps=dependencies, workspace=SimpleNamespace(working_dir=working_dir))
+
+        async def dispatch(event):
+            for entry in agent._event_hooks._get("on_event"):
+                if not entry.event_types or isinstance(event, entry.event_types):
+                    await entry.func(context, event)
+
+        async def run_command(tool_call_id: str, command: str, output: str):
+            await dispatch(FunctionToolCallEvent(
+                part=ToolCallPart("run_command", {"command": command}, tool_call_id=tool_call_id),
+                args_valid=True,
+            ))
+            await dispatch(FunctionToolResultEvent(part=ToolReturnPart(
+                "run_command", output, tool_call_id=tool_call_id,
+            )))
+
+        success_output = "[stdout]\n2 passed\n[exit code: 0]"
+        failure_output = "[stdout]\n1 failed\n[exit code: 1]"
+        asyncio.run(run_command("foreground-success", "pytest -q tests", success_output))
+        asyncio.run(run_command("foreground-success", "pytest -q tests", success_output))
+        asyncio.run(run_command("foreground-failure", "pytest -q tests", failure_output))
+        asyncio.run(run_command("generic-shell", "printf 'tests passed'", "tests passed"))
+
+        test_events = [event for event in self.store.events_after(self.mission["id"], 0)
+                       if event["type"] == "repo.test_run.completed"]
+        self.assertEqual(len(test_events), 2)
+        self.assertEqual({event["payload"]["exitCode"] for event in test_events}, {0, 1})
+        self.assertEqual(len({event["payload"]["runId"] for event in test_events}), 2)
+        runs = self.store.background_runs(self.mission["id"])
+        self.assertEqual(len([run for run in runs if run["status"] in {"completed", "failed"}]), 2)
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual(
+            {entry["scheduleId"] for entry in claimed},
+            {successful_schedule["id"], failed_schedule["id"]},
+        )
+
+    def test_harness_background_test_events_reach_runs_and_schedule_through_agent_hooks(self) -> None:
+        from pydantic_ai.messages import (
+            FunctionToolCallEvent, FunctionToolResultEvent, ToolCallPart, ToolReturnPart,
+        )
+        from pydantic_ai.models.test import TestModel
+
+        item = self.store.create_work_item(self.mission["id"], "Run the selected test command")
+        self.assertIsNotNone(self.store.claim_work(self.mission["id"], "builder", work_item_id=item["id"]))
+        target = self.store.create_mission(self.project["id"], "Review Harness tests", "Review test output")
+        schedule = self.store.create_schedule(
+            self.project["id"], "Review completed tests", "Summarize the test result", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=self.mission["id"], target_mission_id=target["id"],
+        )
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Run repository tests", "builder.md",
+            tool_permissions=("start_command", "check_command"),
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"], trigger_sequence=self.store.latest_sequence(self.mission["id"]),
+        )
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()):
+            agent = _build_agent(definition, "openai:test-model")
+        async def working_dir() -> str:
+            return str(self.repository)
+
+        context = SimpleNamespace(deps=dependencies, workspace=SimpleNamespace(working_dir=working_dir))
+
+        async def dispatch(event):
+            for entry in agent._event_hooks._get("on_event"):
+                if not entry.event_types or isinstance(event, entry.event_types):
+                    await entry.func(context, event)
+
+        command_id = "e" * 32
+        asyncio.run(dispatch(FunctionToolCallEvent(
+            part=ToolCallPart("start_command", {"command": "pytest -q tests"}, tool_call_id="start"),
+            args_valid=True,
+        )))
+        asyncio.run(dispatch(FunctionToolResultEvent(part=ToolReturnPart(
+            "start_command", f"Started background command.\nID: {command_id}", tool_call_id="start",
+        ))))
+        asyncio.run(dispatch(FunctionToolCallEvent(
+            part=ToolCallPart("check_command", {"command_id": command_id}, tool_call_id="check"),
+            args_valid=True,
+        )))
+        asyncio.run(dispatch(FunctionToolResultEvent(part=ToolReturnPart(
+            "check_command", "[stdout]\n2 passed in 0.04s\n[status: finished]\n[exit code: 0]",
+            tool_call_id="check",
+        ))))
+        asyncio.run(dispatch(FunctionToolCallEvent(
+            part=ToolCallPart("check_command", {"command_id": command_id}, tool_call_id="check-retry"),
+            args_valid=True,
+        )))
+        asyncio.run(dispatch(FunctionToolResultEvent(part=ToolReturnPart(
+            "check_command", "[stdout]\n2 passed in 0.04s\n[status: finished]\n[exit code: 0]",
+            tool_call_id="check-retry",
+        ))))
+        asyncio.run(dispatch(FunctionToolCallEvent(
+            part=ToolCallPart("run_command", {"command": "printf '2 passed'"}, tool_call_id="generic"),
+            args_valid=True,
+        )))
+        asyncio.run(dispatch(FunctionToolResultEvent(part=ToolReturnPart(
+            "run_command", "2 passed", tool_call_id="generic",
+        ))))
+
+        run_id = f"harness:{self.mission['id']}:{command_id}"
+        test_events = [event for event in self.store.events_after(self.mission["id"], 0)
+                       if event["type"] == "repo.test_run.completed"]
+        self.assertEqual(len(test_events), 1)
+        self.assertEqual(test_events[0]["payload"]["runId"], run_id)
+        self.assertEqual(test_events[0]["payload"]["source"], "pydantic_ai_harness_background_test")
+        run = self.store.background_run(run_id)
+        self.assertEqual(run["status"], "completed")
+        self.assertIn("2 passed", run["output"])
+        self.assertEqual([entry["scheduleId"] for entry in self.store.claim_event_schedules()], [schedule["id"]])
+
+    def test_harness_timeout_and_signal_statuses_do_not_trigger_failure_schedules(self) -> None:
+        from pydantic_ai.messages import FunctionToolCallEvent, FunctionToolResultEvent, ToolCallPart, ToolReturnPart
+        from pydantic_ai.models.test import TestModel
+
+        item = self.store.create_work_item(self.mission["id"], "Check interrupted test results")
+        self.assertIsNotNone(self.store.claim_work(self.mission["id"], "builder", work_item_id=item["id"]))
+        self.store.create_schedule(
+            self.project["id"], "Handle test failures", "Investigate an ordinary failure", "event", "UTC",
+            trigger_event_type="repo.test_run.failed", event_source_mission_id=self.mission["id"],
+        )
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Run repository tests", "builder.md",
+            tool_permissions=("start_command", "check_command"),
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"], trigger_sequence=self.store.latest_sequence(self.mission["id"]),
+        )
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()):
+            agent = _build_agent(definition, "openai:test-model")
+
+        async def working_dir() -> str:
+            return str(self.repository)
+
+        context = SimpleNamespace(deps=dependencies, workspace=SimpleNamespace(working_dir=working_dir))
+
+        async def dispatch(event):
+            for entry in agent._event_hooks._get("on_event"):
+                if not entry.event_types or isinstance(event, entry.event_types):
+                    await entry.func(context, event)
+
+        for suffix, exit_code in (("timeout", 124), ("signal", -15)):
+            command_id = ("f" if suffix == "timeout" else "a") * 32
+            start_id, check_id = f"start-{suffix}", f"check-{suffix}"
+            asyncio.run(dispatch(FunctionToolCallEvent(
+                part=ToolCallPart("start_command", {"command": "pytest -q tests"}, tool_call_id=start_id),
+                args_valid=True,
+            )))
+            asyncio.run(dispatch(FunctionToolResultEvent(part=ToolReturnPart(
+                "start_command", f"Started background command.\nID: {command_id}", tool_call_id=start_id,
+            ))))
+            asyncio.run(dispatch(FunctionToolCallEvent(
+                part=ToolCallPart("check_command", {"command_id": command_id}, tool_call_id=check_id),
+                args_valid=True,
+            )))
+            asyncio.run(dispatch(FunctionToolResultEvent(part=ToolReturnPart(
+                "check_command",
+                f"[stdout]\n1 failed in 0.2s\n[status: finished]\n[exit code: {exit_code}]",
+                tool_call_id=check_id,
+            ))))
+
+        results = [event["payload"] for event in self.store.events_after(self.mission["id"], 0)
+                   if event["type"] == "repo.test_run.completed"]
+        self.assertEqual(len(results), 2)
+        self.assertEqual(
+            [(result["cancelled"], result["timedOut"]) for result in results],
+            [(False, True), (True, False)],
+        )
+        self.assertEqual(self.store.claim_event_schedules(), [])
 
     def test_harness_test_evidence_rejects_incomplete_or_non_test_output(self) -> None:
         self.assertIsNone(self.store.record_harness_node_test_result(
@@ -2796,7 +5368,6 @@ TAP version 13
         self.assertEqual(len(result["event"]["payload"]["acceptanceEvidence"]), 2)
         self.assertEqual(result["event"]["payload"]["evidenceRefs"][0]["id"], passed_run["id"])
         self.assertEqual(self.store.mission(self.mission["id"])["status"], "completed")
-        self.assertIsNone(self.store.activate_mission(self.mission["id"]))
         review = self.store.review_mission_outcome(self.mission["id"], "follow_up", "One edge case needs a follow-up.")
         self.assertEqual(review["type"], "mission.outcome.reviewed")
         self.assertEqual(review["actorId"], "user")
@@ -2809,6 +5380,8 @@ TAP version 13
             for mission in exported["missions"]
             for event in mission["events"]
         ))
+        reopened = self.store.activate_mission(self.mission["id"])
+        self.assertEqual(reopened["status"], "active")
         optional_mission = self.store.create_mission(
             self.project["id"], "Optional plan work", "Complete without workflow gates",
         )
@@ -3478,7 +6051,7 @@ TAP version 13
         )
         failure = {
             "exit_code": 1, "stdout": "1 failed", "stderr": "assertion mismatch",
-            "timed_out": False, "cancelled": False,
+            "timed_out": False, "cancelled": False, "started": True,
         }
         with patch("tribe_runtime.commands.run_foreground_process", return_value=failure):
             thread = threading.Thread(target=worker.run)
@@ -3930,8 +6503,9 @@ os._exit(27)
 
     def test_bootstrap_restores_durable_background_command_runs(self) -> None:
         run = self.store.create_background_run(
-            self.mission["id"], ["pytest", "-q"], str(self.repository), 4567
+            self.mission["id"], ["pytest", "-q"], str(self.repository)
         )
+        run = self.store.mark_background_run_running(run["id"], 4567)
         self.store.update_background_output(run["id"], "2 passed\n")
         finished = self.store.finish_background_run(run["id"], "completed", 0)
 
@@ -3947,8 +6521,19 @@ os._exit(27)
         self.assertEqual(finished["id"], restored["id"])
 
     def test_startup_marks_unmonitored_background_commands_interrupted(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Review completed tests", "Summarise the test result", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=self.mission["id"],
+        )
         run = self.store.create_background_run(
-            self.mission["id"], ["pytest", "-q"], str(self.repository), 4567
+            self.mission["id"], ["pytest", "-q"], str(self.repository)
+        )
+        run = self.store.mark_background_run_running(run["id"], 4567)
+        # A crash after persisting intent but before recording the child PID is
+        # also recoverable, and must not be mistaken for an unstarted command.
+        starting = self.store.create_background_run(
+            self.mission["id"], ["npm", "run", "build"], str(self.repository)
         )
 
         self.store.recover_background_runs()
@@ -3956,18 +6541,33 @@ os._exit(27)
         recovered = self.store.background_run(run["id"])
         self.assertEqual(recovered["status"], "interrupted")
         self.assertIsNone(recovered["exit_code"])
+        recovered_starting = self.store.background_run(starting["id"])
+        self.assertEqual(recovered_starting["status"], "interrupted")
+        self.assertEqual(recovered_starting["argv"], ["npm", "run", "build"])
+        self.assertEqual(recovered_starting["cwd"], str(self.repository))
+        self.assertIsNone(recovered_starting["pid"])
+        restored = self.store.bootstrap(self.project["id"], self.mission["id"])["commandRuns"]
+        restored_starting = next(item for item in restored if item["id"] == starting["id"])
+        self.assertEqual(restored_starting["status"], "interrupted")
+        self.assertEqual(restored_starting["argv"], ["npm", "run", "build"])
+        self.assertEqual(restored_starting["cwd"], str(self.repository))
         events = self.store.events_after(self.mission["id"], 0)
         recovery_events = [event for event in events if event["type"] == "repo.command.completed"]
-        self.assertEqual(len(recovery_events), 1)
+        self.assertEqual(len(recovery_events), 2)
         self.assertEqual(recovery_events[0]["payload"], {
             "runId": run["id"], "status": "interrupted", "exitCode": None,
         })
+        self.assertFalse(any(
+            event["type"] == "repo.test_run.completed" for event in events
+        ))
+        self.assertEqual(self.store.claim_event_schedules(), [])
+        self.assertEqual(self.store.schedule_runs(schedule["id"])["runs"], [])
 
         self.store.recover_background_runs()
         self.assertEqual(len([
             event for event in self.store.events_after(self.mission["id"], 0)
             if event["type"] == "repo.command.completed"
-        ]), 1)
+        ]), 2)
 
     def test_pausing_a_mission_is_idempotent_and_audited(self) -> None:
         paused = self.store.pause_mission(self.mission["id"])
@@ -4075,6 +6675,18 @@ os._exit(27)
         )))
         self.assertFalse(_has_unresolved_harness_tool_effects(
             self.store.data_dir, self.mission["id"], "builder", 9,
+        ))
+
+        asyncio.run(step_store.record_tool_effect(ToolEffectRecord(
+            run_id="harness-run-1", tool_call_id="call-read", tool_name="sonarqube_search_issues",
+            status="started",
+        )))
+        self.assertTrue(_has_unresolved_harness_tool_effects(
+            self.store.data_dir, self.mission["id"], "builder", 9,
+        ))
+        self.assertFalse(_has_unresolved_harness_tool_effects(
+            self.store.data_dir, self.mission["id"], "builder", 9,
+            read_only_tool_names={"sonarqube_search_issues"},
         ))
 
     def test_mission_blocks_after_last_active_task_finishes_and_unblocks_when_plan_grows(self) -> None:
@@ -4283,6 +6895,52 @@ os._exit(27)
         with patch.dict(os.environ, {"MISTRAL_API_KEY": "test-secret"}, clear=True):
             self.assertEqual(get_api_key("mistral:mistral-large-latest"), "test-secret")
 
+    def test_approval_review_arguments_redact_credentials_and_bound_nested_data(self) -> None:
+        from tribe_runtime.credentials import redact_review_arguments
+
+        with patch.dict(os.environ, {"TRIBE_TEST_API_TOKEN": "environment-secret"}, clear=True):
+            redacted = redact_review_arguments({
+                "api_key": "field-secret",
+                "request": {
+                    "authorization": "Bearer nested-secret",
+                    "description": "contains environment-secret",
+                },
+                "items": ["safe", {"client_secret": "another-secret"}],
+                "command": "--token cli-secret Authorization: Bearer bearer-secret",
+                "note": "configured-keyring-secret",
+                "large": "x" * 7000,
+                "tail": [[[[[["too deep"]]]]]],
+            }, explicit_secrets=("configured-keyring-secret",))
+
+        self.assertEqual(redacted["api_key"], "[redacted]")
+        self.assertEqual(redacted["request"]["authorization"], "[redacted]")
+        self.assertEqual(redacted["request"]["description"], "contains [redacted]")
+        self.assertEqual(redacted["items"][1]["client_secret"], "[redacted]")
+        self.assertEqual(redacted["command"], "--token [redacted] Authorization: [redacted]")
+        self.assertEqual(redacted["note"], "[redacted]")
+        self.assertEqual(len(redacted["large"]), 6000)
+        self.assertEqual(redacted["tail"][0][0][0][0][0], "[nested data omitted]")
+
+    def test_repository_change_approval_preview_shows_redacted_bounded_diff(self) -> None:
+        preview = repository_change_approval_preview("edit_file", {
+            "path": "src/feature.js",
+            "old_text": "const count = 1;\nconst TOKEN = 'do-not-show';",
+            "new_text": "const count = 2;\nconst TOKEN = 'new-secret';",
+        })
+
+        self.assertIn("File: src/feature.js", preview)
+        self.assertIn("Before:\nconst count = 1;", preview)
+        self.assertIn("After:\nconst count = 2;", preview)
+        self.assertNotIn("do-not-show", preview)
+        self.assertNotIn("new-secret", preview)
+        self.assertIsNone(repository_change_approval_preview("run_command", {"command": "pwd"}))
+
+        large_preview = repository_change_approval_preview(
+            "write_file", {"path": "src/large.js", "content": "x" * 5000},
+        )
+        self.assertIn("preview truncated", large_preview)
+        self.assertLess(len(large_preview), 1700)
+
     def test_unlisted_pydantic_provider_uses_its_native_environment_credentials(self) -> None:
         supervisor = AgentSupervisor(self.store, [])
         definition = AgentDefinition("builder", "Builder", "Build", "Build safely.", "builder.md")
@@ -4375,7 +7033,9 @@ os._exit(27)
 
     def test_openai_compatible_local_endpoint_can_be_configured_without_a_key(self) -> None:
         supervisor = AgentSupervisor(self.store, [])
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "tribe_runtime.agent_runtime.get_api_key", return_value=None,
+        ):
             with patch("tribe_runtime.agent_runtime.save_api_key") as save_api_key:
                 status = supervisor.configure("openai:qwen3", "", "http://127.0.0.1:1234/v1")
             self.assertTrue(status["enabled"])
@@ -4751,7 +7411,11 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         ])
 
     def test_repository_deletion_needs_exact_one_use_approval(self) -> None:
-        workspace = WorkspaceTools(self.store, self.mission["id"], "builder")
+        work_item = self.store.create_work_item(self.mission["id"], "Delete the approved repository file")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], "builder", work_item_id=work_item["id"],
+        ))
+        workspace = WorkspaceTools(self.store, self.mission["id"], "builder", work_item["id"])
         target = workspace.resolve("README.md")
         fingerprint = workspace.file_fingerprint("README.md")
         wrong = self.store.create_repository_file_deletion_approval(
@@ -4910,10 +7574,14 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertEqual(json.loads(added["notebookVersions"]["after"]), updated)
 
     def test_test_commands_do_not_inherit_credentials_from_the_agent_process(self) -> None:
-        workspace = WorkspaceTools(self.store, self.mission["id"], "builder")
+        work_item = self.store.create_work_item(self.mission["id"], "Run the configured project tests")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], "builder", work_item_id=work_item["id"],
+        ))
+        workspace = WorkspaceTools(self.store, self.mission["id"], "builder", work_item["id"])
         completed = {
             "exit_code": 0, "stdout": "pytest 8", "stderr": "",
-            "timed_out": False, "cancelled": False,
+            "timed_out": False, "cancelled": False, "started": True,
         }
         with (
             patch.dict(os.environ, {
@@ -4925,7 +7593,14 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             }),
             patch("tribe_runtime.commands.run_foreground_process", return_value=completed) as run,
         ):
-            workspace.run_tests(["pytest", "--version"])
+            metadata_result = workspace.run_tests(["pytest", "--version"])
+            metadata_events = self.store.events_after(self.mission["id"], 0)
+            self.assertTrue(metadata_result["processStarted"])
+            self.assertFalse(any(
+                event["type"] in {"repo.test_run.started", "repo.test_run.completed"}
+                for event in metadata_events
+            ))
+            self.assertEqual(self.store.background_runs(self.mission["id"]), [])
             node_result = workspace.run_tests(["node", "--test", "tests/focus-timer.test.mjs"])
 
         environment = run.call_args.kwargs["env"]
@@ -4938,6 +7613,13 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertEqual(run.call_args.args[0], ["node", "--test", "tests/focus-timer.test.mjs"])
         self.assertEqual(node_result["argv"], ["node", "--test", "tests/focus-timer.test.mjs"])
         self.assertTrue(node_result["verificationEventId"])
+        completed_test_events = [
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.completed"
+        ]
+        self.assertEqual(len(completed_test_events), 1)
+        self.assertEqual(completed_test_events[0]["payload"]["runId"], node_result["runId"])
+        self.assertEqual(len(self.store.background_runs(self.mission["id"])), 1)
         completion_event = next(
             event for event in self.store.events_after(self.mission["id"], 0)
             if event["type"] == "repo.test_run.completed"
@@ -4945,6 +7627,240 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         )
         self.assertEqual(node_result["verificationEventId"], completion_event["id"])
         self.assertIsNone(run.call_args.kwargs["is_cancelled"])
+
+    def test_python_test_commands_prefer_the_venv_near_the_requested_tests(self) -> None:
+        work_item = self.store.create_work_item(self.mission["id"], "Run the runtime tests")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], "builder", work_item_id=work_item["id"],
+        ))
+        runtime = self.repository / "runtime"
+        test_target = runtime / "tests" / "test_runtime_core.py"
+        test_target.parent.mkdir(parents=True)
+        test_target.write_text("", encoding="utf-8")
+        (runtime / "pyproject.toml").write_text("[project]\nname = 'tribe-runtime'\n", encoding="utf-8")
+        script_dir = "Scripts" if os.name == "nt" else "bin"
+        python_name = "python.exe" if os.name == "nt" else "python"
+        project_python_bin = runtime / ".venv" / script_dir
+        project_python_bin.mkdir(parents=True)
+        (project_python_bin / python_name).write_text("test interpreter", encoding="utf-8")
+
+        workspace = WorkspaceTools(self.store, self.mission["id"], "builder", work_item["id"])
+        completed = {
+            "exit_code": 0, "stdout": "3 passed", "stderr": "",
+            "timed_out": False, "cancelled": False, "started": True,
+        }
+        with (
+            patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}),
+            patch("tribe_runtime.commands.run_foreground_process", return_value=completed) as run,
+        ):
+            result = workspace.run_tests(
+                ["python", "-m", "pytest", "runtime/tests/test_runtime_core.py"],
+                timeout_seconds=240,
+            )
+
+        effective_path = run.call_args.kwargs["env"]["PATH"].split(os.pathsep)
+        self.assertEqual(effective_path[0], str(project_python_bin.resolve()))
+        self.assertEqual(run.call_args.kwargs["timeout"], 240)
+        self.assertEqual(run.call_args.args[0], [
+            "python", "-m", "pytest", "runtime/tests/test_runtime_core.py",
+        ])
+        self.assertEqual(result["timeoutSeconds"], 240)
+        started_event = next(
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.started"
+        )
+        completed_event = next(
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.completed"
+        )
+        self.assertEqual(started_event["payload"]["timeoutSeconds"], 240)
+        self.assertEqual(completed_event["payload"]["timeoutSeconds"], 240)
+
+    def test_uv_run_project_pytest_preserves_focused_selection(self) -> None:
+        work_item = self.store.create_work_item(self.mission["id"], "Run focused runtime tests")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], "builder", work_item_id=work_item["id"],
+        ))
+        runtime = self.repository / "runtime"
+        runtime.mkdir(exist_ok=True)
+        (runtime / "pyproject.toml").write_text("[project]\nname='tribe-runtime'\n", encoding="utf-8")
+        workspace = WorkspaceTools(self.store, self.mission["id"], "builder", work_item["id"])
+        argv = [
+            "uv", "run", "--project", "runtime", "--extra", "test", "pytest",
+            "runtime/tests/test_runtime_core.py", "-k", "approval_review_scope", "-q",
+        ]
+        completed = {
+            "exit_code": 0, "stdout": "2 passed", "stderr": "",
+            "timed_out": False, "cancelled": False, "started": True,
+        }
+        with patch("tribe_runtime.commands.run_foreground_process", return_value=completed) as run:
+            result = workspace.run_tests(argv, timeout_seconds=180)
+
+        self.assertEqual(run.call_args.args[0], argv)
+        self.assertEqual(run.call_args.kwargs["cwd"], workspace.root)
+        self.assertEqual(result["argv"], argv)
+        self.assertEqual(result["exitCode"], 0)
+
+    def test_harness_background_command_list_recovers_ids_and_ignores_unsafe_entries(self) -> None:
+        workspace = WorkspaceTools(self.store, self.mission["id"], "builder")
+        shell_root = workspace.root / ".pydantic-ai-harness" / "shell"
+        shell_root.mkdir(parents=True)
+        running_id = "a" * 32
+        finished_id = "b" * 32
+        malformed_id = "not-a-command-id"
+        running = shell_root / running_id
+        running.mkdir()
+        (running / "handle").write_text("12345 -\n", encoding="utf-8")
+        (running / "status.json").write_text('{"pid":12345,"exit_code":null}', encoding="utf-8")
+        finished = shell_root / finished_id
+        finished.mkdir()
+        (finished / "handle").write_text("12346 -\n", encoding="utf-8")
+        (finished / "status.json").write_text('{"pid":12346,"exit_code":7}', encoding="utf-8")
+        (shell_root / malformed_id).mkdir()
+        outside = self.root / "outside-command"
+        outside.mkdir()
+        (outside / "handle").write_text("12347 12347\n", encoding="utf-8")
+        (shell_root / ("c" * 32)).symlink_to(outside, target_is_directory=True)
+
+        commands = workspace.list_harness_background_commands()
+
+        self.assertEqual({item["commandId"] for item in commands}, {running_id, finished_id})
+        by_id = {item["commandId"]: item for item in commands}
+        self.assertEqual(by_id[running_id]["status"], "running")
+        self.assertIsNone(by_id[running_id]["exitCode"])
+        self.assertEqual(by_id[finished_id]["status"], "finished")
+        self.assertEqual(by_id[finished_id]["exitCode"], 7)
+
+    def test_harness_shell_job_can_be_waited_on_through_the_public_toolset(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's local Harness Shell requires POSIX")
+        from pydantic_ai import Agent, RunContext
+        from pydantic_ai.models.test import TestModel
+        from pydantic_ai.workspaces import Workspace
+        from pydantic_ai.workspaces.local import LocalWorkspaceBackend
+        from pydantic_ai_harness import Shell
+
+        agent = Agent(TestModel(call_tools=["start_and_wait"]))
+
+        @agent.tool
+        async def start_and_wait(ctx: RunContext[None]) -> str:
+            shell = ctx.capabilities["tribe_shell"]
+            start_result = await shell.get_toolset().start_command(ctx, "printf durable-output")
+            command_id = start_result.rsplit("ID: ", 1)[-1].strip()
+            wait_result = await wait_for_harness_background_command(
+                ctx, command_id, wait_seconds=15,
+            )
+            check_result = await shell.get_toolset().check_command(ctx, command_id)
+            unknown_result = await wait_for_harness_background_command(ctx, "f" * 32, wait_seconds=15)
+            return f"{command_id}\n{start_result}\n{wait_result}\n{check_result}\n{unknown_result}"
+
+        result = agent.run_sync(
+            "Start a background command, wait for it to finish, and check its status.",
+            workspace=Workspace(LocalWorkspaceBackend(self.repository)),
+            capabilities=[Shell(id="tribe_shell", tools=["start_command", "check_command"])],
+        )
+
+        tool_result = json.loads(result.output)["start_and_wait"]
+        self.assertRegex(tool_result, r"(?m)^[a-f0-9]{32}$")
+        self.assertIn("[status: finished]", tool_result)
+        self.assertIn("[exit code: 0]", tool_result)
+        self.assertIn("durable-output", tool_result)
+        self.assertIn("[status: finished]", tool_result)
+        self.assertIn("Unknown background command ID", tool_result)
+        with self.assertRaisesRegex(ValueError, "from 1 to 100"):
+            WorkspaceTools(self.store, self.mission["id"], "builder").list_harness_background_commands(0)
+
+    def test_registered_wait_background_command_waits_for_a_running_job(self) -> None:
+        if os.name != "posix":
+            self.skipTest("Pydantic AI's local Harness Shell requires POSIX")
+        from pydantic_ai import Agent
+        from pydantic_ai.models.test import TestModel
+        from pydantic_ai.workspaces import Workspace
+        from pydantic_ai.workspaces.local import LocalWorkspaceBackend
+        from pydantic_ai_harness import Shell
+
+        shell = Shell(id="tribe_shell", tools=["start_command", "check_command"])
+        starter = Agent(TestModel(call_tools=["start_and_check"]))
+
+        @starter.tool
+        async def start_and_check(ctx: RunContext[None]) -> str:
+            tools = ctx.capabilities["tribe_shell"].get_toolset()
+            started = await tools.start_command(ctx, "sleep 4; printf registered-wait")
+            command_id = started.rsplit("ID: ", 1)[-1].splitlines()[0].strip()
+            status = await tools.check_command(ctx, command_id)
+            return f"{command_id} | {status}"
+
+        start_result = starter.run_sync(
+            "Start a background job and confirm it is still running.",
+            workspace=Workspace(LocalWorkspaceBackend(self.repository)), capabilities=[shell],
+        )
+        started_output = json.loads(start_result.output)["start_and_check"]
+        command_id = started_output.split(" | ", 1)[0]
+        self.assertRegex(command_id, r"^[a-f0-9]{32}$")
+        self.assertIn("[status: running]", started_output)
+
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Wait for the existing local job.", "builder.md",
+            tool_permissions=("start_command", "check_command"),
+        )
+        item = self.store.create_work_item(self.mission["id"], "Wait for the Harness Shell job")
+        self.assertIsNotNone(self.store.claim_work(self.mission["id"], definition.id, work_item_id=item["id"]))
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"], file_locks={}, pending_file_changes={},
+        )
+        capabilities = build_capabilities(
+            workspace, dependencies.skills, repository_access=definition.repository_access,
+            tool_permissions=definition.tool_permissions, approval_mode="standard",
+        )
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()):
+            agent = _build_agent(definition, "openai:test-model")
+        self.reveal_deferred_test_tools(agent, capabilities)
+
+        class WaitModel(TestModel):
+            def gen_tool_args(self, tool_def):
+                if tool_def.name == "wait_background_command":
+                    return {"command_id": command_id, "wait_seconds": 15}
+                return super().gen_tool_args(tool_def)
+
+        wait_started = time.monotonic()
+        try:
+            with agent.override(model=WaitModel(
+                call_tools=["wait_background_command"], custom_output_text="The running job finished.",
+            )):
+                result = asyncio.run(agent.run(
+                    "Wait for the existing running job.", deps=dependencies, capabilities=capabilities,
+                    conversation_id=f"tribe:{self.mission['id']}:builder:registered-wait",
+                ))
+        finally:
+            if dependencies.file_locks is not None:
+                for lock in dependencies.file_locks.values():
+                    lock.close()
+                dependencies.file_locks.clear()
+
+        self.assertEqual(result.output, "The running job finished.")
+        self.assertGreaterEqual(time.monotonic() - wait_started, 1.0)
+        self.assertIn("[status: finished]", str(result.all_messages()))
+        self.assertIn("[exit code: 0]", str(result.all_messages()))
+        self.assertIn("registered-wait", str(result.all_messages()))
+
+    def test_repository_test_timeout_is_bounded_and_reported_before_launch(self) -> None:
+        work_item = self.store.create_work_item(self.mission["id"], "Validate test timeout bounds")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], "builder", work_item_id=work_item["id"],
+        ))
+        workspace = WorkspaceTools(self.store, self.mission["id"], "builder", work_item["id"])
+        with patch("tribe_runtime.commands.run_foreground_process") as run:
+            for timeout_seconds in (0, 301, True, "300"):
+                with self.subTest(timeout_seconds=timeout_seconds):
+                    with self.assertRaisesRegex(ValueError, "from 1 to 300 seconds"):
+                        workspace.run_tests(["pytest", "--version"], timeout_seconds=timeout_seconds)
+        run.assert_not_called()
+        self.assertFalse(any(
+            event["type"] == "repo.test_run.started"
+            for event in self.store.events_after(self.mission["id"], 0)
+        ))
 
     def test_expected_agent_tool_validation_errors_return_recovery_feedback(self) -> None:
         builder = AgentDefinition(
@@ -5039,11 +7955,11 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             captured.update(argv=argv, **kwargs)
             return {
                 "exit_code": 0, "stdout": "passed", "stderr": "",
-                "cancelled": False, "timed_out": False,
+                "cancelled": False, "timed_out": False, "started": True,
             }
 
         with patch("tribe_runtime.commands.run_foreground_process", side_effect=run_process):
-            result = tool.function(SimpleNamespace(deps=dependencies), ["pytest", "--version"])
+            result = tool.function(SimpleNamespace(deps=dependencies), ["pytest", "tests"])
 
         is_cancelled = captured["is_cancelled"]
         self.assertFalse(is_cancelled())
@@ -5075,7 +7991,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         ]
         failure = {
             "exit_code": 1, "stdout": "1 failed", "stderr": "assertion mismatch",
-            "cancelled": False, "timed_out": False,
+            "cancelled": False, "timed_out": False, "started": True,
         }
 
         with patch("tribe_runtime.commands.run_foreground_process", return_value=failure):
@@ -5092,6 +8008,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         )
         self.assertEqual(completion["payload"]["exitCode"], 1)
         self.assertEqual(completion["payload"]["toolCallId"], "test-call-1")
+        self.assertEqual(completion["payload"]["source"], "run_repository_tests")
         self.store.append("agent.tool.completed", definition.id, self.mission["id"], {
             "toolName": "run_repository_tests", "toolCallId": "test-call-1", "outcome": "success",
         })
@@ -5109,6 +8026,71 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertTrue(self.store.has_unexpected_agent_effect_after(
             self.mission["id"], incomplete_cursor, definition.id,
         ))
+
+    def test_repository_test_launch_failures_do_not_publish_completion_or_trigger(self) -> None:
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Run project tests", "builder.md",
+            tool_permissions=("run_repository_tests",),
+        )
+        item = self.store.create_work_item(self.mission["id"], "Run project tests")
+        self.assertIsNotNone(self.store.claim_work(self.mission["id"], definition.id, work_item_id=item["id"]))
+        target = self.store.create_mission(self.project["id"], "Triggered review", "Review completed tests")
+        schedule = self.store.create_schedule(
+            self.project["id"], "Investigate failed tests", "Inspect the failed test run", "event", "UTC",
+            trigger_event_type="repo.test_run.failed",
+            event_source_mission_id=self.mission["id"], target_mission_id=target["id"],
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"],
+        )
+        tool = _build_agent(definition, "openai:test-model")._function_toolset.tools[
+            "run_repository_tests"
+        ]
+        failures = [
+            {"exit_code": 127, "stdout": "", "stderr": "executable not found",
+             "cancelled": False, "timed_out": False, "started": False},
+            {"exit_code": 127, "stdout": "", "stderr": "Popen failed",
+             "cancelled": False, "timed_out": False, "started": False},
+        ]
+        for index, failure in enumerate(failures):
+            with self.subTest(index=index), patch(
+                "tribe_runtime.commands.run_foreground_process", return_value=failure,
+            ):
+                result = tool.function(
+                    SimpleNamespace(deps=dependencies, tool_call_id=f"launch-failure-{index}"),
+                    ["pytest", "tests"],
+                )
+                self.assertFalse(result["processStarted"])
+                self.assertNotIn("verificationEventId", result)
+                self.assertEqual(self.store.claim_event_schedules(), [])
+
+        self.assertFalse(any(
+            event["type"] == "repo.test_run.completed"
+            for event in self.store.events_after(self.mission["id"], 0)
+        ))
+
+        # Exit 127 is also a legitimate result after a test process starts. Only
+        # the explicit `started` signal distinguishes it from launch failures.
+        with patch("tribe_runtime.commands.run_foreground_process", return_value={
+            "exit_code": 127, "stdout": "", "stderr": "test runner exited 127",
+            "cancelled": False, "timed_out": False, "started": True,
+        }):
+            result = tool.function(
+                SimpleNamespace(deps=dependencies, tool_call_id="started-exit-127"),
+                ["pytest", "tests"],
+            )
+
+        self.assertTrue(result["processStarted"])
+        self.assertEqual(result["exitCode"], 127)
+        event = next(
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.completed"
+        )
+        self.assertEqual(event["payload"]["runId"], result["runId"])
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual([item["scheduleId"] for item in claimed], [schedule["id"]])
 
     def test_command_output_is_durable_activity_data_not_an_artifact(self) -> None:
         output = "test output"
@@ -5214,7 +8196,11 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertLess(claim_event["sequence"], message_event["sequence"])
 
     def test_isolated_patch_requires_approval_and_integrates(self) -> None:
-        workspace = WorkspaceTools(self.store, self.mission["id"], "builder")
+        work_item = self.store.create_work_item(self.mission["id"], "Prepare and integrate the isolated change")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], "builder", work_item_id=work_item["id"],
+        ))
+        workspace = WorkspaceTools(self.store, self.mission["id"], "builder", work_item["id"])
         workspace.start_isolated_work()
         workspace.write_file("README.md", "isolated edit\n")
         request = workspace.request_isolated_integration("Reviewed change")
@@ -5228,7 +8214,11 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertEqual(self.store.integration_request(request["interactionId"])["status"], "applied")
 
     def test_discard_cancels_pending_integration(self) -> None:
-        workspace = WorkspaceTools(self.store, self.mission["id"], "builder")
+        work_item = self.store.create_work_item(self.mission["id"], "Prepare an isolated change")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], "builder", work_item_id=work_item["id"],
+        ))
+        workspace = WorkspaceTools(self.store, self.mission["id"], "builder", work_item["id"])
         workspace.start_isolated_work()
         workspace.write_file("README.md", "discard me\n")
         request = workspace.request_isolated_integration("Discard this proposal")
@@ -5596,7 +8586,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                 tool_permissions=("unregistered_tool",),
             )
 
-    def test_read_only_role_function_toolset_hides_repository_mutations(self) -> None:
+    def test_read_only_role_can_run_tests_but_cannot_mutate_repository(self) -> None:
         reviewer = next(agent for agent in discover_agents(ROOT / "agents") if agent.id == "reviewer")
         agent = _build_agent(reviewer, "openai:gpt-4o-mini")
 
@@ -5605,7 +8595,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         )}
 
         self.assertIn("read_repository_file", allowed)
-        self.assertNotIn("run_repository_tests", allowed)
+        self.assertIn("run_repository_tests", allowed)
         self.assertIn("update_state", allowed)
         self.assertNotIn("complete_mission", allowed)
         self.assertNotIn("complete_discovery", allowed)
@@ -5645,16 +8635,54 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertEqual(available, set(permissions))
         self.assertTrue(all(agent._function_toolset.tools[name].defer_loading for name in permissions))
 
+    def test_default_reviewer_checks_existing_coverage_before_reporting_gaps(self) -> None:
+        reviewer = next(agent for agent in discover_agents(ROOT / "agents") if agent.id == "reviewer")
+        instructions = reviewer.instructions.casefold()
+
+        self.assertIn("inspect the current implementation and relevant existing tests", instructions)
+        self.assertIn("state whether those tests already cover the case", instructions)
+        self.assertIn("separate confirmed defects from hardening suggestions", instructions)
+        self.assertIn("verify the runtime boundary", instructions)
+
     def test_agent_instructions_route_tests_through_the_restricted_test_tool(self) -> None:
+        from pydantic_ai.models.test import TestModel
+
         builder = next(agent for agent in discover_agents(ROOT / "agents") if agent.id == "builder")
-        agent = _build_agent(builder, "openai:gpt-4o-mini")
+        with patch("tribe_runtime.agent_runtime._model_for_identifier", return_value=TestModel()):
+            agent = _build_agent(builder, "openai:test-model")
         instructions = agent._instructions[0].instruction
 
         self.assertFalse(agent._function_toolset.tools["run_repository_tests"].defer_loading)
-        self.assertIn("Use the granted project command capability to run appropriate checks.", instructions)
+        self.assertIn("Use the granted project command capability for appropriate checks.", instructions)
+        self.assertIn("Keep and reuse the exact command ID returned by start_command.", instructions)
+        self.assertIn("If check_command reports an unknown ID, do not start a duplicate", instructions)
+        self.assertIn("call list_background_commands", instructions)
+        self.assertIn("wait_background_command with its default wait", instructions)
         self.assertIn("A failed command is feedback", instructions)
-        self.assertIn("check the task's stated intended role", instructions)
+        self.assertIn("Check the task's intended role before claiming", instructions)
         self.assertIn("Specialized capabilities may be deferred and discovered with load_capability", instructions)
+        command_tools = {tool.name for tool in _tools_for_agent(
+            agent, builder.repository_access, builder.tool_permissions,
+        )}
+        self.assertIn("list_background_commands", command_tools)
+        self.assertIn("wait_background_command", command_tools)
+        self.assertTrue(agent._function_toolset.tools["list_background_commands"].defer_loading)
+        self.assertTrue(agent._function_toolset.tools["wait_background_command"].defer_loading)
+        read_only = AgentDefinition(
+            "read_only", "Read-only", "Inspect", "", "read-only.md",
+            repository_access="read_only", tool_permissions=("read_file",),
+        )
+        read_only_agent = _build_agent(read_only, "openai:test-model")
+        self.assertNotIn("list_background_commands", {
+            tool.name for tool in _tools_for_agent(
+                read_only_agent, read_only.repository_access, read_only.tool_permissions,
+            )
+        })
+        self.assertNotIn("wait_background_command", {
+            tool.name for tool in _tools_for_agent(
+                read_only_agent, read_only.repository_access, read_only.tool_permissions,
+            )
+        })
         state_tool = agent._function_toolset.tools["update_state"]
         self.assertEqual(state_tool.function_schema.json_schema["required"], ["target", "action"])
         self.assertNotIn("complete_discovery", agent._function_toolset.tools)
@@ -5890,13 +8918,13 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertIn("message_agent", tools)
         self.assertNotIn("record_review_checkpoint", tools)
 
-    def test_read_only_role_does_not_receive_harness_filesystem_or_shell(self) -> None:
+    def test_read_only_role_receives_granted_harness_reads_and_commands(self) -> None:
         workspace = WorkspaceTools(self.store, self.mission["id"], "reviewer")
         skills = SkillCatalog(self.repository)
 
         read_only = build_capabilities(
             workspace, skills, repository_access="read_only",
-            tool_permissions=("read_file", "write_file", "run_command"),
+            tool_permissions=("read_file", "write_file", "run_command", "stop_command"),
         )
         writer = build_capabilities(
             workspace, skills, repository_access="workspace_write",
@@ -5910,12 +8938,15 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             self.assertTrue({"LocalWorkspace", "FileSystem", "Shell"}.isdisjoint(read_only_names))
             return
 
-        self.assertNotIn("FileSystem", read_only_names)
-        self.assertNotIn("Shell", read_only_names)
+        self.assertIn("FileSystem", read_only_names)
+        self.assertIn("Shell", read_only_names)
         self.assertIn("FileSystem", writer_names)
         self.assertIn("Shell", writer_names)
+        read_only_by_name = {type(capability).__name__: capability for capability in read_only}
         capability_by_name = {type(capability).__name__: capability for capability in writer}
         self.assertFalse(capability_by_name["LocalWorkspace"].defer_loading)
+        self.assertEqual(read_only_by_name["FileSystem"].tools, ["read_file"])
+        self.assertEqual(read_only_by_name["Shell"].tools, ["run_command", "stop_command"])
         self.assertTrue(capability_by_name["FileSystem"].defer_loading)
         self.assertTrue(capability_by_name["Shell"].defer_loading)
 
@@ -6090,6 +9121,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         ]
         trigger = self.store.append("message.created", "user", self.mission["id"], {
             "text": "Compare two approaches", "recipient": None, "researchMode": "deep_research",
+            "leadAgentId": "planner",
         })
         planner = AgentDefinition(
             "planner", "Planner", "Planner", "Coordinate work", "planner.md",
@@ -6115,7 +9147,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertEqual(prompt["workflow"], workflow)
         self.assertIn("inline Markdown links", prompt["instructions"])
         self.assertIn("refine the question map and search terms", prompt["instructions"])
-        self.assertIn("dependent Planner analysis task with `Intended role: Planner`", prompt["instructions"])
+        self.assertIn("make a dependent analysis task for a selected role", prompt["instructions"])
         self.assertIn("it is not the final report task", prompt["instructions"])
         self.assertIn("shared Research brief", prompt["instructions"])
         self.assertIn("Intended role: <exact selected role id or name>", prompt["instructions"])
@@ -6284,6 +9316,12 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             if event["type"] == "plan.item.completed"
             and event["payload"]["workItem"]["id"] == researcher_item["id"]
         )
+        # Deep Research lead selection is optional and explicit; this scenario
+        # exercises the lead path without making the Planner role mandatory.
+        completion_event = {
+            **completion_event,
+            "payload": {**completion_event["payload"], "leadAgentId": planner.id},
+        }
         self.assertEqual(next(
             item for item in self.store.work_items(self.mission["id"])
             if item["id"] == synthesis_item["id"]
@@ -6315,7 +9353,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         )
         self.assertIn("Research brief", [item["title"] for item in prompt["research_protocol"]["working_documents"]])
         self.assertIn("Sources reviewed and gaps recorded.", json.dumps(prompt))
-        self.assertIn("dependent Planner analysis task", prompt["instructions"])
+        self.assertIn("make a dependent analysis task for a selected role", prompt["instructions"])
         self.assertIn("final-report task must depend on every research and source-audit task", prompt["instructions"])
         self.assertIn("verify its consequential claims", prompt["instructions"])
         self.assertIn("ready selected role whose profile grants task coordination, web, and artifact capabilities", prompt["instructions"])
@@ -6820,10 +9858,15 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             "builder", "Builder", "Implementation", "Build work", "builder.md",
             tool_permissions=("write_file",),
         )
-        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
+        item = self.store.create_work_item(self.mission["id"], "Write and release the repository path lock")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], definition.id, work_item_id=item["id"],
+        ))
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
         skills = SkillCatalog(self.repository)
         dependencies = AgentDependencies(
             self.store, self.mission["id"], definition, workspace, skills,
+            active_work_item_id=item["id"],
             file_locks={}, pending_file_changes={},
         )
         agent = _build_agent(definition, "openai:test-model")
@@ -6894,10 +9937,15 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             "builder", "Builder", "Implementation", "Build work", "builder.md",
             tool_permissions=("create_directory",),
         )
-        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id)
+        item = self.store.create_work_item(self.mission["id"], "Create the generated directory")
+        self.assertIsNotNone(self.store.claim_work(
+            self.mission["id"], definition.id, work_item_id=item["id"],
+        ))
+        workspace = WorkspaceTools(self.store, self.mission["id"], definition.id, item["id"])
         skills = SkillCatalog(self.repository)
         dependencies = AgentDependencies(
             self.store, self.mission["id"], definition, workspace, skills,
+            active_work_item_id=item["id"],
             file_locks={}, pending_file_changes={},
         )
         agent = _build_agent(definition, "openai:test-model")
@@ -6932,10 +9980,15 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                     lock.close()
                 dependencies.file_locks.clear()
 
-    def test_agent_broadcast_does_not_wake_peers_but_direct_message_does(self) -> None:
+    def test_unaddressed_user_messages_route_to_one_ready_role_without_a_lead(self) -> None:
+        builder = AgentDefinition("builder", "Builder", "Implementation", "", "")
+        reviewer = AgentDefinition("reviewer", "Reviewer", "Quality", "", "")
+        team = _project_team_context([builder, reviewer], {"builder", "reviewer"})
         worker = AgentWorker(
-            self.store, self.mission["id"], AgentDefinition("builder", "Builder", "Implementation", "", ""),
-            None, threading.Event(),
+            self.store, self.mission["id"], builder, None, threading.Event(), project_team=team,
+        )
+        reviewer_worker = AgentWorker(
+            self.store, self.mission["id"], reviewer, None, threading.Event(), project_team=team,
         )
         base = {"actorId": "reviewer", "type": "agent.message.created", "payload": {}}
         self.assertFalse(worker._should_run(base))
@@ -6943,9 +9996,34 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertTrue(worker._should_run({**base, "payload": {"recipient": "builder", "replyDepth": 3}}))
         self.assertFalse(worker._should_run({**base, "payload": {"recipient": "builder", "replyDepth": 4}}))
         user_message = {"actorId": "user", "type": "message.created", "payload": {}}
-        self.assertFalse(worker._should_run(user_message))
+        self.assertTrue(worker._should_run(user_message))
+        self.assertFalse(reviewer_worker._should_run(user_message))
+        self.assertEqual(worker._provider_event(user_message)["payload"]["leadAgentId"], "builder")
         self.assertTrue(worker._should_run({**user_message, "payload": {"recipient": "builder"}}))
         self.assertFalse(worker._should_run({**user_message, "payload": {"recipient": "reviewer"}}))
+        self.assertTrue(worker._should_run({**user_message, "payload": {"leadAgentId": "builder"}}))
+        self.assertFalse(worker._should_run({**user_message, "payload": {"leadAgentId": "reviewer"}}))
+        self.assertTrue(reviewer_worker._should_run({**user_message, "payload": {"leadAgentId": "reviewer"}}))
+        self.assertTrue(worker._should_run({**user_message, "payload": {"mentions": ["builder"]}}))
+        self.assertFalse(worker._should_run({**user_message, "payload": {"mentions": ["reviewer"]}}))
+        nonparticipant_reviewer = AgentWorker(
+            self.store, self.mission["id"], reviewer, None, threading.Event(),
+            project_team=_project_team_context([builder], {"builder"}),
+        )
+        self.assertTrue(nonparticipant_reviewer._should_run(
+            {**user_message, "payload": {"mentions": ["reviewer"]}},
+        ))
+        self.assertFalse(nonparticipant_reviewer._should_run(user_message))
+        reviewer_only_team = _project_team_context([builder, reviewer], {"reviewer"})
+        fallback_worker = AgentWorker(
+            self.store, self.mission["id"], reviewer, None, threading.Event(), project_team=reviewer_only_team,
+        )
+        self.assertTrue(fallback_worker._should_run(user_message))
+        self.assertEqual(
+            fallback_worker._provider_event({**user_message, "payload": {"leadAgentId": "builder"}})
+            ["payload"]["leadAgentId"],
+            "reviewer",
+        )
         self.assertFalse(worker._should_run({"actorId": "runtime", "type": "agent.runtime.started", "payload": {}}))
         targeted_start = {"actorId": "runtime", "type": "agent.runtime.started",
                           "payload": {"roles": ["planner"]}}
@@ -7186,9 +10264,12 @@ with workspace._path_lock(Path(repository) / 'README.md'):
     def test_interactive_artifact_tool_creates_and_attaches_only_valid_html(self) -> None:
         definition = AgentDefinition("planner", "Planner", "Planning", "Answer the user", "planner.md")
         agent = _build_agent(definition, "openai:test-model")
-        authoring_instructions = agent._instructions[0].instruction
-        self.assertIn("finished, task-specific mini-product", authoring_instructions)
-        self.assertIn("browser-default buttons or fields", authoring_instructions)
+        authoring_skill = SkillCatalog(self.repository).find_builtin("interactive-app-authoring")
+        self.assertIsNotNone(authoring_skill)
+        self.assertTrue(agent._function_toolset.tools["load_skill"].defer_loading)
+        authoring_instructions = SkillCatalog(self.repository).read(authoring_skill.id)
+        self.assertIn("finished, task-specific product", authoring_instructions)
+        self.assertIn("browser-default controls", authoring_instructions)
         self.assertIn("available desktop width", authoring_instructions)
         tool = agent._function_toolset.tools["create_artifact"]
         self.assertIn(
@@ -7394,14 +10475,14 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                 http.server_close()
                 server_thread.join(timeout=2)
 
-    def test_planner_is_intake_for_unaddressed_user_messages_and_initial_question_skips_duplicate(self) -> None:
-        planner = AgentWorker(
-            self.store, self.mission["id"], AgentDefinition("planner", "Planner", "Planning", "", ""),
+    def test_unaddressed_user_messages_do_not_require_a_planner_role(self) -> None:
+        researcher = AgentWorker(
+            self.store, self.mission["id"], AgentDefinition("researcher", "Researcher", "Research", "", ""),
             None, threading.Event(),
         )
         message = {"actorId": "user", "type": "message.created", "payload": {}}
-        self.assertTrue(planner._should_run(message))
-        self.assertFalse(planner._should_run({
+        self.assertTrue(researcher._should_run(message))
+        self.assertFalse(researcher._should_run({
             "actorId": "user", "type": "mission.created",
             "payload": {"hasInitialMessage": True},
         }))
@@ -7483,12 +10564,12 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self_actor_event = {"actorId": planner.id, "type": "plan.item.completed", "payload": {}}
         self.assertTrue(planner_worker._should_run(self_actor_event))
 
-    def test_initial_question_runs_planner_once_and_does_not_wake_every_role(self) -> None:
+    def test_initial_question_runs_for_selected_team_without_a_planner_role(self) -> None:
         mission = self.store.create_mission(
             self.project["id"], "Explain this project", "Explain this project",
             initial_message="Explain this project",
         )
-        planner_called = threading.Event()
+        intake_called = threading.Event()
         calls: list[tuple[str, str]] = []
 
         class Provider:
@@ -7497,10 +10578,10 @@ with workspace._path_lock(Path(repository) / 'README.md'):
 
             async def run(self, store, mission_id, event):
                 calls.append((self.agent_id, event["type"]))
-                if self.agent_id == "planner":
-                    planner_called.set()
+                intake_called.set()
+                if self.agent_id == "researcher":
                     return "This repository contains the project implementation."
-                return "unexpected role wake"
+                return "I found the project structure and its entry points."
 
         class EnabledSupervisor(AgentSupervisor):
             @property
@@ -7510,30 +10591,30 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         supervisor = EnabledSupervisor(
             self.store,
             [
-                AgentDefinition("planner", "Planner", "Intake", "", "planner.md"),
-                AgentDefinition("builder", "Builder", "Implementation", "", "builder.md"),
+                AgentDefinition("researcher", "Researcher", "Research", "", "researcher.md"),
+                AgentDefinition("engineer", "Engineer", "Implementation", "", "engineer.md"),
             ],
             provider_factory=lambda definition, model: Provider(definition.id),
         )
         try:
             supervisor.start_mission(mission["id"], initial_launch=True)
-            self.assertTrue(planner_called.wait(3), "planner did not receive the initial prompt")
+            self.assertTrue(intake_called.wait(3), "selected team did not receive the initial prompt")
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
                 if any(event["type"] == "agent.message.created"
                        for event in self.store.events_after(mission["id"], 0)):
                     break
                 time.sleep(0.02)
-            self.assertIn(("planner", "message.created"), calls)
-            self.assertNotIn(("planner", "mission.created"), calls)
-            self.assertNotIn(("builder", "message.created"), calls)
+            self.assertIn(("researcher", "message.created"), calls)
+            self.assertNotIn(("engineer", "message.created"), calls)
+            self.assertNotIn(("researcher", "mission.created"), calls)
             self.assertTrue(any(event["type"] == "agent.message.created"
-                                and event["actorId"] == "planner"
+                                and event["actorId"] == "researcher"
                                 for event in self.store.events_after(mission["id"], 0)))
         finally:
             supervisor.close()
 
-    def test_resuming_unplanned_auto_chat_wakes_only_the_planner(self) -> None:
+    def test_resuming_unplanned_auto_chat_does_not_repeat_the_team_reply(self) -> None:
         mission = self.store.create_mission(
             self.project["id"], "Explain this project", "Explain this project",
             initial_message="Explain this project",
@@ -7556,17 +10637,17 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         supervisor = EnabledSupervisor(
             self.store,
             [
-                AgentDefinition("planner", "Planner", "Intake", "", "planner.md"),
-                AgentDefinition("builder", "Builder", "Implementation", "", "builder.md"),
+                AgentDefinition("researcher", "Researcher", "Research", "", "researcher.md"),
+                AgentDefinition("engineer", "Engineer", "Implementation", "", "engineer.md"),
             ],
             provider_factory=lambda definition, model: Provider(definition.id),
         )
         try:
             supervisor.start_mission(mission["id"])
             deadline = time.monotonic() + 10
-            while time.monotonic() < deadline and "planner" not in calls:
+            while time.monotonic() < deadline and len(calls) < 2:
                 time.sleep(0.02)
-            self.assertEqual(calls, ["planner"])
+            self.assertEqual(calls, [])
             started = next(
                 item for item in self.store.events_after(mission["id"], 0)
                 if item["type"] == "agent.runtime.started"
@@ -7583,7 +10664,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         reviewer = AgentWorker(
             self.store, self.mission["id"], AgentDefinition(
                 "reviewer", "Reviewer", "Review", "", "",
-                tool_permissions=("claim_work", "list_plan_items"),
+                capabilities=("artifacts",),
             ),
             None, threading.Event(),
         )
@@ -7652,15 +10733,113 @@ with workspace._path_lock(Path(repository) / 'README.md'):
         self.assertFalse(reviewer._should_run(builder_comment))
 
     def test_direct_agent_reply_chains_allow_multiple_messages_and_stop_after_three_hops(self) -> None:
-        first = _next_agent_reply_metadata(None, 0)
+        first = _next_agent_reply_metadata(None, 0, 17)
         self.assertEqual(first["replyDepth"], 1)
         self.assertTrue(first["replyChainId"])
+        self.assertEqual(first["rootTriggerSequence"], 17)
 
-        second = _next_agent_reply_metadata(first["replyChainId"], first["replyDepth"])
-        third = _next_agent_reply_metadata(second["replyChainId"], second["replyDepth"])
-        self.assertEqual(third, {"replyChainId": first["replyChainId"], "replyDepth": 3})
+        second = _next_agent_reply_metadata(first["replyChainId"], first["replyDepth"], 17)
+        third = _next_agent_reply_metadata(second["replyChainId"], second["replyDepth"], 17)
+        self.assertEqual(third, {
+            "replyChainId": first["replyChainId"], "replyDepth": 3, "rootTriggerSequence": 17,
+        })
         with self.assertRaisesRegex(ValueError, "three-hop limit"):
-            _next_agent_reply_metadata(third["replyChainId"], third["replyDepth"])
+            _next_agent_reply_metadata(third["replyChainId"], third["replyDepth"], 17)
+
+    def test_direct_message_context_preserves_root_request_and_private_thread(self) -> None:
+        builder = AgentDefinition("builder", "Builder", "Implementation", "", "")
+        reviewer = AgentDefinition("reviewer", "Reviewer", "Quality", "", "")
+        root = self.store.append("message.created", "user", self.mission["id"], {
+            "text": "Run the two approved read-only checks and report their limitations.",
+            "recipient": "builder",
+        })
+        for index in range(15):
+            self.store.append("agent.status", "runtime", self.mission["id"], {"index": index})
+        first_metadata = _next_agent_reply_metadata(None, 0, root["sequence"])
+        first = self.store.append("agent.message.created", builder.id, self.mission["id"], {
+            **first_metadata, "recipient": reviewer.id, "text": "Please verify the gate result.",
+        })
+        reply_metadata = _next_agent_reply_metadata(
+            first_metadata["replyChainId"], first_metadata["replyDepth"], root["sequence"],
+        )
+        reply = self.store.append("agent.message.created", reviewer.id, self.mission["id"], {
+            **reply_metadata, "recipient": builder.id, "text": "I cannot run project commands.",
+        })
+
+        context = _agent_reply_context(self.store, self.mission["id"], builder, reply)
+
+        self.assertEqual(
+            context["originating_request"]["text"],
+            "Run the two approved read-only checks and report their limitations.",
+        )
+        self.assertEqual(
+            [message["text"] for message in context["thread"]],
+            ["Please verify the gate result."],
+        )
+        self.assertEqual(
+            _current_user_request(self.store, self.mission["id"], builder.id, reply, context),
+            "Run the two approved read-only checks and report their limitations.",
+        )
+        self.assertEqual(
+            _current_user_request(self.store, self.mission["id"], builder.id, root),
+            "Run the two approved read-only checks and report their limitations.",
+        )
+        unrelated = AgentDefinition("planner", "Planner", "Planning", "", "")
+        self.assertIsNone(_agent_reply_context(self.store, self.mission["id"], unrelated, reply))
+
+    def test_approval_continuation_keeps_its_originating_user_request(self) -> None:
+        root = self.store.append("message.created", "user", self.mission["id"], {
+            "text": "Run the focused repository test and report its result.",
+        })
+        approval_id = uuid.uuid4().hex
+        interaction = self.store.create_deferred_tool_interaction(
+            mission_id=self.mission["id"], requested_by="builder", title="Approve test",
+            details="Run the focused test", target="Local test", trigger_sequence=root["sequence"],
+            run_id=f"test-run-{approval_id}", conversation_id=f"test:{self.mission['id']}",
+            tool_call_id=f"call-{approval_id}", tool_name="run_command",
+            tool_arguments={"command": "pytest -q"}, message_history="[]",
+            approval_capability="",
+        )
+        continued = {"type": "interaction.approval.resolved", "actorId": "user", "payload": {
+            "interaction": {"id": interaction["id"]},
+        }}
+
+        self.assertEqual(
+            _current_user_request(self.store, self.mission["id"], "builder", continued),
+            "Run the focused repository test and report its result.",
+        )
+
+    def test_approval_review_scope_uses_later_user_instruction(self) -> None:
+        original = "Fix the selected issue and run the focused test."
+        root = self.store.append("message.created", "user", self.mission["id"], {"text": original})
+        self.assertEqual(_approval_review_scope(self.store, self.mission["id"], root["sequence"], original), {
+            "current_user_request": original,
+            "originating_user_request": None,
+            "latest_user_request_sequence": None,
+        })
+
+        correction = "Do not touch LinkPreviews; run only the design-systems test."
+        newer = self.store.append("message.created", "user", self.mission["id"], {"text": correction})
+        self.store.append("agent.status", "builder", self.mission["id"], {"status": "Working"})
+
+        self.assertEqual(_approval_review_scope(self.store, self.mission["id"], root["sequence"], original), {
+            "current_user_request": correction,
+            "originating_user_request": original,
+            "latest_user_request_sequence": newer["sequence"],
+        })
+        reviewed_scope = _approval_review_scope(
+            self.store, self.mission["id"], root["sequence"], original,
+        )
+        self.assertTrue(_approval_review_scope_is_current(
+            self.store, self.mission["id"], root["sequence"], reviewed_scope,
+        ))
+
+        self.store.append("message.created", "user", self.mission["id"], {
+            "text": "Stop that action; I have changed the request again.",
+        })
+        self.assertFalse(_approval_review_scope_is_current(
+            self.store, self.mission["id"], root["sequence"], reviewed_scope,
+        ))
 
     def test_registering_user_role_starts_its_active_mission_worker(self) -> None:
         invoked = threading.Event()
@@ -8017,6 +11196,8 @@ with workspace._path_lock(Path(repository) / 'README.md'):
             registered = None
             updated = None
             unregistered = None
+            resumed_after_message = None
+            resumed_mentions = None
 
             def register_agent(self, definition) -> None:
                 if any(agent.id == definition.id for agent in runtime_server.AGENT_DEFINITIONS):
@@ -8028,6 +11209,16 @@ with workspace._path_lock(Path(repository) / 'README.md'):
 
             def unregister_agent(self, agent_id) -> None:
                 self.unregistered = agent_id
+
+            def research_lead_for_mission(self, mission_id) -> str:
+                return "security_auditor"
+
+            def pause_other_missions(self, mission_id) -> None:
+                pass
+
+            def resume_after_user_message(self, mission_id, message_sequence, mentioned_agent_ids=None) -> None:
+                self.resumed_after_message = runtime_server.STORE.latest_sequence(mission_id)
+                self.resumed_mentions = mentioned_agent_ids or []
 
         supervisor = SupervisorStub()
         with (
@@ -8092,6 +11283,57 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                 with urllib.request.urlopen(message_request, timeout=3) as response:
                     message = json.loads(response.read())["event"]
                 self.assertEqual(message["payload"]["recipient"], "security_auditor")
+                self.assertEqual(
+                    supervisor.resumed_after_message,
+                    message["sequence"],
+                    "a new message must wake the already active chat team",
+                )
+
+                # Mention targets may be in the configured project roster without
+                # being participants managed by this chat's team picker.
+                roster_ids = [definition.id for definition in definitions]
+                self.store.set_project_agent_ids(self.project["id"], roster_ids, roster_ids)
+                self.store.set_mission_agent_ids(
+                    self.mission["id"], ["builder"], roster_ids, lead_agent_id=None,
+                )
+                mention_request = urllib.request.Request(
+                    f"http://127.0.0.1:{http.server_port}/api/messages",
+                    data=json.dumps({
+                        "missionId": self.mission["id"],
+                        "text": "Please review this @Reviewer",
+                        "mentions": ["reviewer"],
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Origin": "http://localhost:5173"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(mention_request, timeout=3) as response:
+                    mentioned = json.loads(response.read())["event"]
+                self.assertEqual(mentioned["payload"]["mentions"], ["reviewer"])
+                self.assertEqual(supervisor.resumed_mentions, ["reviewer"])
+                self.assertEqual(self.store.mission_agent_ids(self.mission["id"], roster_ids), ["builder"])
+
+                with self.store._connect() as db:
+                    db.execute("UPDATE missions SET status='completed' WHERE id=?", (self.mission["id"],))
+                continuation_request = urllib.request.Request(
+                    f"http://127.0.0.1:{http.server_port}/api/messages",
+                    data=json.dumps({
+                        "missionId": self.mission["id"], "text": "Continue this completed chat",
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Origin": "http://localhost:5173"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(continuation_request, timeout=3) as response:
+                    continuation = json.loads(response.read())
+                self.assertEqual(continuation["mission"]["status"], "active")
+                self.assertEqual(continuation["event"]["payload"]["text"], "Continue this completed chat")
+                self.assertEqual(
+                    [event["type"] for event in self.store.events_after(self.mission["id"], 0)][-2:],
+                    ["mission.resumed", "message.created"],
+                )
+                self.assertEqual(
+                    supervisor.resumed_after_message,
+                    continuation["event"]["sequence"],
+                )
 
                 research_request = urllib.request.Request(
                     f"http://127.0.0.1:{http.server_port}/api/messages",
@@ -8106,6 +11348,7 @@ with workspace._path_lock(Path(repository) / 'README.md'):
                     research_message = json.loads(response.read())["event"]
                 self.assertEqual(research_message["payload"]["researchMode"], "deep_research")
                 self.assertIsNone(research_message["payload"]["recipient"])
+                self.assertEqual(research_message["payload"]["leadAgentId"], "security_auditor")
 
                 document, _ = self.store.create_canvas_document(
                     self.mission["id"], "Architecture notes", "markdown", "user", "# Current design",
@@ -8203,16 +11446,554 @@ with workspace._path_lock(Path(repository) / 'README.md'):
 
 
 class ScheduleCase(RuntimeCase):
-    def test_failed_test_event_creates_one_project_scoped_schedule_run(self) -> None:
+    def _append_repository_test_event(self, payload: dict[str, Any], mission_id: str | None = None):
+        return self.store.append(
+            "repo.test_run.completed", "builder", mission_id or self.mission["id"],
+            {**payload, "source": "run_repository_tests"},
+        )
+
+    def test_repository_test_capability_completion_starts_the_selected_project_chat(self) -> None:
+        target = self.store.create_mission(self.project["id"], "Triggered review", "Review completed tests")
+        work_item = self.store.create_work_item(self.mission["id"], "Run project tests")
+        self.assertIsNotNone(self.store.claim_work(self.mission["id"], "builder", work_item_id=work_item["id"]))
         schedule = self.store.create_schedule(
-            self.project["id"], "Investigate failures", "Find the cause and suggest a fix", "event", "UTC",
+            self.project["id"], "Review completed tests", "Summarize the result", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=self.mission["id"], target_mission_id=target["id"],
+        )
+        # Generic Harness shell output is not itself evidence of a test run.
+        self.store.append("repo.test_run.completed", "builder", self.mission["id"], {
+            "runId": "harness-only", "source": "pydantic_ai_harness", "exitCode": 0,
+        })
+        self.assertEqual(self.store.claim_event_schedules(), [])
+
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Run project tests", "builder.md",
+            tool_permissions=("run_repository_tests",),
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], "builder", work_item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=work_item["id"],
+        )
+        capability = _build_agent(definition, "openai:test-model")._function_toolset.tools[
+            "run_repository_tests"
+        ]
+        with patch("tribe_runtime.commands.run_foreground_process", return_value={
+            "exit_code": 0, "stdout": "1 passed in 0.03s\n", "stderr": "",
+            "cancelled": False, "timed_out": False, "started": True,
+        }):
+            result = capability.function(
+                SimpleNamespace(deps=dependencies, tool_call_id="capability-test-run"),
+                ["python", "-m", "pytest", "-q", "tests"],
+                timeout_seconds=30,
+            )
+        self.assertTrue(result["processStarted"])
+        self.assertEqual(result["source"], "run_repository_tests")
+        self.assertEqual(result["exitCode"], 0, result)
+
+        completed = next(
+            item for item in self.store.events_after(self.mission["id"], 0)
+            if item["type"] == "repo.test_run.completed" and item["payload"]["runId"] == result["runId"]
+        )
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual([item["missionId"] for item in claimed], [target["id"]])
+        self.assertEqual(self.store.schedule_runs(schedule["id"])["runs"][0]["source_event_sequence"],
+                         completed["sequence"])
+        messages = [item for item in self.store.events_after(target["id"], 0) if item["type"] == "message.created"]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("A test run completed", messages[0]["payload"]["text"])
+        self.assertEqual(completed["payload"]["stdout"], result["stdout"])
+        self.assertEqual(completed["payload"]["stderr"], result["stderr"])
+        self.assertEqual(completed["payload"]["source"], "run_repository_tests")
+        run = self.store.background_run(result["runId"])
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["exit_code"], 0)
+        self.assertEqual(run["argv"], ["python", "-m", "pytest", "-q", "tests"])
+
+    def test_repository_test_tool_retry_reuses_the_completed_run_identity(self) -> None:
+        item = self.store.create_work_item(self.mission["id"], "Run focused repository tests")
+        self.assertIsNotNone(self.store.claim_work(self.mission["id"], "builder", work_item_id=item["id"]))
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Run repository tests", "builder.md",
+            tool_permissions=("run_repository_tests",),
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], "builder", item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"],
+        )
+        tool = _build_agent(definition, "openai:test-model")._function_toolset.tools[
+            "run_repository_tests"
+        ]
+        process_result = {
+            "exit_code": 0, "stdout": "2 passed", "stderr": "",
+            "cancelled": False, "timed_out": False, "started": True,
+        }
+        with patch("tribe_runtime.commands.run_foreground_process", return_value=process_result) as execute:
+            first = tool.function(
+                SimpleNamespace(deps=dependencies, tool_call_id="stable-test-call"),
+                ["pytest", "-q", "tests"],
+            )
+            retry = tool.function(
+                SimpleNamespace(deps=dependencies, tool_call_id="stable-test-call"),
+                ["pytest", "-q", "tests"],
+            )
+
+        self.assertEqual(execute.call_count, 1)
+        self.assertEqual(retry["runId"], first["runId"])
+        self.assertEqual(retry["verificationEventId"], first["verificationEventId"])
+        self.assertEqual(len([
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.started"
+            and event["payload"].get("toolCallId") == "stable-test-call"
+        ]), 1)
+        self.assertEqual(len([
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.completed"
+            and event["payload"].get("runId") == first["runId"]
+        ]), 1)
+        self.assertEqual(len([
+            run for run in self.store.background_runs(self.mission["id"])
+            if run["id"] == first["runId"]
+        ]), 1)
+
+    def test_repository_test_retry_does_not_repeat_an_unsettled_execution(self) -> None:
+        item = self.store.create_work_item(self.mission["id"], "Recover a repository test run")
+        self.assertIsNotNone(self.store.claim_work(self.mission["id"], "builder", work_item_id=item["id"]))
+        definition = AgentDefinition(
+            "builder", "Builder", "Implementation", "Run repository tests", "builder.md",
+            tool_permissions=("run_repository_tests",),
+        )
+        workspace = WorkspaceTools(self.store, self.mission["id"], "builder", item["id"])
+        dependencies = AgentDependencies(
+            self.store, self.mission["id"], definition, workspace, SkillCatalog(self.repository),
+            active_work_item_id=item["id"],
+        )
+        tool = _build_agent(definition, "openai:test-model")._function_toolset.tools[
+            "run_repository_tests"
+        ]
+        self.store.begin_repository_test_run(
+            self.mission["id"], "builder", self.store.latest_sequence(self.mission["id"]),
+            "reserved-run-id", ["pytest", "tests"], item["id"], "unsettled-test-call", 120,
+        )
+
+        with patch("tribe_runtime.commands.run_foreground_process") as execute:
+            retry = tool.function(
+                SimpleNamespace(deps=dependencies, tool_call_id="unsettled-test-call"),
+                ["pytest", "tests"],
+            )
+
+        execute.assert_not_called()
+        self.assertEqual(retry["runId"], "reserved-run-id")
+        self.assertIsNone(retry["processStarted"])
+        self.assertIn("status is unknown", retry["stderr"])
+        self.assertFalse(any(
+            event["type"] == "repo.test_run.completed"
+            and event["payload"].get("runId") == "reserved-run-id"
+            for event in self.store.events_after(self.mission["id"], 0)
+        ))
+
+    def test_runs_generic_shell_output_does_not_become_test_evidence(self) -> None:
+        run = self.store.create_background_run(
+            self.mission["id"], ["printf", "tests passed"], str(self.repository.resolve()),
+        )
+        self.store.mark_background_run_running(run["id"], 4570)
+        self.store.update_background_output(run["id"], "tests passed")
+
+        self.store.finish_background_run(run["id"], "completed", 0)
+
+        self.assertFalse(any(
+            event["type"] == "repo.test_run.completed"
+            for event in self.store.events_after(self.mission["id"], 0)
+        ))
+
+    def test_event_schedule_accepts_recognised_harness_test_results(self) -> None:
+        target = self.store.create_mission(self.project["id"], "Review Harness tests", "Review test output")
+        schedule = self.store.create_schedule(
+            self.project["id"], "Review completed tests", "Summarize the test result", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=self.mission["id"], target_mission_id=target["id"],
+        )
+
+        event = self.store.record_harness_test_run_result(
+            self.mission["id"], "builder", self.store.latest_sequence(self.mission["id"]),
+            "harness-pytest-call", "pytest -q tests", "2 passed in 0.04s\n[exit code: 0]", "task-1",
+        )
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event["payload"]["source"], "pydantic_ai_harness_test")
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual([item["scheduleId"] for item in claimed], [schedule["id"]])
+        self.assertEqual(claimed[0]["missionId"], target["id"])
+
+    def test_event_schedule_accepts_recognised_harness_background_test_completion(self) -> None:
+        target = self.store.create_mission(self.project["id"], "Review background tests", "Summarize the result")
+        schedule = self.store.create_schedule(
+            self.project["id"], "Review completed tests", "Summarize the test result", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=self.mission["id"], target_mission_id=target["id"],
+        )
+        started = self.store.record_harness_test_run_started(
+            self.mission["id"], "builder", 30, "c" * 32,
+            "pytest -q tests", "task-background-success", str(self.repository), "start-success",
+        )
+        event = self.store.record_harness_test_run_result(
+            self.mission["id"], "builder", 31, "check-success",
+            started["payload"]["command"],
+            "[stdout]\n2 passed in 0.04s\n[status: finished]\n[exit code: 0]",
+            "task-background-success", run_id=started["payload"]["runId"],
+            cwd=started["payload"]["cwd"], source="pydantic_ai_harness_background_test",
+        )
+
+        claimed = self.store.claim_event_schedules()
+
+        self.assertEqual(event["payload"]["source"], "pydantic_ai_harness_background_test")
+        self.assertEqual([item["scheduleId"] for item in claimed], [schedule["id"]])
+        self.assertEqual(claimed[0]["missionId"], target["id"])
+
+    def test_event_schedule_accepts_recognised_harness_background_test_failure(self) -> None:
+        target = self.store.create_mission(self.project["id"], "Investigate background test failure", "Find the cause")
+        schedule = self.store.create_schedule(
+            self.project["id"], "Investigate failed tests", "Find the cause", "event", "UTC",
+            trigger_event_type="repo.test_run.failed",
+            event_source_mission_id=self.mission["id"], target_mission_id=target["id"],
+        )
+        started = self.store.record_harness_test_run_started(
+            self.mission["id"], "builder", 32, "d" * 32,
+            "pytest -q tests", "task-background-failure", str(self.repository), "start-failure",
+        )
+        event = self.store.record_harness_test_run_result(
+            self.mission["id"], "builder", 33, "check-failure",
+            started["payload"]["command"],
+            "[stdout]\n1 failed in 0.04s\n[status: finished]\n[exit code: 1]",
+            "task-background-failure", run_id=started["payload"]["runId"],
+            cwd=started["payload"]["cwd"], source="pydantic_ai_harness_background_test",
+        )
+
+        claimed = self.store.claim_event_schedules()
+
+        self.assertEqual(event["payload"]["exitCode"], 1)
+        self.assertEqual([item["scheduleId"] for item in claimed], [schedule["id"]])
+        self.assertEqual(claimed[0]["missionId"], target["id"])
+
+    def test_completion_trigger_fires_for_successful_completed_run_only(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Review test result", "Summarize the completed test run", "event", "UTC",
             trigger_event_type="repo.test_run.completed",
             event_source_mission_id=self.mission["id"],
         )
-        self.store.append("repo.test_run.completed", "builder", self.mission["id"], {
+        self.store.append("repo.test_run.started", "builder", self.mission["id"], {
+            "runId": "started-only", "argv": ["pytest"],
+        })
+        self.assertEqual(self.store.claim_event_schedules(), [])
+        interrupted = self._append_repository_test_event({
+            "runId": "cancelled-run", "testCount": 4, "passed": 2, "failed": 1,
+            "exitCode": -15, "cancelled": True,
+        })
+        self.assertEqual(self.store.claim_event_schedules(), [])
+        timed_out = self._append_repository_test_event({
+            "runId": "timed-out-run", "exitCode": 124, "cancelled": False, "timedOut": True,
+        })
+        self.assertEqual(self.store.claim_event_schedules(), [])
+        failed = self._append_repository_test_event({
+            "runId": "failed-run", "testCount": 4, "passed": 3, "failed": 1,
+            "exitCode": 1, "cancelled": False,
+        })
+        self.assertEqual(self.store.claim_event_schedules(), [])
+        completed = self._append_repository_test_event({
+            "runId": "successful-run", "testCount": 4, "passed": 4, "failed": 0, "exitCode": 0,
+        })
+
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual(len(claimed), 1)
+        history = self.store.schedule_runs(schedule["id"])
+        self.assertEqual(history["runs"][0]["source_event_sequence"], completed["sequence"])
+        self.assertNotEqual(history["runs"][0]["source_event_sequence"], interrupted["sequence"])
+        self.assertNotEqual(history["runs"][0]["source_event_sequence"], failed["sequence"])
+        self.assertNotEqual(history["runs"][0]["source_event_sequence"], timed_out["sequence"])
+        event = self.store.events_after(claimed[0]["missionId"], 0)[-1]
+        prompt = event["payload"]["goal"] if event["type"] == "mission.created" else event["payload"]["text"]
+        self.assertIn("0 of 4 tests failed", prompt)
+        self.assertEqual(self.store.claim_event_schedules(), [])
+
+    def test_runs_background_test_command_publishes_project_scoped_test_event(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Review successful tests", "Summarise the run", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=self.mission["id"],
+        )
+        run = self.store.create_background_run(
+            self.mission["id"], ["pytest", "-q", "tests"], str(self.repository.resolve()),
+        )
+        self.store.mark_background_run_running(run["id"], 4567)
+        self.store.update_background_output(run["id"], "3 passed in 0.2s\n")
+
+        finished = self.store.finish_background_run(run["id"], "completed", 0)
+
+        events = [item for item in self.store.events_after(self.mission["id"], 0)
+                  if item["type"] == "repo.test_run.completed"]
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["missionId"], self.mission["id"])
+        with self.store._connect() as db:
+            project_id = db.execute("SELECT project_id FROM events WHERE id=?", (event["id"],)).fetchone()[0]
+        self.assertEqual(project_id, self.project["id"])
+        self.assertEqual(event["payload"]["source"], "background_command")
+        self.assertEqual(event["payload"]["runId"], run["id"])
+        self.assertEqual(event["payload"]["argv"], ["pytest", "-q", "tests"])
+        self.assertEqual(event["payload"]["exitCode"], 0)
+        self.assertEqual(event["payload"]["stdout"], "3 passed in 0.2s\n")
+        self.assertEqual(finished["status"], "completed")
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual([item["scheduleId"] for item in claimed], [schedule["id"]])
+        # A repeated completion call cannot publish the durable test event twice.
+        self.store.finish_background_run(run["id"], "completed", 0)
+        events_after_repeat = [item for item in self.store.events_after(self.mission["id"], 0)
+                              if item["type"] == "repo.test_run.completed"]
+        self.assertEqual(len(events_after_repeat), 1)
+
+    def test_harness_result_after_runs_completion_reuses_existing_run_and_events(self) -> None:
+        argv = ["pytest", "-q", "tests"]
+        cwd = str(self.repository.resolve())
+        run = self.store.create_background_run(self.mission["id"], argv, cwd)
+        self.store.mark_background_run_running(run["id"], 4568)
+        self.store.update_background_output(run["id"], "3 passed in 0.2s\n")
+        self.store.finish_background_run(run["id"], "completed", 0)
+        [existing_test_event] = [
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.completed"
+        ]
+
+        duplicate = self.store.record_repository_test_run_result(
+            self.mission["id"], "builder", self.store.latest_sequence(self.mission["id"]),
+            "harness-check-call", run["id"], argv, cwd, 0,
+            "3 passed in 0.2s\n", "", None, "pydantic_ai_harness_background_test",
+        )
+
+        self.assertEqual(duplicate["id"], existing_test_event["id"])
+        command_events = [
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.command.completed"
+            and event["payload"].get("runId") == run["id"]
+        ]
+        test_events = [
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.completed"
+            and event["payload"].get("runId") == run["id"]
+        ]
+        self.assertEqual(len(command_events), 1)
+        self.assertEqual(len(test_events), 1)
+        self.assertEqual(len([
+            item for item in self.store.background_runs(self.mission["id"])
+            if item["id"] == run["id"]
+        ]), 1)
+
+    def test_repository_test_helper_reuses_existing_command_completion_event(self) -> None:
+        argv = ["pytest", "-q", "tests"]
+        cwd = str(self.repository.resolve())
+        run = self.store.create_background_run(self.mission["id"], argv, cwd)
+        self.store.mark_background_run_running(run["id"], 4569)
+        with self.store._connect() as db:
+            db.execute(
+                "UPDATE background_runs SET status='completed',exit_code=0,output=? WHERE id=?",
+                ("2 passed in 0.1s\n", run["id"]),
+            )
+        command_event = self.store.append("repo.command.completed", "builder", self.mission["id"], {
+            "runId": run["id"], "status": "completed", "exitCode": 0,
+            "argv": argv, "cwd": cwd,
+        })
+
+        test_event = self.store.record_repository_test_run_result(
+            self.mission["id"], "builder", self.store.latest_sequence(self.mission["id"]),
+            "harness-check-call", run["id"], argv, cwd, 0,
+            "2 passed in 0.1s\n", "", None, "pydantic_ai_harness_background_test",
+        )
+
+        self.assertEqual(test_event["payload"]["sourceCommandEventId"], command_event["id"])
+        self.assertEqual(len([
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.command.completed"
+            and event["payload"].get("runId") == run["id"]
+        ]), 1)
+        self.assertEqual(len([
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.completed"
+            and event["payload"].get("runId") == run["id"]
+        ]), 1)
+        self.assertEqual(self.store.background_run(run["id"])["status"], "completed")
+
+    def test_repository_test_helper_backfills_runs_for_legacy_test_event(self) -> None:
+        legacy_run_id = "harness:legacy-test-call"
+        retry_run_id = "harness:current:retry"
+        argv = ["pytest", "-q", "tests"]
+        cwd = str(self.repository.resolve())
+        legacy_event = self.store.append("repo.test_run.completed", "builder", self.mission["id"], {
+            "runId": legacy_run_id, "argv": argv, "exitCode": 0,
+            "stdout": "2 passed in 0.1s\n", "stderr": "",
+            "toolCallId": "legacy-test-call",
+            "source": "pydantic_ai_harness_test",
+        })
+
+        replayed = self.store.record_repository_test_run_result(
+            self.mission["id"], "builder", self.store.latest_sequence(self.mission["id"]),
+            "legacy-test-call", retry_run_id, argv, cwd, 0,
+            "2 passed in 0.1s\n", "", None, "pydantic_ai_harness_test",
+        )
+
+        self.assertEqual(replayed["id"], legacy_event["id"])
+        run = self.store.background_run(legacy_run_id)
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["output"], "2 passed in 0.1s\n")
+        self.assertEqual(len([
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.command.completed"
+            and event["payload"].get("runId") == legacy_run_id
+        ]), 1)
+        self.assertEqual(len([
+            event for event in self.store.events_after(self.mission["id"], 0)
+            if event["type"] == "repo.test_run.completed"
+            and event["payload"].get("runId") == legacy_run_id
+        ]), 1)
+
+    def test_runs_npm_test_publishes_a_project_scoped_test_event(self) -> None:
+        run = self.store.create_background_run(
+            self.mission["id"], ["npm", "test"], str(self.repository.resolve()),
+        )
+        self.store.mark_background_run_running(run["id"], 4568)
+        self.store.update_background_output(run["id"], "Tests: 2 passed, 2 total\\n")
+
+        self.store.finish_background_run(run["id"], "completed", 0)
+
+        events = [item for item in self.store.events_after(self.mission["id"], 0)
+                  if item["type"] == "repo.test_run.completed"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["payload"]["argv"], ["npm", "test"])
+        self.assertEqual(events[0]["payload"]["source"], "background_command")
+        with self.store._connect() as db:
+            project_id = db.execute("SELECT project_id FROM events WHERE id=?", (events[0]["id"],)).fetchone()[0]
+        self.assertEqual(project_id, self.project["id"])
+
+    def test_runs_pytest_version_does_not_publish_a_test_event(self) -> None:
+        run = self.store.create_background_run(
+            self.mission["id"], ["pytest", "--version"], str(self.repository.resolve()),
+        )
+        self.store.mark_background_run_running(run["id"], 4569)
+        self.store.update_background_output(run["id"], "pytest 8.0.0\\n")
+
+        self.store.finish_background_run(run["id"], "completed", 0)
+
+        self.assertEqual(
+            [item for item in self.store.events_after(self.mission["id"], 0)
+             if item["type"] == "repo.test_run.completed"],
+            [],
+        )
+
+    def test_runs_background_failed_test_triggers_failure_only(self) -> None:
+        completed_schedule = self.store.create_schedule(
+            self.project["id"], "Review successful tests", "Summarise success", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=self.mission["id"],
+        )
+        failed_schedule = self.store.create_schedule(
+            self.project["id"], "Investigate failed tests", "Find the cause", "event", "UTC",
+            trigger_event_type="repo.test_run.failed",
+            event_source_mission_id=self.mission["id"],
+        )
+        cancelled = self.store.create_background_run(
+            self.mission["id"], ["pytest", "-q"], str(self.repository.resolve()),
+        )
+        self.store.mark_background_run_running(cancelled["id"], 4567)
+        self.store.finish_background_run(cancelled["id"], "cancelled", -15)
+        unstarted = self.store.create_background_run(
+            self.mission["id"], ["pytest", "-q"], str(self.repository.resolve()),
+        )
+        self.store.finish_background_run(unstarted["id"], "failed", None)
+        for exit_code in (-15, 124):
+            interrupted = self.store.create_background_run(
+                self.mission["id"], ["pytest", "-q"], str(self.repository.resolve()),
+            )
+            self.store.mark_background_run_running(interrupted["id"], 4569)
+            self.store.update_background_output(interrupted["id"], "1 failed in 0.2s\n")
+            self.store.finish_background_run(interrupted["id"], "failed", exit_code)
+        interrupted_events = [item for item in self.store.events_after(self.mission["id"], 0)
+                              if item["type"] == "repo.test_run.completed"]
+        self.assertEqual(len(interrupted_events), 2)
+        self.assertEqual(
+            [(event["payload"]["cancelled"], event["payload"]["timedOut"])
+             for event in interrupted_events],
+            [(True, False), (False, True)],
+        )
+        self.assertEqual(self.store.claim_event_schedules(), [])
+
+        failed = self.store.create_background_run(
+            self.mission["id"], ["pytest", "-q"], str(self.repository.resolve()),
+        )
+        self.store.mark_background_run_running(failed["id"], 4568)
+        self.store.update_background_output(failed["id"], "1 failed in 0.2s\n")
+        self.store.finish_background_run(failed["id"], "failed", 1)
+
+        events = [item for item in self.store.events_after(self.mission["id"], 0)
+                  if item["type"] == "repo.test_run.completed"]
+        self.assertEqual(len(events), 3)
+        self.assertEqual(events[-1]["payload"]["runId"], failed["id"])
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual([item["scheduleId"] for item in claimed], [failed_schedule["id"]])
+        self.assertNotIn(completed_schedule["id"], {item["scheduleId"] for item in claimed})
+
+    def test_failure_trigger_accepts_nonzero_exit_without_parsed_count_but_skips_cancelled_run(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Investigate failures", "Find the cause", "event", "UTC",
+            trigger_event_type="repo.test_run.failed",
+            event_source_mission_id=self.mission["id"],
+        )
+        self._append_repository_test_event({
+            "failed": 1, "exitCode": -15, "cancelled": True,
+        })
+        self.assertEqual(self.store.claim_event_schedules(), [])
+        self._append_repository_test_event({
+            "exitCode": 124, "timedOut": True,
+        })
+        self.assertEqual(self.store.claim_event_schedules(), [])
+        failed = self._append_repository_test_event({
+            "exitCode": 1, "cancelled": False,
+        })
+
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(
+            self.store.schedule_runs(schedule["id"])["runs"][0]["source_event_sequence"],
+            failed["sequence"],
+        )
+        run_event = self.store.events_after(claimed[0]["missionId"], 0)[-1]
+        run_prompt = run_event["payload"]["goal"] if run_event["type"] == "mission.created" else run_event["payload"]["text"]
+        self.assertIn("A test run failed", run_prompt)
+
+    def test_legacy_test_failure_schedule_is_preserved_during_schema_upgrade(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Investigate failures", "Find the cause", "event", "UTC",
+            trigger_event_type="repo.test_run.completed",
+            event_source_mission_id=self.mission["id"],
+        )
+        with self.store._connect() as db:
+            db.execute("PRAGMA user_version = 55")
+
+        migrated = MissionStore(self.store.path)
+        stored = next(item for item in migrated.schedules(self.project["id"]) if item["id"] == schedule["id"])
+        self.assertEqual(stored["trigger_event_type"], "repo.test_run.failed")
+        with migrated._connect() as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+
+    def test_failed_test_event_creates_one_project_scoped_schedule_run(self) -> None:
+        schedule = self.store.create_schedule(
+            self.project["id"], "Investigate failures", "Find the cause and suggest a fix", "event", "UTC",
+            trigger_event_type="repo.test_run.failed",
+            event_source_mission_id=self.mission["id"],
+        )
+        self._append_repository_test_event({
             "testCount": 4, "passed": 3, "failed": 1, "exitCode": 1,
         })
-        event = self.store.append("repo.test_run.completed", "builder", self.mission["id"], {
+        event = self._append_repository_test_event({
             "testCount": 5, "passed": 3, "failed": 2, "exitCode": 1,
         })
 
@@ -8227,7 +12008,7 @@ class ScheduleCase(RuntimeCase):
         self.assertEqual(self.store.claim_event_schedules(), [])
 
         self.store.finish_scheduled_run(claimed[0]["missionId"])
-        next_event = self.store.append("repo.test_run.completed", "builder", self.mission["id"], {
+        next_event = self._append_repository_test_event({
             "testCount": 2, "passed": 1, "failed": 1, "exitCode": 1,
         })
         self.assertEqual(self.store.claim_event_schedules(), [])
@@ -8247,10 +12028,10 @@ class ScheduleCase(RuntimeCase):
         self.store.set_project_agent_ids(self.project["id"], ["planner"], ["planner"], "planner")
         schedule = self.store.create_schedule(
             self.project["id"], "Investigate failures", "Find the cause", "event", "UTC",
-            trigger_event_type="repo.test_run.completed",
+            trigger_event_type="repo.test_run.failed",
             event_source_mission_id=self.mission["id"],
         )
-        source_event = self.store.append("repo.test_run.completed", "builder", self.mission["id"], {
+        source_event = self._append_repository_test_event({
             "testCount": 5, "passed": 3, "failed": 2, "exitCode": 1,
         })
         claimed = self.store.claim_event_schedules()
@@ -8306,12 +12087,12 @@ class ScheduleCase(RuntimeCase):
         )
         schedule = self.store.create_schedule(
             self.project["id"], "Investigate failures", "Find the cause and suggest a fix", "event", "UTC",
-            trigger_event_type="repo.test_run.completed",
+            trigger_event_type="repo.test_run.failed",
             event_source_mission_id=source_chat["id"],
         )
-        source_event = self.store.append("repo.test_run.completed", "builder", source_chat["id"], {
+        source_event = self._append_repository_test_event({
             "testCount": 3, "passed": 1, "failed": 2, "exitCode": 1,
-        })
+        }, source_chat["id"])
         claimed = self.store.claim_event_schedules()
         self.assertEqual(len(claimed), 1)
         with self.store._connect() as db:
@@ -8349,12 +12130,12 @@ class ScheduleCase(RuntimeCase):
         )
         schedule = self.store.create_schedule(
             self.project["id"], "Investigate failures", "Find the cause", "event", "UTC",
-            trigger_event_type="repo.test_run.completed",
+            trigger_event_type="repo.test_run.failed",
             event_source_mission_id=source_chat["id"], event_auto_retry_limit=2,
         )
-        self.store.append("repo.test_run.completed", "builder", source_chat["id"], {
+        self._append_repository_test_event({
             "testCount": 3, "passed": 1, "failed": 2, "exitCode": 1,
-        })
+        }, source_chat["id"])
         claimed = self.store.claim_event_schedules()[0]
         with self.store._connect() as db:
             db.execute(
@@ -8390,7 +12171,7 @@ class ScheduleCase(RuntimeCase):
 
         side_effect_schedule = self.store.create_schedule(
             self.project["id"], "Review again", "Inspect the failure", "event", "UTC",
-            trigger_event_type="repo.test_run.completed",
+            trigger_event_type="repo.test_run.failed",
             event_source_mission_id=source_chat["id"], event_auto_retry_limit=1,
         )
         with self.store._connect() as db:
@@ -8398,9 +12179,9 @@ class ScheduleCase(RuntimeCase):
                 "UPDATE schedules SET last_event_triggered_at='2020-01-01T00:00:00+00:00' WHERE id=?",
                 (side_effect_schedule["id"],),
             )
-        self.store.append("repo.test_run.completed", "builder", source_chat["id"], {
+        self._append_repository_test_event({
             "testCount": 1, "passed": 0, "failed": 1, "exitCode": 1,
-        })
+        }, source_chat["id"])
         side_effect_run = next(
             item for item in self.store.claim_event_schedules()
             if item["scheduleId"] == side_effect_schedule["id"]
@@ -8420,7 +12201,7 @@ class ScheduleCase(RuntimeCase):
 
         replied_schedule = self.store.create_schedule(
             self.project["id"], "Avoid duplicate replies", "Summarise the failure", "event", "UTC",
-            trigger_event_type="repo.test_run.completed",
+            trigger_event_type="repo.test_run.failed",
             event_source_mission_id=source_chat["id"], event_auto_retry_limit=1,
         )
         with self.store._connect() as db:
@@ -8428,9 +12209,9 @@ class ScheduleCase(RuntimeCase):
                 "UPDATE schedules SET last_event_triggered_at='2020-01-01T00:00:00+00:00' WHERE id=?",
                 (replied_schedule["id"],),
             )
-        self.store.append("repo.test_run.completed", "builder", source_chat["id"], {
+        self._append_repository_test_event({
             "testCount": 1, "passed": 0, "failed": 1, "exitCode": 1,
-        })
+        }, source_chat["id"])
         replied_run = next(
             item for item in self.store.claim_event_schedules()
             if item["scheduleId"] == replied_schedule["id"]
@@ -8462,12 +12243,12 @@ class ScheduleCase(RuntimeCase):
         )
         schedules = [self.store.create_schedule(
             self.project["id"], f"Investigate failures {index}", "Find the cause", "event", "UTC",
-            trigger_event_type="repo.test_run.completed",
+            trigger_event_type="repo.test_run.failed",
             event_source_mission_id=source_chat["id"],
         ) for index in range(2)]
-        self.store.append("repo.test_run.completed", "builder", source_chat["id"], {
+        self._append_repository_test_event({
             "testCount": 3, "passed": 1, "failed": 2, "exitCode": 1,
-        })
+        }, source_chat["id"])
         claimed = self.store.claim_event_schedules()
         self.assertEqual(len(claimed), 2)
         with self.store._connect() as db:
@@ -8547,6 +12328,32 @@ class ScheduleCase(RuntimeCase):
             mission_id = next(item["missionId"] for item in claimed if item["scheduleId"] == schedule["id"])
             context = self.store.mission(mission_id)["goal"]
             self.assertIn(summary, context)
+
+    def test_message_event_schedule_only_triggers_for_user_messages(self) -> None:
+        target = self.store.create_mission(self.project["id"], "Follow-up", "Respond to a new message")
+        schedule = self.store.create_schedule(
+            self.project["id"], "Respond to messages", "Handle the latest user request", "event", "UTC",
+            trigger_event_type="message.created",
+            event_source_mission_id=self.mission["id"], target_mission_id=target["id"],
+        )
+        self.store.append("message.created", "scheduler", self.mission["id"], {"text": "Scheduled reply"})
+        self.store.append("agent.message.created", "builder", self.mission["id"], {"text": "Agent reply"})
+        self.assertEqual(self.store.claim_event_schedules(), [])
+
+        user_message = self.store.append("message.created", "user", self.mission["id"], {
+            "text": "Please inspect the new failing check",
+        })
+        claimed = self.store.claim_event_schedules()
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0]["scheduleId"], schedule["id"])
+        self.assertEqual(claimed[0]["missionId"], target["id"])
+        run = self.store.schedule_runs(schedule["id"])["runs"][0]
+        self.assertEqual(run["source_event_sequence"], user_message["sequence"])
+        trigger = next(
+            event for event in self.store.events_after(target["id"], 0)
+            if event["type"] == "message.created" and event["actorId"] == "scheduler"
+        )
+        self.assertIn("A user sent a message", trigger["payload"]["text"])
 
     def test_file_event_schedule_filters_paths_and_restarts_cursor_when_filter_changes(self) -> None:
         schedule = self.store.create_schedule(
@@ -9306,11 +13113,14 @@ os._exit(27)
         source = f'''\
 import os
 from pathlib import Path
+from unittest.mock import patch
 from tribe_runtime.store import MissionStore
 
 store = MissionStore(Path({str(self.store.path)!r}))
 mission_id = {self.mission["id"]!r}
 trigger_sequence = {event["sequence"]}
+keyring_patch = patch("tribe_runtime.secure_storage.workspace_key", return_value=b"t" * 32)
+keyring_patch.start()
 store.append("agent.tool.started", "builder", mission_id, {{
     "toolName": "run_command", "toolCallId": "tool-call",
     "triggerSequence": trigger_sequence, "summary": "pytest tests",
@@ -9324,6 +13134,7 @@ interaction = store.create_deferred_tool_interaction(
 )
 store.resolve_interaction(interaction["id"], "approved_once")
 assert store.consume_deferred_tool_approval(interaction["id"], "pytest tests")
+keyring_patch.stop()
 os._exit(24)
 '''
         crashed_process = subprocess.run(
@@ -9360,6 +13171,11 @@ os._exit(24)
             message_history="[]",
         )
         self.assertEqual(self.store.recover_interrupted_agent_runs(), 0)
+        # A worker that stops at the pending request has already saved the
+        # cursor immediately before the original user trigger.
+        self.store.save_agent_offset(
+            "builder", self.mission["id"], trigger["sequence"] - 1,
+        )
         resolution = self.store.resolve_interaction(interaction["id"], "approved_once")
         stop = threading.Event()
         observed = []
@@ -9974,6 +13790,7 @@ asyncio.run(main())
             if isinstance(capability, SummarizingCompaction)
         )
         self.assertEqual(compaction.context_window, 1_000_000)
+        self.assertEqual(compaction.fallback_context_window, UNKNOWN_MODEL_CONTEXT_WINDOW)
         self.assertEqual(compaction.keep_tokens, 200_000)
         self.assertEqual(compaction.max_fraction, 0.75)
         self.assertTrue(compaction.keep_user_messages)
@@ -10775,6 +14592,49 @@ class SupervisorResumeCase(unittest.TestCase):
         })
         self.store.save_agent_offset("builder", self.mission["id"], message["sequence"] - 1)
         self.store.create_work_item(self.mission["id"], "Keep the worker lifecycle task active")
+
+    def test_mention_starts_a_project_role_not_selected_for_the_chat(self) -> None:
+        mentioned = threading.Event()
+        received = []
+
+        class MentionProvider:
+            def __init__(self, agent_id: str):
+                self.agent_id = agent_id
+
+            async def run(inner_self, store: MissionStore, mission_id: str, event: dict) -> str:
+                if event["type"] == "message.created" and "reviewer" in event["payload"].get("mentions", []):
+                    received.append((inner_self.agent_id, event["payload"]["mentions"]))
+                    mentioned.set()
+                return "Mention received"
+
+        class EnabledSupervisor(AgentSupervisor):
+            @property
+            def enabled(self) -> bool:
+                return True
+
+        definitions = [
+            AgentDefinition("builder", "Builder", "Implementation", "", "builder.md"),
+            AgentDefinition("reviewer", "Reviewer", "Quality review", "", "reviewer.md"),
+        ]
+        role_ids = [definition.id for definition in definitions]
+        self.store.set_project_agent_ids(self.project["id"], role_ids, role_ids)
+        self.store.set_mission_agent_ids(self.mission["id"], ["builder"], role_ids)
+        self.store.activate_mission(self.mission["id"])
+        event = self.store.append("message.created", "user", self.mission["id"], {
+            "text": "Please review this change @Reviewer", "recipient": None, "mentions": ["reviewer"],
+        })
+        self.store.save_agent_offset("builder", self.mission["id"], event["sequence"])
+        supervisor = EnabledSupervisor(
+            self.store, definitions,
+            provider_factory=lambda definition, model: MentionProvider(definition.id),
+        )
+        try:
+            supervisor.resume_after_user_message(self.mission["id"], event["sequence"], ["reviewer"])
+            self.assertTrue(mentioned.wait(5), "the project-roster mention target should receive its user message")
+            self.assertEqual(received, [("reviewer", ["reviewer"])])
+            self.assertEqual(self.store.mission_agent_ids(self.mission["id"], role_ids), ["builder"])
+        finally:
+            supervisor.close()
 
     def test_resume_waits_for_in_flight_worker_then_restarts(self) -> None:
         started = threading.Event()

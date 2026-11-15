@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
 import {
   ArrowDownRight, ArrowSquareOut, BellSimple, CaretDown, CaretRight, ChatCircleDots, Clock, Code,
@@ -26,6 +26,108 @@ import { runtime } from "../api/runtime.js";
 export { MessageMarkdown };
 
 const agentColours = { planner: "violet", builder: "blue", reviewer: "teal" };
+
+export function insertAgentMention(value, agentName) {
+  const match = value.match(/(^|\s)@([^\n]*)$/);
+  if (!match) return null;
+  const start = match.index + match[1].length;
+  return `${value.slice(0, start)}@${agentName} `;
+}
+
+export function mentionedAgentIds(value, roster) {
+  const ids = new Set();
+  for (const agent of roster) {
+    for (const label of new Set([agent.name, agent.role].filter(Boolean))) {
+      const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (!new RegExp(`(^|\\s)@${escaped}(?=$|[\\s.,!?;:])`, "i").test(value)) continue;
+      const normalisedLabel = label.toLocaleLowerCase();
+      const matches = roster.filter((candidate) =>
+        [candidate.name, candidate.role].some((candidateLabel) => candidateLabel?.toLocaleLowerCase() === normalisedLabel));
+      // Free-typed labels are routable only when they identify one roster entry.
+      if (matches.length === 1) ids.add(agent.id);
+    }
+  }
+  return [...ids];
+}
+
+export function updateSelectedMentionAnchors(previousValue, nextValue, selectedMentions = [], editRange = null) {
+  if (editRange?.invalidateAll) return [];
+  if (editRange && Number.isInteger(editRange.start) && Number.isInteger(editRange.end)) {
+    const start = Math.max(0, Math.min(editRange.start, previousValue.length));
+    const end = Math.max(start, Math.min(editRange.end, previousValue.length));
+    const insertedLength = nextValue.length - (previousValue.length - (end - start));
+    const delta = insertedLength - (end - start);
+    return selectedMentions.flatMap((mention) => {
+      if (start === end) {
+        if (start <= mention.start) return [{ ...mention, start: mention.start + insertedLength, end: mention.end + insertedLength }];
+        if (start >= mention.end) return [mention];
+        return [];
+      }
+      if (end <= mention.start) return [{ ...mention, start: mention.start + delta, end: mention.end + delta }];
+      if (start >= mention.end) return [mention];
+      return [];
+    });
+  }
+
+  let prefix = 0;
+  while (prefix < previousValue.length && prefix < nextValue.length
+    && previousValue[prefix] === nextValue[prefix]) prefix += 1;
+  let suffix = 0;
+  while (suffix < previousValue.length - prefix && suffix < nextValue.length - prefix
+    && previousValue[previousValue.length - suffix - 1] === nextValue[nextValue.length - suffix - 1]) suffix += 1;
+  const removedEnd = previousValue.length - suffix;
+  const insertedEnd = nextValue.length - suffix;
+  const delta = insertedEnd - removedEnd;
+
+  return selectedMentions.flatMap((mention) => {
+    if (removedEnd === prefix) {
+      if (prefix <= mention.start) return [{ ...mention, start: mention.start + delta, end: mention.end + delta }];
+      if (prefix >= mention.end) return [mention];
+      return [];
+    }
+    if (removedEnd <= mention.start) return [{ ...mention, start: mention.start + delta, end: mention.end + delta }];
+    if (prefix >= mention.end) return [mention];
+    return [];
+  });
+}
+
+export function resolveMentionedAgentIds(value, roster, selectedMentions = []) {
+  const selected = selectedMentions.filter(({ id, name, start, end }) =>
+    roster.some((agent) => agent.id === id) && value.slice(start, end) === `@${name}`);
+  const selectedNames = new Set(selected.map(({ name }) => name.toLocaleLowerCase()));
+  return [...new Set([
+    ...selected.map(({ id }) => id),
+    ...mentionedAgentIds(value, roster).filter((id) => {
+      const agent = roster.find((item) => item.id === id);
+      return !agent || !selectedNames.has(agent.name.toLocaleLowerCase());
+    }),
+  ])];
+}
+
+export function handleMentionKeyDown(event, options, activeIndex, setActiveIndex, chooseMention, dismissMention) {
+  if (options.length === 0) return false;
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    setActiveIndex((index) => (index + 1) % options.length);
+    return true;
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    setActiveIndex((index) => (index + options.length - 1) % options.length);
+    return true;
+  }
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    chooseMention(options[activeIndex] ?? options[0]);
+    return true;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    dismissMention();
+    return true;
+  }
+  return false;
+}
 
 export function AgentIcon({ agent, size = 18 }) {
   if (agent.id === "builder") return <Wrench size={size} weight="duotone" />;
@@ -657,6 +759,15 @@ function InteractionCard({ interaction, onResolve }) {
 
   if (interaction.type === "approval") {
     const isPublicWebRead = ["duckduckgo_search", "web_fetch"].includes(interaction.toolName);
+    const isRepositoryFileChange = ["write_file", "edit_file", "create_directory", "write_repository_file"]
+      .includes(interaction.toolName);
+    const canRememberApproval = interaction.persistentAccessAvailable && ![
+      "request_file_deletion_approval", "delete_repository_file",
+      "request_isolated_integration", "integrate_isolated_changes",
+    ].includes(interaction.toolName);
+    const isCommand = ["run_command", "start_command"].includes(interaction.toolName);
+    const rememberedAction = isRepositoryFileChange ? "future in-project file changes" : "this exact action";
+    const approvalActionPhrase = isRepositoryFileChange ? "file changes" : `this ${isCommand ? "command" : "action"}`;
     return (
       <section className="interaction-card interaction-card--approval" aria-label="Tool approval request">
         <div className="interaction-symbol"><WarningCircle size={23} weight="duotone" /></div>
@@ -664,13 +775,13 @@ function InteractionCard({ interaction, onResolve }) {
           <strong>Approval required</strong>
           <span className="interaction-action">{interaction.title}</span>
           <code>{interaction.target}</code>
-          <span className="interaction-reason">{interaction.reason}</span>
+          <span className={`interaction-reason${interaction.type === "approval" ? " interaction-reason--approval" : ""}`}>{interaction.reason}</span>
           <span className="interaction-resume">Only {interaction.agent} will continue after your decision.</span>
         </div>
         <div className="interaction-actions">
           <button className="button button--quiet" disabled={submitting} onClick={() => void resolveDecision("Denied")} type="button">Deny</button>
           <button className="button button--primary" disabled={submitting} onClick={() => void resolveDecision("Approved once")} type="button">Approve once</button>
-          {isPublicWebRead && <details className="approval-scope-menu"><summary className="button button--quiet">More approval options</summary><div className="approval-scope-options"><p>Allow read-only public web access until you revoke it.</p><button className="button button--quiet" disabled={submitting} onClick={() => void resolveDecision("Approved once", "chat")} type="button">Allow for this chat</button><button className="button button--quiet" disabled={submitting} onClick={() => void resolveDecision("Approved once", "project")} type="button">Allow for this project</button><button className="button button--quiet" disabled={submitting} onClick={() => void resolveDecision("Approved once", "workspace")} type="button">Allow across workspace</button></div></details>}
+          {(isPublicWebRead || canRememberApproval) && <details className="approval-scope-menu"><summary className="button button--quiet">More approval options</summary><div className="approval-scope-options"><p>{isPublicWebRead ? "Allow read-only public web access until you revoke it." : `Remember approval for ${rememberedAction}. You can revoke it in Settings.${isRepositoryFileChange ? " Deletions and external actions still require approval." : ""}`}</p><button className="button button--quiet" disabled={submitting} onClick={() => void resolveDecision("Approved once", "chat")} type="button">Allow {approvalActionPhrase} for this chat</button><button className="button button--quiet" disabled={submitting} onClick={() => void resolveDecision("Approved once", "project")} type="button">Allow {approvalActionPhrase} for this project</button>{isPublicWebRead && <button className="button button--quiet" disabled={submitting} onClick={() => void resolveDecision("Approved once", "workspace")} type="button">Allow across workspace</button>}</div></details>}
         </div>
       </section>
     );
@@ -711,9 +822,12 @@ function ChatQuestionIcon() {
   return <WarningCircle size={23} weight="duotone" />;
 }
 
-function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, initialDraft, onDraftConsumed, onConnectModel, onManageModelMetadata, onManageTeam, onSaveModelPreferences }) {
-  const [value, setValue] = useState("");
-  const [recipient, setRecipient] = useState(null);
+function MessageComposer({ agents, teamAgents = agents, mission, workspaceModel, onSend, onAttach, initialDraft, onDraftConsumed, onConnectModel, onManageModelMetadata, onManageTeam, onUpdateMissionTeam, onSaveModelPreferences, initialTeamMenuOpen = false }) {
+  const [value, setValue] = useState(initialDraft?.text ?? "");
+  const [selectedMentions, setSelectedMentions] = useState([]);
+  const [activeMention, setActiveMention] = useState(0);
+  const [mentionDismissed, setMentionDismissed] = useState(false);
+  const mentionListboxId = useId();
   const [canvasContext, setCanvasContext] = useState(null);
   const [attachments, setAttachments] = useState([]);
   const [sending, setSending] = useState(false);
@@ -726,10 +840,12 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [modelListOpen, setModelListOpen] = useState(false);
   const [modelListSearch, setModelListSearch] = useState("");
-  const [recipientMenuOpen, setRecipientMenuOpen] = useState(false);
+  const [teamMenuOpen, setTeamMenuOpen] = useState(initialTeamMenuOpen);
+  const [teamSaving, setTeamSaving] = useState(false);
   const inputRef = useRef(null);
+  const mentionEditRangeRef = useRef(null);
   const modelMenuRef = useRef(null);
-  const recipientMenuRef = useRef(null);
+  const teamMenuRef = useRef(null);
   const modelListSearchRef = useRef(null);
   const effortPreferenceRef = useRef("");
   const modelCatalogRequestRef = useRef(0);
@@ -758,6 +874,10 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
   }, [mission?.id, mission?.model_preference, mission?.effort_preference]);
 
   useEffect(() => {
+    setSelectedMentions([]);
+  }, [mission?.id]);
+
+  useEffect(() => {
     if (!modelMenuOpen) return undefined;
     function dismiss(event) {
       if (event.key === "Escape") {
@@ -777,10 +897,9 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
   }, [modelMenuOpen, modelListOpen]);
 
   useEffect(() => {
-    if (!recipientMenuOpen) return undefined;
+    if (!teamMenuOpen) return undefined;
     function dismiss(event) {
-      if (event.key === "Escape") setRecipientMenuOpen(false);
-      else if (!recipientMenuRef.current?.contains(event.target)) setRecipientMenuOpen(false);
+      if (event.key === "Escape" || !teamMenuRef.current?.contains(event.target)) setTeamMenuOpen(false);
     }
     document.addEventListener("pointerdown", dismiss);
     document.addEventListener("keydown", dismiss);
@@ -788,7 +907,7 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
       document.removeEventListener("pointerdown", dismiss);
       document.removeEventListener("keydown", dismiss);
     };
-  }, [recipientMenuOpen]);
+  }, [teamMenuOpen]);
 
   useEffect(() => {
     if (modelListOpen && modelCatalog.length > 8) modelListSearchRef.current?.focus();
@@ -797,6 +916,7 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
   useEffect(() => {
     if (!initialDraft) return;
     setValue(initialDraft.text);
+    setSelectedMentions([]);
     setCanvasContext(initialDraft.canvasDocument ?? null);
     setAttachments(initialDraft.attachments ?? []);
     inputRef.current?.focus();
@@ -815,10 +935,11 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
     if ((!value.trim() && attachments.length === 0) || sending) return;
     setSending(true);
     try {
-      const saved = await onSend(value.trim() || "Please review the attached files.", recipient?.id ?? null, canvasContext, attachments, { deepResearch });
+      const mentions = resolveMentionedAgentIds(value, teamAgents, selectedMentions);
+      const saved = await onSend(value.trim() || "Please review the attached files.", null, canvasContext, attachments, { deepResearch, mentions });
       if (saved === false) return;
       setValue("");
-      setRecipient(null);
+      setSelectedMentions([]);
       setCanvasContext(null);
       setAttachments([]);
       setDeepResearch(false);
@@ -827,10 +948,44 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
     }
   }
 
-  function chooseRecipient(agent) {
-    setRecipient(agent);
-    setRecipientMenuOpen(false);
+  function chooseMention(agent) {
+    const nextValue = insertAgentMention(value, agent.name);
+    if (nextValue === null) return;
+    const match = value.match(/(^|\s)@([^\n]*)$/);
+    const start = match.index + match[1].length;
+    setValue(nextValue);
+    setSelectedMentions((current) => [
+      ...updateSelectedMentionAnchors(value, nextValue, current),
+      { id: agent.id, name: agent.name, start, end: start + agent.name.length + 1 },
+    ]);
+    setActiveMention(0);
+    setMentionDismissed(true);
     inputRef.current?.focus();
+  }
+
+  async function toggleChatAgent(agent) {
+    if (teamSaving) return;
+    const currentIds = mission?.agentIds ?? teamAgents.map((item) => item.id);
+    if (currentIds.includes(agent.id) && currentIds.length <= 1) return;
+    const nextIds = currentIds.includes(agent.id)
+      ? currentIds.filter((id) => id !== agent.id)
+      : [...currentIds, agent.id];
+    const nextLead = nextIds.includes(mission?.leadAgentId) ? mission.leadAgentId : null;
+    setTeamSaving(true);
+    try {
+      const saved = await onUpdateMissionTeam?.(nextIds, nextLead);
+      if (saved !== false) setTeamMenuOpen(true);
+    } finally { setTeamSaving(false); }
+  }
+
+  async function chooseChatLead(agentId) {
+    if (teamSaving) return;
+    const currentIds = mission?.agentIds ?? teamAgents.map((item) => item.id);
+    setTeamSaving(true);
+    try {
+      const saved = await onUpdateMissionTeam?.(currentIds, agentId || null);
+      if (saved !== false) setTeamMenuOpen(true);
+    } finally { setTeamSaving(false); }
   }
 
   async function savePreferences(nextModel, nextEffort) {
@@ -852,7 +1007,7 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
   const visibleModelChoices = modelListSearch.trim()
     ? availableModelCatalog.filter((model) => `${modelDisplayName(model)} ${model.name} ${model.id} ${model.provider}`.toLocaleLowerCase().includes(modelListSearch.trim().toLocaleLowerCase()))
     : availableModelCatalog;
-  const receivingAgent = recipient ?? agents.find((agent) => agent.id === "planner" || agent.name?.toLowerCase() === "planner" || agent.role?.toLowerCase() === "planner") ?? null;
+  const receivingAgent = agents.find((agent) => agent.id === mission?.leadAgentId) ?? null;
   const receivingModel = receivingAgent?.model || effectiveModel;
   const receivingModelMetadata = modelCatalog.find((model) => model.id === receivingModel);
   const attachedModalities = [...new Set(attachments.map((attachment) => String(attachment.mediaType ?? "").toLowerCase().split(";", 1)[0].split("/", 1)[0]).filter((modality) => ["image", "audio", "video"].includes(modality)))];
@@ -914,9 +1069,11 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
     void refreshModelCatalog();
   }
 
-  const recipientName = recipient?.name;
-  const composerLabel = recipientName ? `Message ${recipientName}` : "Message the team";
-  const composerPlaceholder = recipientName ? `Message ${recipientName}…` : "Message the team…";
+  const mentionMatch = value.match(/(^|\s)@([^\n]*)$/);
+  const mentionQuery = mentionMatch?.[2]?.toLowerCase() ?? null;
+  const mentionOptions = mentionQuery === null || mentionDismissed ? [] : teamAgents
+    .filter((agent) => `${agent.name} ${agent.role}`.toLowerCase().includes(mentionQuery))
+    .slice(0, 6);
 
   return (
     <form className="composer" onSubmit={submit}>
@@ -924,49 +1081,86 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
       {canvasContext && <div className="composer-canvas-context"><FileText size={15} /><span>{canvasContext.title} · Revision {canvasContext.revision}</span><button aria-label="Remove document context" onClick={() => setCanvasContext(null)} type="button">×</button></div>}
       {attachments.length > 0 && <div aria-label="Attached files" className="composer-attachments">{attachments.map((attachment) => <span className="composer-attachment" key={attachment.id}><FileText size={13} /><span title={attachment.name}>{attachment.name}</span><button aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))} type="button"><X size={13} /></button></span>)}</div>}
       {unsupportedAttachedModalities.length > 0 && <div className="composer-media-warning" role="alert"><WarningCircle aria-hidden="true" size={15} /><span>{receivingAgent?.name ?? "The selected model"}’s model doesn’t list support for {unsupportedAttachedModalities.join(", ")} input.</span><button onClick={resolveMediaWarning} type="button">{hasPinnedReceivingModel ? "Manage role" : "Choose model"}</button></div>}
+      {mentionOptions.length > 0 && <div aria-label="Mention an agent" className="composer-mention-popover" id={mentionListboxId} role="listbox">
+        {mentionOptions.map((agent, index) => <button aria-selected={index === activeMention} className={`composer-mention-option${index === activeMention ? " composer-mention-option--active" : ""}`} id={`${mentionListboxId}-option-${index}`} key={agent.id} onClick={() => chooseMention(agent)} onMouseDown={(event) => event.preventDefault()} role="option" type="button">
+          <i className={`composer-team-dot ${["Not configured", "Provider setup failed", "Needs attention"].includes(agent.status) ? "composer-team-dot--attention" : ""}`} />
+          <span><strong>{agent.name}</strong><small>{agent.role}</small></span>
+        </button>)}
+      </div>}
       <textarea
         ref={inputRef}
-        aria-label={composerLabel}
-        onChange={(event) => setValue(event.target.value)}
+        aria-label="Message the team"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-controls={mentionOptions.length > 0 ? mentionListboxId : undefined}
+        aria-expanded={mentionOptions.length > 0}
+        aria-haspopup="listbox"
+        aria-activedescendant={mentionOptions.length > 0 ? `${mentionListboxId}-option-${activeMention}` : undefined}
+        onBeforeInput={(event) => {
+          const inputType = event.nativeEvent.inputType;
+          if (inputType === "historyUndo" || inputType === "historyRedo") {
+            mentionEditRangeRef.current = { invalidateAll: true };
+            return;
+          }
+          mentionEditRangeRef.current = {
+            start: event.currentTarget.selectionStart,
+            end: event.currentTarget.selectionEnd,
+          };
+        }}
+        onChange={(event) => {
+          const editRange = mentionEditRangeRef.current;
+          mentionEditRangeRef.current = null;
+          setSelectedMentions((current) => updateSelectedMentionAnchors(value, event.target.value, current, editRange));
+          setValue(event.target.value);
+          setActiveMention(0);
+          setMentionDismissed(false);
+        }}
         onKeyDown={(event) => {
+          const isTextEdit = event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey;
+          const isDelete = event.key === "Backspace" || event.key === "Delete";
+          const isClipboardEdit = (event.metaKey || event.ctrlKey) && ["x", "v", "z", "y"].includes(event.key.toLowerCase());
+          if (isTextEdit || isDelete || isClipboardEdit) {
+            mentionEditRangeRef.current = {
+              start: event.currentTarget.selectionStart,
+              end: event.currentTarget.selectionEnd,
+            };
+          }
+          if (handleMentionKeyDown(event, mentionOptions, activeMention, setActiveMention, chooseMention,
+            () => setMentionDismissed(true))) return;
           if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
             if ((value.trim() || attachments.length > 0) && !sending) event.currentTarget.form?.requestSubmit();
           }
         }}
-        placeholder={composerPlaceholder}
+        placeholder="Message the team…"
         rows={2}
         value={value}
       />
       <div className="composer-tools">
         <IconButton label="Attach a file" onClick={() => onAttach((attachment) => setAttachments((current) => current.some((item) => item.id === attachment.id) ? current : [...current, attachment]))}><Paperclip size={19} /></IconButton>
-        <button aria-pressed={deepResearch} className={`research-mode-toggle research-mode-toggle--project${deepResearch ? " research-mode-toggle--active" : ""}`} disabled={sending} onClick={() => { if (!deepResearch) setRecipient(null); setDeepResearch((value) => !value); }} title="The Planner leads the investigation and assigns focused work to selected project roles with web access." type="button"><GlobeSimple aria-hidden="true" size={15} /><span>Deep Research</span></button>
-        {agents.length > 0 && <div className="composer-recipient-menu-wrap" ref={recipientMenuRef}>
-          <IconButton
-            aria-expanded={recipientMenuOpen}
-            aria-haspopup="dialog"
-            className={`composer-recipient-trigger${recipient || recipientMenuOpen ? " composer-recipient-trigger--active" : ""}`}
-            disabled={deepResearch}
-            label={deepResearch ? "Deep Research is routed to the project team" : recipient ? `Message ${recipient.name}` : "Choose message recipient · Team"}
-            onClick={() => setRecipientMenuOpen((open) => !open)}
-          >
-            <UsersThree size={18} weight={recipient ? "fill" : "regular"} />
-            {recipient && <i className={`composer-team-dot ${["Not configured", "Provider setup failed", "Needs attention"].includes(recipient.status) ? "composer-team-dot--attention" : ""}`} />}
-          </IconButton>
-          {recipientMenuOpen && <div aria-label="Choose message recipient" className="composer-recipient-popover" role="dialog">
-            <div className="composer-recipient-heading">Send to</div>
-            <div aria-label="Message recipient" className="composer-recipient-options" role="group">
-              <button aria-pressed={!recipient} className={`composer-recipient-option${!recipient ? " composer-recipient-option--selected" : ""}`} onClick={() => chooseRecipient(null)} type="button">
-                <UsersThree aria-hidden="true" size={17} />
-                <span><strong>Team</strong><small>Send to the project team</small></span>
-                {!recipient && <Check aria-hidden="true" className="composer-recipient-check" size={15} />}
-              </button>
-              {agents.map((agent) => <button aria-pressed={recipient?.id === agent.id} className={`composer-recipient-option${recipient?.id === agent.id ? " composer-recipient-option--selected" : ""}`} key={agent.id} onClick={() => chooseRecipient(agent)} title={`${agent.role} · ${agentStatusLabel(agent.status)}`} type="button">
-                <i className={`composer-team-dot ${["Not configured", "Provider setup failed", "Needs attention"].includes(agent.status) ? "composer-team-dot--attention" : ""}`} />
-                <span><strong>{agent.name}</strong><small>{agent.role} · {agentStatusLabel(agent.status)}</small></span>
-                {recipient?.id === agent.id && <Check aria-hidden="true" className="composer-recipient-check" size={15} />}
-              </button>)}
+        <button aria-pressed={deepResearch} className={`research-mode-toggle research-mode-toggle--project${deepResearch ? " research-mode-toggle--active" : ""}`} disabled={sending} onClick={() => setDeepResearch((value) => !value)} title="The selected chat team investigates the question, follows evidence and shares sourced findings." type="button"><GlobeSimple aria-hidden="true" size={15} /><span>Deep Research</span></button>
+        {teamAgents.length > 0 && <div className="composer-recipient-menu-wrap" ref={teamMenuRef}>
+          <IconButton aria-expanded={teamMenuOpen} aria-haspopup="dialog" className={`composer-recipient-trigger${teamMenuOpen ? " composer-recipient-trigger--active" : ""}`} label="Choose agents for this chat" onClick={() => setTeamMenuOpen((open) => !open)}><UsersThree size={18} /></IconButton>
+          {teamMenuOpen && <div aria-label="Agents in this chat" className="composer-recipient-popover" role="dialog">
+            <div className="composer-recipient-heading">Chat team</div>
+            <div aria-label="Chat participants" className="composer-recipient-options" role="group">
+              {teamAgents.map((agent) => {
+                const selected = (mission?.agentIds ?? teamAgents.map((item) => item.id)).includes(agent.id);
+                return <button aria-pressed={selected} className={`composer-recipient-option${selected ? " composer-recipient-option--selected" : ""}`} disabled={teamSaving || (selected && (mission?.agentIds ?? teamAgents.map((item) => item.id)).length <= 1)} key={agent.id} onClick={() => void toggleChatAgent(agent)} title={`${agent.role} · ${agentStatusLabel(agent.status)}`} type="button">
+                  <i className={`composer-team-dot ${["Not configured", "Provider setup failed", "Needs attention"].includes(agent.status) ? "composer-team-dot--attention" : ""}`} />
+                  <span><strong>{agent.name}</strong><small>{agent.role}</small></span>
+                  {selected && <Check aria-hidden="true" className="composer-recipient-check" size={15} />}
+                </button>;
+              })}
             </div>
+            <div className="composer-chat-lead">
+              <span>Default agent <small>Optional · otherwise one available role receives team messages and can involve others</small></span>
+              <div aria-label="Default agent" role="radiogroup">
+                <button aria-checked={!mission?.leadAgentId} className={!mission?.leadAgentId ? "composer-chat-lead-option composer-chat-lead-option--selected" : "composer-chat-lead-option"} disabled={teamSaving} onClick={() => void chooseChatLead("")} role="radio" type="button">None</button>
+                {teamAgents.filter((agent) => (mission?.agentIds ?? teamAgents.map((item) => item.id)).includes(agent.id)).map((agent) => <button aria-checked={mission?.leadAgentId === agent.id} className={mission?.leadAgentId === agent.id ? "composer-chat-lead-option composer-chat-lead-option--selected" : "composer-chat-lead-option"} disabled={teamSaving} key={agent.id} onClick={() => void chooseChatLead(agent.id)} role="radio" type="button">{agent.name}</button>)}
+              </div>
+            </div>
+            <button className="composer-team-manage" onClick={() => { setTeamMenuOpen(false); onManageTeam?.(); }} type="button">Manage available roles…</button>
           </div>}
         </div>}
         <div className="composer-model-menu-wrap" ref={modelMenuRef}>
@@ -1022,34 +1216,6 @@ function MessageComposer({ agents, mission, workspaceModel, onSend, onAttach, in
         </button>
       </div>
     </form>
-  );
-}
-
-function MissionOutcomeReview({ messages, onReview }) {
-  const [outcome, setOutcome] = useState("accepted");
-  const [notes, setNotes] = useState("");
-  const [saving, setSaving] = useState(false);
-  const latest = [...messages].reverse().find((message) => message.text?.startsWith("Outcome marked "));
-  async function submit(event) {
-    event.preventDefault();
-    setSaving(true);
-    try {
-      const saved = await onReview(outcome, notes.trim());
-      if (saved) setNotes("");
-    } finally { setSaving(false); }
-  }
-  return (
-    <section className="mission-outcome" aria-label="Chat outcome review">
-      <div className="mission-outcome-heading">
-        <strong>Review outcome</strong>
-        <span>{latest ? latest.text : "Record whether this result met the goal."}</span>
-      </div>
-      <form onSubmit={submit}>
-        <SelectControl aria-label="Chat outcome" onChange={setOutcome} options={[{ value: "accepted", label: "Accepted" }, { value: "follow_up", label: "Needs follow-up" }, { value: "rejected", label: "Rejected" }]} size="regular" value={outcome} />
-        <input aria-label="Outcome notes" maxLength={5000} onChange={(event) => setNotes(event.target.value)} placeholder="Optional note" value={notes} />
-        <button className="button button--subtle" disabled={saving} type="submit">{saving ? "Saving…" : latest ? "Update review" : "Save review"}</button>
-      </form>
-    </section>
   );
 }
 
@@ -1119,9 +1285,9 @@ function RightRail({ artifacts, activeInteraction, queuedInteractions, onSelectA
   );
 }
 
-export function MissionView({ mission, agents, agentDefinitions = agents, messages, artifacts, hasOlderEvents, loadingOlderEvents, onLoadOlderEvents, workItems, query = "", isolatedWorkspaces, activeInteraction, queuedInteractions, runtimeStatus, workspaceModel, onSend, onRecoverAgent, onStopAgentRun, onResolve, onSelectArtifact, onOpenCanvas, composerDraft, onComposerDraftConsumed, onActivateInteraction, onAttach, onDiscardIsolation, onReviewOutcome, onConnectModel, onManageModelMetadata, onManageTeam, onOpenUsageSettings, onSaveModelPreferences, interactiveResponsesEnabled = false, onShareInteractiveAction, onOpenAgentActivity = () => {} }) {
+export function MissionView({ mission, agents, teamAgents = agents, agentDefinitions = agents, messages, artifacts, hasOlderEvents, loadingOlderEvents, onLoadOlderEvents, workItems, query = "", isolatedWorkspaces, activeInteraction, queuedInteractions, runtimeStatus, workspaceModel, onSend, onRecoverAgent, onStopAgentRun, onResolve, onSelectArtifact, onOpenCanvas, composerDraft, onComposerDraftConsumed, onActivateInteraction, onAttach, onDiscardIsolation, onConnectModel, onManageModelMetadata, onManageTeam, onUpdateMissionTeam, onOpenUsageSettings, onSaveModelPreferences, interactiveResponsesEnabled = false, onShareInteractiveAction, onOpenAgentActivity = () => {}, initialTeamMenuOpen = false }) {
   const activityRows = useMemo(() => groupActivityMessages(messages), [messages]);
-  const workingAgents = agents.filter((agent) => agent.status === "Working");
+  const workingAgents = teamAgents.filter((agent) => agent.status === "Working");
   let latestHumanMessage = null;
   let latestAgentMessage = null;
   for (const message of messages) {
@@ -1129,13 +1295,26 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
     if (message.actorType === "human" && !message.isScheduled) latestHumanMessage = message;
     else if (message.actorType === "agent") latestAgentMessage = message;
   }
-  const requestedAgent = latestHumanMessage?.recipientId
-    ? agents.find((agent) => agent.id === latestHumanMessage.recipientId || agent.role === latestHumanMessage.recipientId)
-    : agents.find((agent) => agent.id === "planner" || agent.role === "planner");
+  const selectedTeamAgents = teamAgents.filter((agent) =>
+    (mission?.agentIds ?? teamAgents.map((member) => member.id)).includes(agent.id));
+  const preferredIntakeAgentId = latestHumanMessage?.leadAgentId ?? mission?.leadAgentId;
+  const intakeAgent = selectedTeamAgents.find((agent) =>
+    agent.id === preferredIntakeAgentId && agent.status === "Ready")
+    ?? selectedTeamAgents.find((agent) => agent.status === "Ready");
+  const addressedAgentIds = latestHumanMessage?.recipientId
+    ? [latestHumanMessage.recipientId]
+    : latestHumanMessage?.mentionedAgentIds?.length
+      ? latestHumanMessage.mentionedAgentIds
+      : intakeAgent ? [intakeAgent.id] : [];
+  const awaitingAgentNames = teamAgents
+    .filter((agent) => addressedAgentIds.includes(agent.id))
+    .map((agent) => agent.name);
+  const awaitingLabel = awaitingAgentNames.length === 1 ? awaitingAgentNames[0] : "the team";
+  const awaitingRole = teamAgents.some((agent) => addressedAgentIds.includes(agent.id) && agent.status === "Ready");
   const awaitingAgentResponse = mission?.status === "active" && !mission.archived_at
     && runtimeStatus === "connected" && latestHumanMessage
     && latestHumanMessage.sequence > (latestAgentMessage?.sequence ?? -1)
-    && requestedAgent?.status === "Ready" && workingAgents.length === 0;
+    && awaitingRole && workingAgents.length === 0;
   const channelListRef = useRef(null);
   const channelFrameRef = useRef(null);
   const isAtBottomRef = useRef(true);
@@ -1321,7 +1500,7 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
             {workingAgents.length > 0
               ? <span aria-live="polite" className="channel-live channel-live--working" role="status"><CircleNotch className="spin" size={12} />{workingAgents.length === 1 ? `${workingAgents[0].name} is working…` : `${workingAgents.length} agents are working…`}</span>
               : awaitingAgentResponse
-                ? <span aria-label={`Waiting for ${requestedAgent.name} to reply`} aria-live="polite" className="channel-live channel-live--waiting" role="status"><CircleNotch className="spin" size={12} />Waiting for {requestedAgent.name}…</span>
+                ? <span aria-label={`Waiting for ${awaitingLabel} to reply`} aria-live="polite" className="channel-live channel-live--waiting" role="status"><CircleNotch className="spin" size={12} />Waiting for {awaitingLabel}…</span>
                 : null}
             <AgentActivityDock agents={agents} onOpen={onOpenAgentActivity} />
           </div>}
@@ -1372,9 +1551,8 @@ export function MissionView({ mission, agents, agentDefinitions = agents, messag
           </button>}
           <div className="channel-compose-area">
             {mission?.archived_at && <div className="archived-mission-note" role="status">This chat is archived. Restore it to continue the conversation.</div>}
-            {mission?.status === "completed" && <MissionOutcomeReview messages={messages} onReview={onReviewOutcome} />}
             <InteractionCard interaction={activeInteraction} onResolve={onResolve} />
-            {!mission?.archived_at && <MessageComposer agents={agents} mission={mission} workspaceModel={workspaceModel} onSend={onSend} onAttach={onAttach} initialDraft={composerDraft} onDraftConsumed={onComposerDraftConsumed} onConnectModel={onConnectModel} onManageModelMetadata={onManageModelMetadata} onManageTeam={onManageTeam} onSaveModelPreferences={onSaveModelPreferences} />}
+            {!mission?.archived_at && <MessageComposer agents={agents} teamAgents={teamAgents} mission={mission} workspaceModel={workspaceModel} onSend={onSend} onAttach={onAttach} initialDraft={composerDraft} onDraftConsumed={onComposerDraftConsumed} onConnectModel={onConnectModel} onManageModelMetadata={onManageModelMetadata} onManageTeam={onManageTeam} onUpdateMissionTeam={onUpdateMissionTeam} onSaveModelPreferences={onSaveModelPreferences} initialTeamMenuOpen={initialTeamMenuOpen} />}
           </div>
         </section>
         <RightRail

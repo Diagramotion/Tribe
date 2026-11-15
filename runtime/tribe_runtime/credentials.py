@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import inspect
 import os
+import re
 from urllib.parse import urlsplit
 
 SERVICE_NAME = "Tribe"
@@ -113,6 +114,85 @@ def redact_secret_values(message: str, *explicit_secrets: str | None) -> str:
     for secret in sorted(secrets, key=len, reverse=True):
         redacted = redacted.replace(secret, "[redacted]")
     return redacted
+
+
+def redact_review_arguments(
+    value: object, depth: int = 0, explicit_secrets: tuple[str, ...] = (),
+) -> object:
+    """Bound and redact structured tool arguments before sending them to an approval model."""
+    if depth > 5:
+        return "[nested data omitted]"
+    if isinstance(value, dict):
+        result = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 40:
+                result["additionalFields"] = "[omitted]"
+                break
+            if any(marker in str(key).casefold() for marker in (
+                "key", "token", "secret", "password", "auth", "credential", "cookie",
+            )):
+                result[str(key)] = "[redacted]"
+            else:
+                result[str(key)] = redact_review_arguments(item, depth + 1, explicit_secrets)
+        return result
+    if isinstance(value, list):
+        return [redact_review_arguments(item, depth + 1, explicit_secrets) for item in value[:40]]
+    if isinstance(value, str):
+        redacted = redact_secret_values(value, *explicit_secrets)
+        redacted = re.sub(
+            r"(?i)(--header|-H)(\s+|=)(['\"])(.*?)\3",
+            lambda match: "".join((
+                match.group(1), match.group(2), match.group(3),
+                _redact_sensitive_header(match.group(4)), match.group(3),
+            )),
+            redacted,
+        )
+        redacted = re.sub(
+            r"(?i)(--header|-H)(\s+|=)([^\s'\"]+)",
+            lambda match: "".join((
+                match.group(1), match.group(2), _redact_sensitive_header(match.group(3)),
+            )),
+            redacted,
+        )
+        redacted = re.sub(
+            r"(?i)(authorization\s*[=:]\s*)(?:(?:Bearer|Basic)\s+)?([^\s,;'\"]+)",
+            r"\1[redacted]", redacted,
+        )
+        redacted = re.sub(
+            r"(?i)(api[_-]?key|access[_-]?token|token|password|secret|cookie)"
+            r"(\s*[=:]\s*)([^\s,;]+)",
+            r"\1\2[redacted]", redacted,
+        )
+        redacted = re.sub(
+            r"(?i)(--?(?:api[_-]?key|access[_-]?token|token|password|secret|authorization|cookie)\s+)"
+            r"([^\s]+)",
+            r"\1[redacted]", redacted,
+        )
+        redacted = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+", r"\1 [redacted]", redacted)
+        return redacted[:6000]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)[:1000]
+
+
+def _redact_sensitive_header(value: str) -> str:
+    name, separator, remainder = value.partition(":")
+    if separator and re.search(
+        r"(?i)(auth|token|cookie|secret|password|api[_-]?key)", name,
+    ):
+        spacing = remainder[:len(remainder) - len(remainder.lstrip())]
+        return f"{name}:{spacing}[redacted]"
+    return value
+
+
+def redact_shell_command(command: str, *, limit: int = 4000) -> str:
+    """Redact credentials before display and mark previews that cannot show the full command."""
+    redacted = redact_review_arguments(command)
+    value = str(redacted)
+    if len(value) <= limit:
+        return value
+    marker = f"\n… command preview truncated; {len(value) - limit} characters omitted"
+    return value[:max(0, limit - len(marker))] + marker
 
 
 def save_api_key(model: str, api_key: str) -> None:

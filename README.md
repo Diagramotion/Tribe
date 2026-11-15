@@ -119,6 +119,15 @@ uv sync --project runtime --extra ai --extra desktop
 npm run desktop:electron
 ```
 
+### Local data
+
+- The web preview stores workspace data in `~/.tribe` by default.
+- `npm run desktop:dev` stores development data in `~/.tribe-dev`, separate from the installed desktop app. Set `TRIBE_DATA_DIR` to use another folder.
+- The packaged Electron app stores its workspace and browser profile in the operating system's Tribe application-data folder.
+- Provider API keys are saved in the operating system credential store; projects, chats and provider settings are kept in the selected Tribe data folder.
+
+The desktop development folder is persistent between runs. It is safe to remove only when you want to reset your local development workspace.
+
 For development checks and packaging details, see [CONTRIBUTING.md](CONTRIBUTING.md) and [runtime and application architecture](docs/runtime-foundation.md).
 
 ## Frequently asked questions
@@ -133,7 +142,7 @@ Yes. Teams can be composed for research, marketing, data science, data engineeri
 
 ### Does Tribe come with a fixed team of agents?
 
-No fixed cast is required. Each project has one required Planner role; you choose or create the other role profiles for that project. Built-in roles are starting points, and role definitions can be customised.
+No fixed cast is required. Choose any combination of roles for a project; a lead/default role is optional. When none is selected, Tribe routes unaddressed messages to a capable role already on the project team. Built-in roles are starting points, and role definitions can be customised.
 
 ### How is Tribe different from an AI agent harness?
 

@@ -1060,7 +1060,7 @@ export function parseDesignSystemImport(text) {
 
 function packageCssValues(css) {
   const values = {};
-  for (const match of css.matchAll(/--([\w-]+)\s*:\s*([^;{}]+)\s*;/g)) {
+  for (const match of css.matchAll(/--([\w-]+)\s*:\s*([^;{}\s]+(?:\s+[^;{}\s]+)*)\s*;/g)) {
     const name = match[1].toLowerCase();
     if (!(name in values)) values[name] = match[2].trim();
   }

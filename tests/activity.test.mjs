@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { deduplicateAgentActivityMessages, filterConversationMessages, filterTimelineMessages, groupActivityMessages, mapTestRun, mapTestRuns, mergeTimelineMessages, restoreAgentActivity, timelineEntries, timelineEntry, timelineMessage } from "../src/domain/activity.js";
+import { deduplicateAgentActivityMessages, filterConversationMessages, filterTimelineMessages, groupActivityMessages, mapInteraction, mapTestRun, mapTestRuns, mergeTimelineMessages, restoreAgentActivity, timelineEntries, timelineEntry, timelineMessage } from "../src/domain/activity.js";
 
 function event(sequence, type, payload, actorId = "builder") {
   return {
@@ -65,11 +65,60 @@ test("scheduled prompts appear as scheduled tasks in the shared chat", () => {
   assert.equal(message.isScheduled, true);
 });
 
+test("approval history distinguishes remembered file changes from exact tool actions", () => {
+  const fileGrant = timelineEntry(event(1, "interaction.approval.resolved", {
+    interaction: {
+      title: "Review project change",
+      resolution: "approved_once",
+      access_grant: { capability: "tool_action_hmac:repository_file_changes:digest", scope: "project" },
+    },
+  }, "user"));
+  const commandGrant = timelineEntry(event(2, "interaction.approval.resolved", {
+    interaction: {
+      title: "Run a command",
+      resolution: "approved_once",
+      access_grant: { capability: "tool_action_hmac:run_command:digest", scope: "chat" },
+    },
+  }, "user"));
+
+  assert.match(fileGrant.text, /allowed in-project file changes for this project/);
+  assert.match(commandGrant.text, /allowed this exact action for this chat/);
+});
+
 test("project chat messages retain the Deep Research mode marker", () => {
   const message = timelineMessage(event(1, "message.created", {
     text: "Compare these two systems.", researchMode: "deep_research",
+    mentions: ["researcher"], leadAgentId: "researcher",
   }, "user"));
   assert.equal(message.researchMode, "deep_research");
+  assert.deepEqual(message.mentionedAgentIds, ["researcher"]);
+  assert.equal(message.leadAgentId, "researcher");
+});
+
+test("automatic tool review is visible without exposing a tool call as pending", () => {
+  const decisions = [
+    ["approved", "Auto-review approved writing a file"],
+    ["needs_user", "Auto-review referred this action for your decision"],
+    ["denied", "Auto-review denied writing a file"],
+  ];
+  for (const [decision, expected] of decisions) {
+    const message = timelineMessage(event(1, "agent.tool.auto_reviewed", {
+      toolName: "write_file", decision, summary: "src/example.js", reason: "Within policy.",
+      toolCallId: "internal-call-id",
+    }));
+    assert.match(message.text, new RegExp(expected));
+    assert.equal(message.toolCallId, null);
+    assert.equal(message.toolState, null);
+    assert.equal(message.detail, "Within policy.");
+  }
+});
+
+test("persistent exact-action availability is surfaced on approval requests", () => {
+  const request = mapInteraction({
+    id: "request-1", title: "Run repository check", details: "Check the project",
+    requested_by: "builder", interaction_type: "tool_action", persistent_access_available: true,
+  });
+  assert.equal(request.persistentAccessAvailable, true);
 });
 
 test("mission completion appears as a final chat reply instead of a status card", () => {

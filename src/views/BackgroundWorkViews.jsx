@@ -12,11 +12,13 @@ const scheduleTemplates = [
   { title: "Weekly project review", description: "Check recent progress, open work and blockers.", prompt: "Review this project's recent progress, open work and blockers. Summarise what changed and recommend the next steps.", cadence: "weekly", icon: ClipboardText },
   { title: "Follow a topic", description: "Check for meaningful updates and explain why they matter.", prompt: "Look for meaningful updates about [topic]. If anything changed, explain why it matters and include sources.", cadence: "weekdays", icon: BellSimple },
   { title: "Plan the week", description: "Review project priorities and prepare a concise plan.", prompt: "Review this project's priorities and prepare a concise plan for the coming week.", cadence: "weekly", icon: CalendarBlank },
-  { title: "Investigate failing tests", description: "Start a review when a project chat records a failed test run.", prompt: "Investigate the failed test run. Identify the likely cause, the smallest useful fix, and any follow-up verification needed.", cadence: "event", triggerEventType: "repo.test_run.completed", icon: WarningCircle },
+  { title: "Investigate failing tests", description: "Start a review when a project chat records a failed test run.", prompt: "Investigate the failed test run. Identify the likely cause, the smallest useful fix, and any follow-up verification needed.", cadence: "event", triggerEventType: "repo.test_run.failed", icon: WarningCircle },
 ];
-const eventTriggerOptions = [
-  { value: "repo.test_run.completed", label: "A test run fails" },
+export const eventTriggerOptions = [
+  { value: "repo.test_run.completed", label: "A repository test run succeeds" },
+  { value: "repo.test_run.failed", label: "A repository test run fails" },
   { value: "repo.file.changed", label: "A repository file changes" },
+  { value: "message.created", label: "A user sends a message" },
   { value: "mission.completed", label: "A chat completes" },
   { value: "artifact.created", label: "An artifact is created" },
   { value: "github.workflow_run.failed", label: "A GitHub Actions run fails" },
@@ -44,6 +46,7 @@ function externalTriggerStatusMessage(code) {
 }
 
 const runStatusLabels = {
+  starting: "Starting",
   queued: "Queued",
   running: "Running",
   paused: "Chat paused",
@@ -51,6 +54,7 @@ const runStatusLabels = {
   completed: "Completed",
   cancelled: "Stopped",
   failed: "Needs attention",
+  interrupted: "Interrupted",
 };
 
 function ScheduleTimeFields({ label, value, onChange }) {
@@ -94,7 +98,7 @@ export function RunsView({ mission, runs, agentRequests = [], onStop }) {
     <div className={`command-run-list ${runs.length === 0 ? "command-run-list--empty" : ""}`}>{runs.length === 0 && <div className="command-empty"><span><TerminalWindow size={20} /></span><div><strong>No runs yet</strong><p>Ask the team to run tests or another repository task in chat. Results will appear here.</p></div></div>}
       {runs.map((run) => <article className="command-run" key={run.id}>
         <div className={`command-run-status command-run-status--${run.status}`} aria-label={runStatusLabels[run.status] ?? "Status unavailable"}>{run.status === "running" ? <CircleNotch className="spin" size={17} /> : run.status === "completed" ? <CheckCircle size={17} /> : <WarningCircle size={17} />}</div>
-        <div className="command-run-body"><div className="command-run-meta"><code>{run.argv.join(" ")}</code><span>{runStatusLabels[run.status] ?? "Status unavailable"}</span></div><small>Started {new Date(run.started_at).toLocaleString()}</small>{run.output && <details className="command-output" open={run.status === "running"}><summary>Show run output</summary><pre>{run.output}</pre></details>}</div>
+        <div className="command-run-body"><div className="command-run-meta"><code>{run.argv.join(" ")}</code><span>{runStatusLabels[run.status] ?? "Status unavailable"}</span></div><small>Working directory: <code>{run.cwd}</code></small><small>Started {new Date(run.started_at).toLocaleString()}</small>{run.status === "interrupted" && <small>The app stopped before it could confirm the result. Check the project before running this command again.</small>}{run.output && <details className="command-output" open={run.status === "running"}><summary>Show run output</summary><pre>{run.output}</pre></details>}</div>
         {run.status === "running" && <button aria-label="Stop run" className="icon-button" onClick={() => onStop(run.id)} title="Stop run" type="button"><Stop size={14} /></button>}
       </article>)}
     </div>
@@ -479,7 +483,13 @@ export function SchedulesView({ project, projects = [], schedules, agentsConfigu
           <div className="schedule-select-row"><span>Repeat</span><SelectControl label="Repeat" onChange={setCadence} options={[{ value: "once", label: "Once" }, { value: "hourly", label: "Hourly" }, { value: "daily", label: "Daily" }, { value: "weekdays", label: "Weekdays" }, { value: "weekly", label: "Weekly" }, { value: "monthly", label: "Monthly" }, { value: "cron", label: "Custom cron" }, { value: "event", label: "When an event occurs" }]} size="regular" value={cadence} /></div>
           {cadence === "event" && <div className="schedule-event-trigger">
             <div className="schedule-select-row"><span>Trigger</span><SelectControl label="Trigger" onChange={(value) => { setTriggerEventType(value); if (value !== "repo.file.changed") setEventPathPattern(""); if (value !== "github.workflow_run.failed") setEventExternalRepository(""); }} options={eventTriggerOptions} size="regular" value={triggerEventType} /></div>
-            <p>{triggerEventType === "github.workflow_run.failed" ? "Tribe checks the public repository every 15 minutes while this device is open. Only run metadata is read; logs and source code are not fetched." : "Tribe watches this chat’s local activity. It coalesces matching events while a run is active and limits each trigger to one run every five minutes."}</p>
+            <p>{triggerEventType === "github.workflow_run.failed"
+              ? "Tribe checks the public repository every 15 minutes while this device is open. Only run metadata is read; logs and source code are not fetched."
+              : triggerEventType === "repo.test_run.completed" || triggerEventType === "repo.test_run.failed"
+                ? triggerEventType === "repo.test_run.completed"
+                  ? "Watches successful recognized test runs from this chat, including tests started by agents or through Runs. Failures, cancellations, timeouts, and commands that did not start do not trigger this task."
+                  : "Watches failed recognized test runs from this chat, including tests started by agents or through Runs. Successful, cancelled, timed-out, and commands that did not start do not trigger this task."
+                : "Tribe watches this chat’s local activity. It coalesces matching events while a run is active and limits each trigger to one run every five minutes."}</p>
             {triggerEventType === "github.workflow_run.failed" && <label className="schedule-event-path-filter" htmlFor="schedule-event-github-repository"><span>Public GitHub repository</span><input autoComplete="url" id="schedule-event-github-repository" maxLength={300} onChange={(event) => setEventExternalRepository(event.target.value)} placeholder="owner/repository" spellCheck="false" value={eventExternalRepository} /><small>Enter owner/repository or a github.com repository URL. Project web access must allow api.github.com.</small></label>}
             <div className="schedule-select-field"><span>{triggerEventType === "github.workflow_run.failed" ? "Record events in chat" : "Watch chat"}</span><SelectControl className="schedule-select--target" label={triggerEventType === "github.workflow_run.failed" ? "Record events in chat" : "Watch chat"} onChange={(nextValue) => { setEventSourceMissionId(nextValue); if (nextValue === targetMissionId) setTargetMissionId(""); }} options={[{ value: "", label: "Choose a chat", disabled: true }, ...(selectedProject?.missions ?? []).filter((item) => !item.archived_at).map((item) => ({ value: item.id, label: item.title }))]} size="full" value={eventSourceMissionId} /></div>
             {triggerEventType === "repo.file.changed" && <label className="schedule-event-path-filter" htmlFor="schedule-event-path-pattern"><span>Path filter (optional)</span><input autoComplete="off" id="schedule-event-path-pattern" maxLength={500} onChange={(event) => setEventPathPattern(event.target.value)} placeholder="src/*.py" spellCheck="false" value={eventPathPattern} /><small>Use * and ? wildcards in a project-relative path. Leave blank to watch every file.</small></label>}
@@ -532,6 +542,7 @@ export function SchedulesView({ project, projects = [], schedules, agentsConfigu
             {schedule.cron_expression && <small className="schedule-expression">{schedule.cron_expression}</small>}
             {workspace && <small>Project · {schedule.project_name}</small>}
             {schedule.cadence === "event" && <small>{eventTriggerOptions.find((option) => option.value === schedule.trigger_event_type)?.label ?? "When a project event occurs"} · {schedule.event_external_repository ? `${schedule.event_external_repository} · recorded in ` : ""}{schedule.event_source_mission_title ?? "Source chat unavailable"}{schedule.event_path_pattern ? ` · ${schedule.event_path_pattern}` : ""}{schedule.event_auto_retry_limit ? ` · Up to ${schedule.event_auto_retry_limit} automatic retries before work starts` : ""}</small>}
+            {schedule.cadence === "event" && ["repo.test_run.completed", "repo.test_run.failed"].includes(schedule.trigger_event_type) && <small>Source: recognized repository test commands started by agents or through Runs.</small>}
             {schedule.event_external_error && <small className="schedule-run-error">{externalTriggerStatusMessage(schedule.event_external_error)}</small>}
             {schedule.target_mission_id && <small>Chat · {schedule.target_mission_title ?? "Unavailable"}{schedule.target_mission_archived_at ? " · archived" : ""}</small>}
             <small>{nextRun}</small>

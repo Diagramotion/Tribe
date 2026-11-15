@@ -32,9 +32,14 @@ from tzlocal import get_localzone_name
 from .canvas import comment_publications, document_publications, validate_content, visible_message
 from .credentials import provider_for_model
 from .github_actions import parse_public_repository
-from .tool_activity import node_test_run_evidence
+from .tool_activity import (
+    background_test_run_evidence,
+    local_repository_test_argv,
+    repository_test_command_argv,
+    repository_test_run_evidence,
+)
 
-SCHEMA_VERSION = 52
+SCHEMA_VERSION = 56
 MAX_EXPERIMENT_MODEL_FINGERPRINT_BYTES = 512 * 1024 * 1024
 MAX_AGENT_RETRY_WINDOW_SECONDS = 24 * 60 * 60
 DEFAULT_AGENT_RUN_TOKEN_LIMIT: int | None = None
@@ -62,6 +67,33 @@ def _is_supported_git_remote(remote: str) -> bool:
 
 def now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def tool_action_approval_capability(
+    tool_name: str, arguments: object, data_dir: str | Path, *, create_key: bool = True,
+) -> str | None:
+    """Return a keyed persistent-approval capability for a bounded local action."""
+    from .secure_storage import action_fingerprint
+
+    if tool_name in {
+        "write_file", "edit_file", "create_directory", "write_repository_file",
+    }:
+        # An explicit chat/project grant covers ordinary in-repository edits, so
+        # iterative work does not require a new grant for every path and diff.
+        # Deletion, shell, MCP and external actions keep their own exact boundary.
+        return action_fingerprint(
+            data_dir, "repository_file_changes", {"scope": "project_repository"},
+            create_key=create_key,
+        )
+    if tool_name in {"run_command", "start_command"} and isinstance(arguments, dict):
+        # Harness omits nullable defaults on some subsequent Shell calls. Keep an
+        # omitted timeout equivalent to the explicit default while fingerprinting
+        # every non-default value so a grant remains exact to the requested action.
+        arguments = {
+            key: value for key, value in arguments.items()
+            if not (key == "timeout_seconds" and value is None)
+        }
+    return action_fingerprint(data_dir, tool_name, arguments, create_key=create_key)
 
 
 def _recovery_scan_start(started_at: str) -> str:
@@ -472,6 +504,7 @@ class MissionStore:
                         tool_name TEXT NOT NULL,
                         tool_arguments TEXT NOT NULL,
                         message_history TEXT NOT NULL,
+                        message_history_encrypted TEXT,
                         target TEXT NOT NULL,
                         status TEXT NOT NULL DEFAULT 'pending',
                         created_at TEXT NOT NULL,
@@ -538,10 +571,29 @@ class MissionStore:
                     added_at TEXT NOT NULL,
                     PRIMARY KEY(project_id, agent_id)
                 );
+                CREATE TABLE IF NOT EXISTS project_agent_role_sets (
+                    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS missions (
                     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
                     title TEXT NOT NULL, goal TEXT NOT NULL, status TEXT NOT NULL,
                     created_at TEXT NOT NULL, background INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS mission_agent_roles (
+                    mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+                    agent_id TEXT NOT NULL,
+                    added_at TEXT NOT NULL,
+                    PRIMARY KEY(mission_id, agent_id)
+                );
+                CREATE TABLE IF NOT EXISTS mission_agent_role_sets (
+                    mission_id TEXT PRIMARY KEY REFERENCES missions(id) ON DELETE CASCADE,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS mission_agent_leads (
+                    mission_id TEXT PRIMARY KEY REFERENCES missions(id) ON DELETE CASCADE,
+                    agent_id TEXT,
+                    updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
@@ -805,7 +857,9 @@ class MissionStore:
                     run_id TEXT NOT NULL,
                     conversation_id TEXT NOT NULL, tool_call_id TEXT NOT NULL,
                     tool_name TEXT NOT NULL, tool_arguments TEXT NOT NULL,
-                    message_history TEXT NOT NULL, target TEXT NOT NULL,
+                    approval_capability TEXT NOT NULL DEFAULT '',
+                    message_history TEXT NOT NULL, message_history_encrypted TEXT,
+                    target TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -879,6 +933,11 @@ class MissionStore:
                 CREATE TABLE IF NOT EXISTS project_approval_policies (
                     project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
                     mode TEXT NOT NULL CHECK(mode IN ('standard','review_changes','confirm_every_call')),
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS project_approval_auto_review (
+                    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
                     updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS project_command_tools (
@@ -1109,6 +1168,34 @@ class MissionStore:
                     db.execute("ALTER TABLE agent_request_usage ADD COLUMN pruned_token_estimate INTEGER NOT NULL DEFAULT 0")
                 if "context_pruning_enabled" not in request_usage_columns:
                     db.execute("ALTER TABLE agent_request_usage ADD COLUMN context_pruning_enabled INTEGER NOT NULL DEFAULT 0")
+                deferred_approval_columns = {
+                    row[1] for row in db.execute("PRAGMA table_info(deferred_tool_approvals)")
+                }
+                if "approval_capability" not in deferred_approval_columns:
+                    db.execute(
+                        "ALTER TABLE deferred_tool_approvals ADD COLUMN approval_capability TEXT NOT NULL DEFAULT ''"
+                    )
+                if "message_history_encrypted" not in deferred_approval_columns:
+                    db.execute("ALTER TABLE deferred_tool_approvals ADD COLUMN message_history_encrypted TEXT")
+                from .secure_storage import encrypt_approval_history
+                for legacy in db.execute(
+                    "SELECT interaction_id,message_history FROM deferred_tool_approvals "
+                    "WHERE message_history_encrypted IS NULL"
+                ).fetchall():
+                    encrypted_history = encrypt_approval_history(
+                        self.data_dir, legacy["interaction_id"], legacy["message_history"],
+                    )
+                    db.execute(
+                        "UPDATE deferred_tool_approvals SET message_history='[encrypted:v1]', "
+                        "message_history_encrypted=?,tool_arguments='{}',approval_capability='' "
+                        "WHERE interaction_id=?",
+                        (encrypted_history, legacy["interaction_id"]),
+                    )
+                db.execute(
+                    "UPDATE access_grants SET revoked_at=? WHERE revoked_at IS NULL "
+                    "AND capability LIKE 'tool_action:%'",
+                    (now(),),
+                )
                 deletion_columns = {
                     row[1] for row in db.execute("PRAGMA table_info(repository_file_deletions)")
                 }
@@ -1123,6 +1210,13 @@ class MissionStore:
                         db.execute(
                             f"ALTER TABLE repository_file_deletions ADD COLUMN {column} {definition}"
                         )
+                if version < 56:
+                    # Preserve existing "test run fails" schedules while the
+                    # completed event type now means any finished test run.
+                    db.execute(
+                        "UPDATE schedules SET trigger_event_type='repo.test_run.failed' "
+                        "WHERE cadence='event' AND trigger_event_type='repo.test_run.completed'"
+                    )
                 db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 db.commit()
             except Exception:
@@ -1377,6 +1471,8 @@ class MissionStore:
                 (project_id,),
             )]
             configured = db.execute(
+                "SELECT 1 FROM project_agent_role_sets WHERE project_id=?", (project_id,),
+            ).fetchone() or db.execute(
                 "SELECT 1 FROM project_agent_roles WHERE project_id=? LIMIT 1", (project_id,),
             ).fetchone()
         return rows if configured else list(available_agent_ids or [])
@@ -1388,6 +1484,8 @@ class MissionStore:
             projects = [row[0] for row in db.execute("SELECT id FROM projects")]
             for project_id in projects:
                 existing = db.execute(
+                    "SELECT 1 FROM project_agent_role_sets WHERE project_id=?", (project_id,),
+                ).fetchone() or db.execute(
                     "SELECT 1 FROM project_agent_roles WHERE project_id=? LIMIT 1", (project_id,),
                 ).fetchone()
                 if existing:
@@ -1403,27 +1501,91 @@ class MissionStore:
             db.execute("DELETE FROM project_agent_roles WHERE agent_id=?", (agent_id,))
 
     def set_project_agent_ids(self, project_id: str, agent_ids: list[str],
-                              available_agent_ids: list[str], required_agent_id: str) -> list[str]:
+                              available_agent_ids: list[str], required_agent_id: str | None = None) -> list[str]:
         if not isinstance(agent_ids, list) or any(not isinstance(item, str) for item in agent_ids):
             raise ValueError("project_team_invalid")
         selected = list(dict.fromkeys(agent_ids))
+        if not selected:
+            raise ValueError("project_team_requires_agent")
         available = set(available_agent_ids)
         if any(agent_id not in available for agent_id in selected):
             raise ValueError("project_team_agent_not_found")
-        if required_agent_id not in selected:
-            raise ValueError("project_team_planner_required")
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if not db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
                 db.rollback()
                 raise ValueError("project_not_found")
             db.execute("DELETE FROM project_agent_roles WHERE project_id=?", (project_id,))
+            db.execute(
+                "INSERT INTO project_agent_role_sets(project_id,updated_at) VALUES (?,?) "
+                "ON CONFLICT(project_id) DO UPDATE SET updated_at=excluded.updated_at",
+                (project_id, now()),
+            )
             db.executemany(
                 "INSERT INTO project_agent_roles(project_id,agent_id,added_at) VALUES (?,?,?)",
                 [(project_id, agent_id, now()) for agent_id in selected],
             )
             db.commit()
         return selected
+
+    def mission_agent_ids(self, mission_id: str, available_agent_ids: list[str] | None = None) -> list[str]:
+        with self._connect() as db:
+            mission = db.execute("SELECT project_id FROM missions WHERE id=?", (mission_id,)).fetchone()
+            if not mission:
+                return []
+            rows = [row[0] for row in db.execute(
+                "SELECT agent_id FROM mission_agent_roles WHERE mission_id=? ORDER BY added_at,agent_id",
+                (mission_id,),
+            )]
+            configured = db.execute(
+                "SELECT 1 FROM mission_agent_role_sets WHERE mission_id=?", (mission_id,),
+            ).fetchone()
+        project_agents = self.project_agent_ids(mission["project_id"], available_agent_ids)
+        return [agent_id for agent_id in rows if agent_id in project_agents] if configured else project_agents
+
+    def set_mission_agent_ids(self, mission_id: str, agent_ids: list[str],
+                              available_agent_ids: list[str], required_agent_id: str | None = None,
+                              lead_agent_id: str | None = None) -> list[str]:
+        if not isinstance(agent_ids, list) or any(not isinstance(item, str) for item in agent_ids):
+            raise ValueError("mission_team_invalid")
+        selected = list(dict.fromkeys(agent_ids))
+        if not selected:
+            raise ValueError("mission_team_requires_agent")
+        mission = self.mission(mission_id)
+        available = set(self.project_agent_ids(mission["project_id"], available_agent_ids)) if mission else set()
+        if any(agent_id not in available for agent_id in selected):
+            raise ValueError("mission_team_agent_not_in_project")
+        if lead_agent_id is not None and lead_agent_id not in selected:
+            raise ValueError("mission_team_lead_not_selected")
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM missions WHERE id=?", (mission_id,)).fetchone():
+                db.rollback()
+                raise ValueError("mission_not_found")
+            db.execute("DELETE FROM mission_agent_roles WHERE mission_id=?", (mission_id,))
+            db.execute(
+                "INSERT INTO mission_agent_role_sets(mission_id,updated_at) VALUES (?,?) "
+                "ON CONFLICT(mission_id) DO UPDATE SET updated_at=excluded.updated_at",
+                (mission_id, now()),
+            )
+            db.execute(
+                "INSERT INTO mission_agent_leads(mission_id,agent_id,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(mission_id) DO UPDATE SET agent_id=excluded.agent_id,updated_at=excluded.updated_at",
+                (mission_id, lead_agent_id, now()),
+            )
+            db.executemany(
+                "INSERT INTO mission_agent_roles(mission_id,agent_id,added_at) VALUES (?,?,?)",
+                [(mission_id, agent_id, now()) for agent_id in selected],
+            )
+            db.commit()
+        return selected
+
+    def mission_lead_agent_id(self, mission_id: str) -> str | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT agent_id FROM mission_agent_leads WHERE mission_id=?", (mission_id,),
+            ).fetchone()
+        return row[0] if row and row[0] in self.mission_agent_ids(mission_id) else None
 
     def create_project(self, repository_path: str, name: str, mission_title: str,
                        goal: str, project_goal: str | None = None,
@@ -1654,13 +1816,13 @@ class MissionStore:
             if mission["archived_at"]:
                 db.rollback()
                 return None
-            if mission["status"] == "completed":
-                db.rollback()
-                return None
             if mission["background"]:
-                if mission["status"] == "paused":
+                if mission["status"] in {"paused", "completed"}:
                     db.execute("UPDATE missions SET status='active' WHERE id=?", (mission_id,))
-                    self._append(db, "mission.resumed", "user", mission_id, {"background": True})
+                    self._append(db, "mission.resumed", "user", mission_id, {
+                        "background": True,
+                        **({"reason": "continued by user"} if mission["status"] == "completed" else {}),
+                    })
                 db.commit()
                 updated = dict(mission)
                 updated["status"] = "active"
@@ -2164,8 +2326,8 @@ class MissionStore:
             raise ValueError("one_time_schedule_cannot_have_cron_expression")
         if cadence == "event":
             if trigger_event_type not in {
-                "repo.test_run.completed", "repo.file.changed", "mission.completed", "artifact.created",
-                "github.workflow_run.failed",
+                "repo.test_run.completed", "repo.test_run.failed", "repo.file.changed", "mission.completed",
+                "artifact.created", "github.workflow_run.failed", "message.created",
             }:
                 raise ValueError("event_trigger_type_not_supported")
             try:
@@ -3160,24 +3322,53 @@ class MissionStore:
                 ).fetchone()[0]
                 if latest <= schedule["event_cursor"]:
                     continue
+                local_test_source_filter = (
+                    " AND json_extract(payload,'$.source') IN "
+                    "('run_repository_tests','pydantic_ai_harness_test',"
+                    "'pydantic_ai_harness_background_test','background_command')"
+                    if schedule["trigger_event_type"] in {
+                        "repo.test_run.completed", "repo.test_run.failed",
+                    } else ""
+                )
                 failure_filter = (
-                    " AND CAST(json_extract(payload,'$.failed') AS INTEGER)>0"
+                    " AND COALESCE(CAST(json_extract(payload,'$.cancelled') AS INTEGER),0)=0 "
+                    "AND COALESCE(CAST(json_extract(payload,'$.timedOut') AS INTEGER),0)=0 "
+                    "AND (CAST(json_extract(payload,'$.failed') AS INTEGER)>0 OR "
+                    "(json_extract(payload,'$.failed') IS NULL "
+                    "AND CAST(json_extract(payload,'$.exitCode') AS INTEGER)<>0))"
+                    if schedule["trigger_event_type"] == "repo.test_run.failed" else ""
+                )
+                completed_test_filter = (
+                    " AND COALESCE(CAST(json_extract(payload,'$.cancelled') AS INTEGER),0)=0 "
+                    "AND COALESCE(CAST(json_extract(payload,'$.timedOut') AS INTEGER),0)=0 "
+                    "AND COALESCE(CAST(json_extract(payload,'$.failed') AS INTEGER),0)=0 "
+                    "AND CAST(json_extract(payload,'$.exitCode') AS INTEGER)=0"
                     if schedule["trigger_event_type"] == "repo.test_run.completed" else ""
+                )
+                event_type = (
+                    "repo.test_run.completed"
+                    if schedule["trigger_event_type"] == "repo.test_run.failed"
+                    else schedule["trigger_event_type"]
                 )
                 path_filter = (
                     " AND json_extract(payload,'$.path') GLOB ?"
                     if schedule["event_path_pattern"] else ""
                 )
+                actor_filter = (
+                    " AND actor_id='user'"
+                    if schedule["trigger_event_type"] == "message.created" else ""
+                )
                 query_parameters: tuple[Any, ...] = (
                     schedule["project_id"], schedule["event_source_mission_id"],
-                    schedule["trigger_event_type"], schedule["event_cursor"], latest,
+                    event_type, schedule["event_cursor"], latest,
                 )
                 if path_filter:
                     query_parameters += (schedule["event_path_pattern"],)
                 event = db.execute(
                     f"""SELECT sequence,id,mission_id,event_type,actor_id,payload,created_at
                         FROM events WHERE project_id=? AND mission_id=? AND event_type=?
-                          AND sequence>? AND sequence<=? {failure_filter}{path_filter}
+                        AND sequence>? AND sequence<=?
+                          {local_test_source_filter}{failure_filter}{completed_test_filter}{actor_filter}{path_filter}
                         ORDER BY sequence DESC LIMIT 1""",
                     query_parameters,
                 ).fetchone()
@@ -3195,12 +3386,14 @@ class MissionStore:
                     "SELECT title FROM missions WHERE id=?", (event["mission_id"],),
                 ).fetchone()[0]
                 event_summary = {
-                    "repo.test_run.completed": "A test run failed",
+                    "repo.test_run.completed": "A test run completed",
+                    "repo.test_run.failed": "A test run failed",
                     "repo.file.changed": "A repository file changed",
                     "mission.completed": "A chat completed",
                     "artifact.created": "An artifact was created",
                     "github.workflow_run.failed": "A GitHub Actions workflow failed",
-                }.get(event["event_type"], "A project event occurred")
+                    "message.created": "A user sent a message",
+                }.get(schedule["trigger_event_type"], "A project event occurred")
                 event_summary += f" in chat {source_title!r}."
                 if isinstance(event_payload, dict):
                     if event["event_type"] == "repo.test_run.completed":
@@ -4642,20 +4835,32 @@ class MissionStore:
                 raise ValueError("project_not_found")
             return Path(row[0]).resolve(strict=True)
 
-    def create_background_run(self, mission_id: str, argv: list[str], cwd: str, pid: int) -> dict[str, Any]:
+    def create_background_run(self, mission_id: str, argv: list[str], cwd: str) -> dict[str, Any]:
+        """Durably reserve a command before launch; startup treats an unsettled intent as unknown."""
         mission = self.mission(mission_id)
         if not mission:
             raise ValueError("mission_not_found")
         run = {"id": str(uuid.uuid4()), "project_id": mission["project_id"], "mission_id": mission_id,
-               "argv": json.dumps(argv), "cwd": cwd, "pid": pid, "status": "running",
+               "argv": json.dumps(argv), "cwd": cwd, "pid": None, "status": "starting",
                "exit_code": None, "output": "", "started_at": now(), "finished_at": None}
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("INSERT INTO background_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", tuple(run.values()))
             self._append(db, "repo.command.started", "user", mission_id,
-                         {"runId": run["id"], "argv": argv, "cwd": cwd})
+                         {"runId": run["id"], "argv": argv, "cwd": cwd, "status": "starting"})
             db.commit()
         return self._background_run(run)
+
+    def mark_background_run_running(self, run_id: str, pid: int) -> dict[str, Any] | None:
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                "UPDATE background_runs SET pid = ?, status = 'running' WHERE id = ? AND status = 'starting'",
+                (pid, run_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = db.execute("SELECT * FROM background_runs WHERE id = ?", (run_id,)).fetchone()
+            return self._background_run(dict(row))
 
     @staticmethod
     def _background_run(row: dict[str, Any]) -> dict[str, Any]:
@@ -4675,7 +4880,9 @@ class MissionStore:
         """Mark runs whose monitor belonged to a previous runtime as interrupted."""
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            rows = db.execute("SELECT id, mission_id FROM background_runs WHERE status = 'running'").fetchall()
+            rows = db.execute(
+                "SELECT id, mission_id FROM background_runs WHERE status IN ('starting', 'running')"
+            ).fetchall()
             for row in rows:
                 db.execute("UPDATE background_runs SET status = 'interrupted', finished_at = ? WHERE id = ?",
                            (now(), row["id"]))
@@ -4695,11 +4902,42 @@ class MissionStore:
             if not row:
                 db.rollback()
                 return None
-            if row["status"] == "running":
+            if row["status"] in {"starting", "running"}:
                 db.execute("UPDATE background_runs SET status = ?, exit_code = ?, finished_at = ? WHERE id = ?",
                            (status, exit_code, now(), run_id))
-                self._append(db, "repo.command.completed", "user", row["mission_id"],
-                             {"runId": run_id, "status": status, "exitCode": exit_code})
+                command_event = self._append(
+                    db, "repo.command.completed", "user", row["mission_id"],
+                    {"runId": run_id, "status": status, "exitCode": exit_code},
+                )
+                # Runs can be a project's test runner too. Publish test evidence
+                # only for a command that actually started, exited, and ran from
+                # this project's checkout; launch failures, cancellations and
+                # crash recovery remain command events only.
+                if (row["pid"] is not None and status in {"completed", "failed"}
+                        and isinstance(exit_code, int) and not isinstance(exit_code, bool)):
+                    project = db.execute(
+                        "SELECT repository FROM projects WHERE id = ?", (row["project_id"],),
+                    ).fetchone()
+                    if project:
+                        try:
+                            checkout = Path(project["repository"]).resolve(strict=True)
+                            run_cwd = Path(row["cwd"]).resolve(strict=True)
+                            argv = json.loads(row["argv"])
+                        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                            argv = None
+                            run_cwd = None
+                            checkout = None
+                        evidence = (
+                            background_test_run_evidence(argv, row["output"], exit_code, run_cwd)
+                            if checkout is not None and run_cwd == checkout else None
+                        )
+                        if evidence is not None:
+                            self._append(db, "repo.test_run.completed", "user", row["mission_id"], {
+                                "runId": run_id,
+                                **evidence,
+                                "source": "background_command",
+                                "sourceCommandEventId": command_event["id"],
+                            })
             updated = dict(db.execute("SELECT * FROM background_runs WHERE id = ?", (run_id,)).fetchone())
             db.commit()
             return self._background_run(updated)
@@ -6310,20 +6548,27 @@ class MissionStore:
             row = db.execute(
                 "SELECT mode FROM project_approval_policies WHERE project_id=?", (project_id,)
             ).fetchone()
-        return {"mode": row["mode"] if row else "standard"}
+            auto_review = db.execute(
+                "SELECT enabled FROM project_approval_auto_review WHERE project_id=?", (project_id,)
+            ).fetchone()
+        mode = row["mode"] if row else "standard"
+        return {"mode": "auto_review" if auto_review and auto_review["enabled"] else mode}
 
     def project_approval_policy_for_mission(self, mission_id: str) -> str:
         with self._connect() as db:
             row = db.execute(
-                """SELECT policy.mode FROM missions
+                """SELECT CASE WHEN auto_review.enabled=1 THEN 'auto_review'
+                                  ELSE COALESCE(policy.mode,'standard') END AS mode
+                   FROM missions
                    LEFT JOIN project_approval_policies policy ON policy.project_id=missions.project_id
+                   LEFT JOIN project_approval_auto_review auto_review ON auto_review.project_id=missions.project_id
                    WHERE missions.id=?""",
                 (mission_id,),
             ).fetchone()
         return row["mode"] if row and row["mode"] else "standard"
 
     def set_project_approval_policy(self, project_id: str, mode: str) -> dict[str, str]:
-        valid_modes = {"standard", "review_changes", "confirm_every_call"}
+        valid_modes = {"standard", "review_changes", "confirm_every_call", "auto_review"}
         if not isinstance(mode, str) or mode not in valid_modes:
             raise ValueError("approval_mode_invalid")
         with self._lock, self._connect() as db:
@@ -6331,12 +6576,23 @@ class MissionStore:
             if not db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
                 db.rollback()
                 raise ValueError("project_not_found")
+            auto_review_enabled = int(mode == "auto_review")
+            stored_mode = "standard" if auto_review_enabled else mode
             db.execute(
                 """INSERT INTO project_approval_policies(project_id,mode,updated_at)
                    VALUES (?,?,?) ON CONFLICT(project_id) DO UPDATE SET
                    mode=excluded.mode,updated_at=excluded.updated_at""",
-                (project_id, mode, now()),
+                (project_id, stored_mode, now()),
             )
+            if auto_review_enabled:
+                db.execute(
+                    """INSERT INTO project_approval_auto_review(project_id,enabled,updated_at)
+                       VALUES (?,1,?) ON CONFLICT(project_id) DO UPDATE SET
+                       enabled=1,updated_at=excluded.updated_at""",
+                    (project_id, now()),
+                )
+            else:
+                db.execute("DELETE FROM project_approval_auto_review WHERE project_id=?", (project_id,))
             mission = db.execute(
                 """SELECT id FROM missions WHERE project_id=?
                    ORDER BY (status='active' AND background=0) DESC,created_at DESC LIMIT 1""",
@@ -6816,40 +7072,330 @@ class MissionStore:
             db.commit()
             return item
 
-    def record_harness_node_test_result(
+    def begin_repository_test_run(
+        self, mission_id: str, agent_id: str, trigger_sequence: int, run_id: str,
+        argv: list[str], work_item_id: str | None, tool_call_id: str | None,
+        timeout_seconds: int,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+        """Reserve one Runs test execution and reuse its identity on tool-call retries."""
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            started = None
+            if tool_call_id:
+                started = db.execute(
+                    "SELECT * FROM events WHERE mission_id=? AND event_type='repo.test_run.started' "
+                    "AND json_extract(payload,'$.toolCallId')=? ORDER BY sequence LIMIT 1",
+                    (mission_id, tool_call_id),
+                ).fetchone()
+            if started:
+                started_event = {
+                    "id": started["id"], "sequence": started["sequence"],
+                    "missionId": started["mission_id"], "type": started["event_type"],
+                    "actorId": started["actor_id"], "payload": json.loads(started["payload"]),
+                    "createdAt": started["created_at"],
+                }
+                existing_run_id = started_event["payload"].get("runId")
+                completed = db.execute(
+                    "SELECT * FROM events WHERE mission_id=? AND event_type='repo.test_run.completed' "
+                    "AND json_extract(payload,'$.runId')=? ORDER BY sequence LIMIT 1",
+                    (mission_id, existing_run_id),
+                ).fetchone()
+                completed_event = None
+                if completed:
+                    completed_event = {
+                        "id": completed["id"], "sequence": completed["sequence"],
+                        "missionId": completed["mission_id"], "type": completed["event_type"],
+                        "actorId": completed["actor_id"], "payload": json.loads(completed["payload"]),
+                        "createdAt": completed["created_at"],
+                    }
+                db.commit()
+                return started_event, completed_event, False
+
+            mission = db.execute("SELECT 1 FROM missions WHERE id=?", (mission_id,)).fetchone()
+            if not mission:
+                db.rollback()
+                raise ValueError("mission_not_found")
+            event = self._append(db, "repo.test_run.started", agent_id, mission_id, {
+                "runId": run_id, "argv": argv, "workItemId": work_item_id,
+                "toolCallId": tool_call_id, "timeoutSeconds": timeout_seconds,
+                "source": "run_repository_tests",
+            })
+            db.commit()
+            return event, None, True
+
+    def _persist_repository_test_run(
         self, mission_id: str, agent_id: str, trigger_sequence: int,
-        tool_call_id: str, command: str, output: object, work_item_id: str | None,
-        source_tool_event_id: str | None = None,
+        tool_call_id: str | None, run_id: str, argv: list[str], cwd: str,
+        exit_code: int, stdout: str, stderr: str, work_item_id: str | None,
+        source: str, source_tool_event_id: str | None = None,
+        cancelled: bool = False, timed_out: bool = False,
+        extra_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Promote a complete Harness Node TAP result into durable verification history."""
-        evidence = node_test_run_evidence(command, output)
-        if evidence is None:
+        mission = self.mission(mission_id)
+        if not mission:
             return None
+        started_at = now()
+        finished_at = now()
+        # POSIX subprocesses report signal termination as a negative return code.
+        # Normalize it here too, so callers that only have an exit code cannot
+        # persist an interrupted run as an ordinary test failure.
+        cancelled = cancelled or exit_code < 0
+        status = "cancelled" if cancelled else "failed" if timed_out or exit_code != 0 else "completed"
+        output = "\n".join(part for part in (stdout, stderr) if part)
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute(
                 "SELECT id,sequence,event_type,actor_id,payload,created_at FROM events "
                 "WHERE mission_id=? AND event_type='repo.test_run.completed' "
-                "AND json_extract(payload,'$.sourceToolCallId')=? LIMIT 1",
-                (mission_id, tool_call_id),
+                "AND (json_extract(payload,'$.runId')=? OR json_extract(payload,'$.sourceToolCallId')=? "
+                "OR json_extract(payload,'$.toolCallId')=?) "
+                "ORDER BY sequence LIMIT 1", (mission_id, run_id, tool_call_id, tool_call_id),
             ).fetchone()
             if existing:
+                existing_payload = json.loads(existing["payload"])
+                if not isinstance(existing_payload, dict):
+                    existing_payload = {}
+                stored_run_id = existing_payload.get("runId")
+                if isinstance(stored_run_id, str) and stored_run_id:
+                    run_id = stored_run_id
+                stored_argv = existing_payload.get("argv")
+                if not isinstance(stored_argv, list) or any(not isinstance(arg, str) for arg in stored_argv):
+                    stored_argv = argv
+                stored_exit_code = existing_payload.get("exitCode")
+                if not isinstance(stored_exit_code, int) or isinstance(stored_exit_code, bool):
+                    stored_exit_code = exit_code
+                stored_stdout = existing_payload.get("stdout")
+                stored_stderr = existing_payload.get("stderr")
+                stored_stdout = stored_stdout if isinstance(stored_stdout, str) else stdout
+                stored_stderr = stored_stderr if isinstance(stored_stderr, str) else stderr
+                stored_cancelled = bool(existing_payload.get("cancelled", cancelled)) or stored_exit_code < 0
+                stored_timed_out = bool(existing_payload.get("timedOut", timed_out))
+                stored_status = (
+                    "cancelled" if stored_cancelled else
+                    "failed" if stored_timed_out or stored_exit_code != 0 else "completed"
+                )
+                stored_finished_at = existing["created_at"]
+                started = db.execute(
+                    "SELECT created_at FROM events WHERE mission_id=? AND event_type='repo.test_run.started' "
+                    "AND json_extract(payload,'$.runId')=? ORDER BY sequence LIMIT 1",
+                    (mission_id, run_id),
+                ).fetchone()
+                existing_command = db.execute(
+                    "SELECT id FROM events WHERE mission_id=? AND event_type='repo.command.completed' "
+                    "AND json_extract(payload,'$.runId')=? ORDER BY sequence LIMIT 1",
+                    (mission_id, run_id),
+                ).fetchone()
+                db.execute(
+                    "INSERT OR IGNORE INTO background_runs "
+                    "(id,project_id,mission_id,argv,cwd,pid,status,exit_code,output,started_at,finished_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (run_id, mission["project_id"], mission_id, json.dumps(stored_argv), cwd, None,
+                     stored_status, stored_exit_code,
+                     "\n".join(part for part in (stored_stdout, stored_stderr) if part),
+                     started["created_at"] if started else stored_finished_at,
+                     stored_finished_at),
+                )
+                if not existing_command:
+                    self._append(db, "repo.command.completed", agent_id, mission_id, {
+                        "runId": run_id, "status": stored_status,
+                        "exitCode": stored_exit_code, "argv": stored_argv, "cwd": cwd,
+                        "source": existing_payload.get("source", source),
+                    })
+                db.execute(
+                    "UPDATE background_runs SET status=?,exit_code=?,output=?,finished_at=? "
+                    "WHERE id=? AND mission_id=? AND status IN ('starting','running')",
+                    (stored_status, stored_exit_code,
+                     "\n".join(part for part in (stored_stdout, stored_stderr) if part),
+                     stored_finished_at, run_id, mission_id),
+                )
                 db.commit()
                 return dict(existing)
+            existing_command = db.execute(
+                "SELECT id,sequence,event_type,actor_id,payload,created_at FROM events "
+                "WHERE mission_id=? AND event_type='repo.command.completed' "
+                "AND json_extract(payload,'$.runId')=? ORDER BY sequence LIMIT 1",
+                (mission_id, run_id),
+            ).fetchone()
+            db.execute(
+                "INSERT OR IGNORE INTO background_runs "
+                "(id,project_id,mission_id,argv,cwd,pid,status,exit_code,output,started_at,finished_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, mission["project_id"], mission_id, json.dumps(argv), cwd, None,
+                 status, exit_code, output, started_at, finished_at),
+            )
+            command_event = dict(existing_command) if existing_command else self._append(
+                db, "repo.command.completed", agent_id, mission_id, {
+                    "runId": run_id, "status": status, "exitCode": exit_code,
+                    "argv": argv, "cwd": cwd, "source": source,
+                },
+            )
             event = self._append(db, "repo.test_run.completed", agent_id, mission_id, {
-                "runId": f"harness:{tool_call_id}",
-                **evidence,
-                "cancelled": False,
-                "timedOut": False,
-                "workItemId": work_item_id,
-                "toolCallId": tool_call_id,
-                "source": "pydantic_ai_harness",
+                "runId": run_id, "argv": argv, "exitCode": exit_code,
+                "stdout": stdout, "stderr": stderr, "cancelled": cancelled,
+                "timedOut": timed_out, "workItemId": work_item_id,
+                "toolCallId": tool_call_id, "source": source,
                 "sourceToolCallId": tool_call_id,
                 "sourceToolEventId": source_tool_event_id,
+                "sourceCommandEventId": command_event["id"],
+                **(extra_payload or {}),
                 "triggerSequence": trigger_sequence,
             })
+            db.execute(
+                "UPDATE background_runs SET status=?,exit_code=?,output=?,finished_at=? "
+                "WHERE id=? AND mission_id=? AND status IN ('starting','running')",
+                (status, exit_code, output, event["createdAt"], run_id, mission_id),
+            )
             db.commit()
             return event
+
+    def record_repository_test_run_result(
+        self, mission_id: str, agent_id: str, trigger_sequence: int,
+        tool_call_id: str | None, run_id: str, argv: list[str], cwd: str,
+        exit_code: int, stdout: str, stderr: str, work_item_id: str | None,
+        source: str, source_tool_event_id: str | None = None,
+        cancelled: bool = False, timed_out: bool = False,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Record one recognized repository test in Runs and durable event history."""
+        return self._persist_repository_test_run(
+            mission_id, agent_id, trigger_sequence, tool_call_id, run_id, argv, cwd,
+            exit_code, stdout, stderr, work_item_id, source, source_tool_event_id,
+            cancelled, timed_out, extra_payload,
+        )
+
+    def record_harness_test_run_started(
+        self, mission_id: str, agent_id: str, trigger_sequence: int,
+        command_id: str, command: str, work_item_id: str | None,
+        cwd: str, tool_call_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Correlate an allowlisted Harness background test with its final status check."""
+        argv = repository_test_command_argv(command, cwd=cwd)
+        if argv is None or not re.fullmatch(r"[0-9a-f]{32}", command_id):
+            return None
+        mission = self.mission(mission_id)
+        if not mission:
+            return None
+        run_id = f"harness:{mission_id}:{command_id}"
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                "SELECT id,sequence,event_type,actor_id,payload,created_at FROM events "
+                "WHERE mission_id=? AND event_type='repo.test_run.started' "
+                "AND json_extract(payload,'$.harnessCommandId')=? ORDER BY sequence LIMIT 1",
+                (mission_id, command_id),
+            ).fetchone()
+            if existing:
+                payload = json.loads(existing["payload"])
+                existing_run_id = payload.get("runId") or run_id
+                existing_argv = payload.get("argv")
+                if not isinstance(existing_argv, list):
+                    existing_argv = argv
+                existing_cwd = payload.get("cwd")
+                if not isinstance(existing_cwd, str):
+                    existing_cwd = cwd
+                db.execute(
+                    "INSERT OR IGNORE INTO background_runs "
+                    "(id,project_id,mission_id,argv,cwd,pid,status,exit_code,output,started_at,finished_at) "
+                    "VALUES (?,?,?,?,?,?, 'running',NULL,'',?,NULL)",
+                    (existing_run_id, mission["project_id"], mission_id,
+                     json.dumps(existing_argv), existing_cwd, None, existing["created_at"]),
+                )
+                db.commit()
+                return dict(existing)
+
+            # Harness can replay a start tool call and assign a fresh shell command
+            # ID. Keep the original logical run identity and register the new ID as
+            # an alias, so whichever retry finishes still produces one Runs record.
+            retried_call = None
+            if tool_call_id:
+                retried_call = db.execute(
+                    "SELECT id,sequence,event_type,actor_id,payload,created_at FROM events "
+                    "WHERE mission_id=? AND event_type='repo.test_run.started' "
+                    "AND json_extract(payload,'$.toolCallId')=? ORDER BY sequence LIMIT 1",
+                    (mission_id, tool_call_id),
+                ).fetchone()
+            if retried_call:
+                prior_payload = json.loads(retried_call["payload"])
+                if prior_payload.get("argv") != argv:
+                    db.commit()
+                    return None
+                prior_run_id = prior_payload.get("runId")
+                event = self._append(db, "repo.test_run.started", agent_id, mission_id, {
+                    "runId": prior_run_id, "harnessCommandId": command_id,
+                    "command": command, "argv": argv, "workItemId": work_item_id,
+                    "toolCallId": tool_call_id, "triggerSequence": trigger_sequence,
+                    "source": "pydantic_ai_harness_background_test", "cwd": cwd,
+                    "retryOfHarnessCommandId": prior_payload.get("harnessCommandId"),
+                })
+                db.execute(
+                    "INSERT OR IGNORE INTO background_runs "
+                    "(id,project_id,mission_id,argv,cwd,pid,status,exit_code,output,started_at,finished_at) "
+                    "VALUES (?,?,?,?,?,?, 'running',NULL,'',?,NULL)",
+                    (prior_run_id, mission["project_id"], mission_id, json.dumps(argv), cwd,
+                     None, retried_call["created_at"]),
+                )
+                db.commit()
+                return event
+            event = self._append(db, "repo.test_run.started", agent_id, mission_id, {
+                "runId": run_id, "harnessCommandId": command_id, "command": command,
+                "argv": argv, "workItemId": work_item_id,
+                "toolCallId": tool_call_id, "triggerSequence": trigger_sequence,
+                "source": "pydantic_ai_harness_background_test", "cwd": cwd,
+            })
+            db.execute(
+                "INSERT OR IGNORE INTO background_runs "
+                "(id,project_id,mission_id,argv,cwd,pid,status,exit_code,output,started_at,finished_at) "
+                "VALUES (?,?,?,?,?,?, 'running',NULL,'',?,NULL)",
+                (run_id, mission["project_id"], mission_id, json.dumps(argv), cwd,
+                 None, event["createdAt"]),
+            )
+            db.commit()
+            return event
+
+    def harness_test_run_started(self, mission_id: str, command_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT payload FROM events WHERE mission_id=? AND event_type='repo.test_run.started' "
+                "AND json_extract(payload,'$.harnessCommandId')=? ORDER BY sequence DESC LIMIT 1",
+                (mission_id, command_id),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def record_harness_test_run_result(
+        self, mission_id: str, agent_id: str, trigger_sequence: int,
+        tool_call_id: str, command: str, output: object, work_item_id: str | None,
+        source_tool_event_id: str | None = None, *, run_id: str | None = None,
+        cwd: str | None = None, source: str = "pydantic_ai_harness_test",
+    ) -> dict[str, Any] | None:
+        """Durably record a recognized Harness test in Runs and the event log."""
+        evidence = repository_test_run_evidence(command, output, cwd=cwd)
+        if evidence is None:
+            return None
+        mission = self.mission(mission_id)
+        project = self.project(mission["project_id"]) if mission else None
+        extra_payload = {key: value for key, value in evidence.items()
+                         if key not in {"argv", "exitCode", "stdout", "stderr"}}
+        return self.record_repository_test_run_result(
+            mission_id, agent_id, trigger_sequence, tool_call_id,
+            run_id or f"harness:{mission_id}:{tool_call_id}", evidence["argv"],
+            str(cwd or (project or {}).get("repository") or ""),
+            evidence["exitCode"], evidence["stdout"], evidence["stderr"],
+            work_item_id, source, source_tool_event_id,
+            cancelled=bool(evidence.get("cancelled")),
+            timed_out=bool(evidence.get("timedOut")),
+            extra_payload=extra_payload,
+        )
+
+    def record_harness_node_test_result(
+        self, mission_id: str, agent_id: str, trigger_sequence: int,
+        tool_call_id: str, command: str, output: object, work_item_id: str | None,
+        source_tool_event_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Compatibility wrapper for older callers; all allowlisted Harness tests share one path."""
+        return self.record_harness_test_run_result(
+            mission_id, agent_id, trigger_sequence, tool_call_id, command, output,
+            work_item_id, source_tool_event_id,
+        )
 
     def approval(self, interaction_id: str) -> dict[str, Any] | None:
         with self._connect() as db:
@@ -6872,6 +7418,12 @@ class MissionStore:
             result = [dict(row) for row in rows]
         for row in result:
             row["tool_arguments"] = json.loads(row["tool_arguments"])
+            if row.get("message_history_encrypted"):
+                from .secure_storage import decrypt_approval_history
+
+                row["message_history"] = decrypt_approval_history(
+                    self.data_dir, row["interaction_id"], row["message_history_encrypted"],
+                )
         return result
 
     def resume_resolved_deferred_tool_approval(self, interaction_id: str) -> int | None:
@@ -6926,6 +7478,23 @@ class MissionStore:
             )
             db.commit()
             return int(row["trigger_sequence"])
+
+    def resume_resolved_deferred_tool_approval_for_trigger(
+        self, agent_id: str, mission_id: str, trigger_sequence: int,
+    ) -> int | None:
+        """Find and rewind a resolved approval before a worker retries its original event."""
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT d.interaction_id FROM deferred_tool_approvals d
+                   JOIN interactions i ON i.id=d.interaction_id
+                   WHERE d.agent_id=? AND d.mission_id=? AND d.trigger_sequence=?
+                     AND d.status='pending' AND i.status='resolved'
+                   ORDER BY d.created_at LIMIT 1""",
+                (agent_id, mission_id, trigger_sequence),
+            ).fetchone()
+        if not row:
+            return None
+        return self.resume_resolved_deferred_tool_approval(row["interaction_id"])
 
     def update_deferred_tool_approval(self, interaction_id: str, status: str) -> None:
         if status not in {"pending", "approved", "denied", "consumed", "unknown_after_crash"}:
@@ -7374,6 +7943,24 @@ class MissionStore:
         with self._connect() as db:
             return self._events(db, mission_id, sequence)
 
+    def latest_user_message(self, mission_id: str, after_sequence: int = 0) -> dict[str, Any] | None:
+        """Return the latest user message after a run's trigger without loading the event history."""
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT sequence,payload FROM events
+                   WHERE mission_id=? AND sequence>? AND event_type='message.created' AND actor_id='user'
+                   ORDER BY sequence DESC LIMIT 1""",
+                (mission_id, after_sequence),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            payload = {}
+        text = payload.get("text") if isinstance(payload, dict) else None
+        return {"sequence": int(row["sequence"]), "text": text if isinstance(text, str) else ""}
+
     def has_event_from_actor_after(self, mission_id: str, sequence: int,
                                    actor_id: str) -> bool:
         """Check for actor activity after a cursor without materialising event payloads."""
@@ -7439,6 +8026,13 @@ class MissionStore:
         for row in rows:
             if row["event_type"] == "repo.test_run.completed":
                 continue
+            if row["event_type"] == "repo.command.completed":
+                try:
+                    run_id = json.loads(row["payload"]).get("runId")
+                except (TypeError, ValueError):
+                    run_id = None
+                if run_id and run_id in completed_runs:
+                    continue
             if row["event_type"] == "agent.message.created":
                 try:
                     tool_call_id = json.loads(row["payload"]).get("toolCallId")
@@ -7996,8 +8590,43 @@ class MissionStore:
             return row[0] if row else None
 
     def require_work_claim(self, mission_id: str, agent_id: str, work_item_id: str | None) -> None:
-        """Repository access is granted by the agent profile, not workflow or plan state."""
-        return None
+        """Require a claim for pending plan work, but allow direct requests on an empty plan."""
+        timestamp = now()
+        with self._connect() as db:
+            mission = db.execute(
+                "SELECT recipe_id FROM missions WHERE id = ?", (mission_id,),
+            ).fetchone()
+            if not mission:
+                raise ValueError("mission_not_found")
+            if mission["recipe_id"] != "goal-driven-sdlc":
+                return
+            if work_item_id is None:
+                row = db.execute(
+                    """SELECT id FROM work_items
+                       WHERE mission_id = ? AND owner = ? AND status = 'claimed' AND lease_until >= ?
+                       ORDER BY updated_at DESC LIMIT 1""",
+                    (mission_id, agent_id, timestamp),
+                ).fetchone()
+            else:
+                row = db.execute(
+                    """SELECT id FROM work_items
+                       WHERE id = ? AND mission_id = ? AND owner = ?
+                         AND status = 'claimed' AND lease_until >= ?""",
+                    (work_item_id, mission_id, agent_id, timestamp),
+                ).fetchone()
+            has_unfinished_work = db.execute(
+                "SELECT 1 FROM work_items WHERE mission_id = ? "
+                "AND status NOT IN ('done', 'cancelled') LIMIT 1",
+                (mission_id,),
+            ).fetchone()
+        # A plan is optional guidance. When it has no unfinished work, a direct
+        # user request remains actionable without requiring an empty-plan placeholder.
+        # Existing claims and unfinished plan items still enforce ownership and
+        # dependency safety before repository actions proceed.
+        if not row and work_item_id is None and not has_unfinished_work:
+            return
+        if not row:
+            raise PermissionError("repository_action_requires_a_live_work_claim")
 
     def create_interaction(self, mission_id: str, interaction_type: str, title: str,
                            details: str, target: str | None, requested_by: str,
@@ -8054,7 +8683,7 @@ class MissionStore:
         self, *, mission_id: str, requested_by: str, title: str, details: str,
         target: str, trigger_sequence: int, run_id: str, conversation_id: str,
         tool_call_id: str, tool_name: str, tool_arguments: dict[str, Any],
-        message_history: str, tool_summary: str = "",
+        message_history: str, approval_capability: str = "", tool_summary: str = "",
         activity_labels: dict[str, str] | None = None,
         work_item_id: str | None = None,
     ) -> dict[str, Any]:
@@ -8067,6 +8696,9 @@ class MissionStore:
         }
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            from .secure_storage import encrypt_approval_history
+
+            encrypted_history = encrypt_approval_history(self.data_dir, interaction["id"], message_history)
             db.execute(
                 "INSERT INTO interactions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 tuple(interaction.values()),
@@ -8074,12 +8706,12 @@ class MissionStore:
             db.execute(
                 """INSERT INTO deferred_tool_approvals (
                     interaction_id, mission_id, agent_id, trigger_sequence, run_id,
-                    conversation_id, tool_call_id, tool_name, tool_arguments,
-                    message_history, target, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                    conversation_id, tool_call_id, tool_name, tool_arguments, approval_capability,
+                    message_history, message_history_encrypted, target, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
                 (interaction["id"], mission_id, requested_by, trigger_sequence,
                  run_id, conversation_id, tool_call_id, tool_name,
-                 json.dumps(tool_arguments), message_history, target,
+                 json.dumps(tool_arguments), approval_capability, "[encrypted:v1]", encrypted_history, target,
                  interaction["created_at"], interaction["created_at"]),
             )
             self._append(
@@ -8098,6 +8730,23 @@ class MissionStore:
             db.commit()
         return interaction
 
+    def record_automatic_tool_review(
+        self, mission_id: str, agent_id: str, *, tool_call_id: str, tool_name: str,
+        decision: str, reason: str, summary: str = "",
+    ) -> dict[str, Any]:
+        if decision not in {"approved", "denied", "needs_user"}:
+            raise ValueError("automatic_tool_review_decision_invalid")
+        with self._lock, self._connect() as db:
+            event = self._append(db, "agent.tool.auto_reviewed", agent_id, mission_id, {
+                "toolCallId": tool_call_id,
+                "toolName": tool_name[:160],
+                "decision": decision,
+                "reason": reason[:1000],
+                "summary": summary[:240],
+            })
+            db.commit()
+            return event
+
     def pending_interactions(self) -> list[dict[str, Any]]:
         with self._connect() as db:
             rows = db.execute("""
@@ -8105,7 +8754,9 @@ class MissionStore:
                        missions.goal AS mission_goal, missions.status AS mission_status,
                        projects.id AS project_id, projects.name AS project_name,
                        projects.goal AS project_goal, projects.repository AS repository,
-                       deferred_tool_approvals.tool_name AS tool_name
+                       deferred_tool_approvals.tool_name AS tool_name,
+                       CASE WHEN deferred_tool_approvals.approval_capability LIKE 'tool_action_hmac:%'
+                            THEN 1 ELSE 0 END AS persistent_access_available
                 FROM interactions
                 JOIN missions ON missions.id = interactions.mission_id
                 JOIN projects ON projects.id = missions.project_id
@@ -8883,14 +9534,24 @@ class MissionStore:
                     db.rollback()
                     raise ValueError("persistent_access_requires_approval")
                 deferred = db.execute(
-                    "SELECT tool_name FROM deferred_tool_approvals WHERE interaction_id = ?",
+                    "SELECT tool_name, approval_capability FROM deferred_tool_approvals WHERE interaction_id = ?",
                     (interaction_id,),
                 ).fetchone()
-                if interaction["interaction_type"] != "approval" or not deferred or deferred["tool_name"] not in {
-                    "duckduckgo_search", "web_fetch",
-                }:
+                is_public_web = bool(deferred and deferred["tool_name"] in {"duckduckgo_search", "web_fetch"})
+                is_irreversible = bool(deferred and deferred["tool_name"] in {
+                    "request_file_deletion_approval", "delete_repository_file",
+                    "request_isolated_integration", "integrate_isolated_changes",
+                })
+                if (interaction["interaction_type"] != "approval" or not deferred
+                        or (not is_public_web and (
+                            is_irreversible
+                            or not str(deferred["approval_capability"] or "").startswith("tool_action_hmac:")
+                        ))):
                     db.rollback()
-                    raise ValueError("persistent_access_only_available_for_public_web_reads")
+                    raise ValueError("persistent_access_not_available_for_this_action")
+                if access_scope == "workspace" and not is_public_web:
+                    db.rollback()
+                    raise ValueError("workspace_access_only_available_for_public_web_reads")
                 mission = db.execute(
                     "SELECT project_id FROM missions WHERE id = ?", (interaction["mission_id"],),
                 ).fetchone()
@@ -8900,10 +9561,17 @@ class MissionStore:
                 project_id = mission["project_id"]
                 grant_project_id = project_id if access_scope in {"chat", "project"} else None
                 grant_mission_id = interaction["mission_id"] if access_scope == "chat" else None
+                capability = (
+                    "public_web_read" if is_public_web else
+                    deferred["approval_capability"]
+                )
+                if not capability:
+                    db.rollback()
+                    raise ValueError("persistent_access_requires_secure_fingerprint")
                 existing = db.execute(
-                    """SELECT id FROM access_grants WHERE scope = ? AND capability = 'public_web_read'
+                    """SELECT id FROM access_grants WHERE scope = ? AND capability = ?
                        AND project_id IS ? AND mission_id IS ?""",
-                    (access_scope, grant_project_id, grant_mission_id),
+                    (access_scope, capability, grant_project_id, grant_mission_id),
                 ).fetchone()
                 timestamp = now()
                 if existing:
@@ -8917,13 +9585,13 @@ class MissionStore:
                     db.execute(
                         """INSERT INTO access_grants
                            (id, scope, project_id, mission_id, capability, created_at, revoked_at)
-                           VALUES (?, ?, ?, ?, 'public_web_read', ?, NULL)""",
-                        (grant_id, access_scope, grant_project_id, grant_mission_id, timestamp),
+                           VALUES (?, ?, ?, ?, ?, ?, NULL)""",
+                        (grant_id, access_scope, grant_project_id, grant_mission_id, capability, timestamp),
                     )
                 grant = {
                     "id": grant_id, "scope": access_scope,
                     "project_id": grant_project_id, "mission_id": grant_mission_id,
-                    "capability": "public_web_read", "created_at": timestamp,
+                    "capability": capability, "created_at": timestamp,
                 }
             timestamp = now()
             db.execute("UPDATE interactions SET status = 'resolved', resolved_at = ?, resolution = ? WHERE id = ?", (timestamp, resolution, interaction_id))

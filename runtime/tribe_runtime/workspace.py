@@ -50,6 +50,96 @@ _REPOSITORY_IMAGE_MIME_TYPES = {
 }
 
 
+def is_approved_repository_test_command(argv: object) -> bool:
+    """Return whether an argument vector is within the repository test-command allowlist."""
+    if (not isinstance(argv, list) or not argv or len(argv) > 16
+            or any(not isinstance(arg, str) or len(arg) > 500 for arg in argv)):
+        return False
+    test_argv = argv
+    if argv[:2] == ["uv", "run"]:
+        index = 2
+        project_seen = False
+        while index < len(argv):
+            option = argv[index]
+            if option == "--project":
+                if project_seen or index + 1 >= len(argv):
+                    return False
+                project_path = Path(argv[index + 1])
+                if project_path.is_absolute() or ".." in project_path.parts:
+                    return False
+                project_seen = True
+                index += 2
+            elif option == "--extra":
+                if index + 1 >= len(argv):
+                    return False
+                extra = argv[index + 1]
+                if not extra or not all(char.isalnum() or char in "_.-" for char in extra):
+                    return False
+                index += 2
+            else:
+                break
+        test_argv = argv[index:]
+    return any(tuple(test_argv[:len(prefix)]) == prefix for prefix in _TEST_COMMANDS)
+
+
+def _uv_project_directory(root: Path, argv: list[str]) -> Path | None:
+    if argv[:2] != ["uv", "run"]:
+        return None
+    try:
+        project_index = argv.index("--project", 2)
+    except ValueError:
+        return None
+    if project_index + 1 >= len(argv):
+        return None
+    project = (root / argv[project_index + 1]).resolve()
+    repository = root.resolve()
+    if not project.is_relative_to(repository) or not (project / "pyproject.toml").is_file():
+        raise PermissionError("uv test project must be inside the repository and contain pyproject.toml")
+    return project
+
+
+def _project_python_environment_bin(root: Path, argv: list[str]) -> Path | None:
+    """Find an existing project venv beside the requested Python test paths."""
+    if argv[0] not in {"pytest", "python", "python3"}:
+        return None
+    project_root = root.resolve()
+    candidates: list[Path] = []
+    for argument in argv[1:]:
+        if argument.startswith("-") or not any(separator in argument for separator in ("/", "\\")):
+            continue
+        target = project_root / argument
+        try:
+            target = target.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if not target.is_relative_to(project_root):
+            continue
+        directory = target if target.is_dir() else target.parent
+        while directory.is_relative_to(project_root):
+            candidates.append(directory)
+            if directory == project_root:
+                break
+            directory = directory.parent
+    candidates.append(project_root)
+
+    seen: set[Path] = set()
+    scripts_name = "Scripts" if os.name == "nt" else "bin"
+    executable_names = {
+        "pytest": ("pytest.exe" if os.name == "nt" else "pytest",),
+        "python": ("python.exe" if os.name == "nt" else "python",),
+        "python3": (("python3.exe", "python.exe") if os.name == "nt" else ("python3",)),
+    }[argv[0]]
+    for directory in candidates:
+        if directory in seen:
+            continue
+        seen.add(directory)
+        for environment_name in (".venv", "venv"):
+            scripts = directory / environment_name / scripts_name
+            if any((scripts / executable_name).is_file() for executable_name in executable_names):
+                return scripts
+    return None
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -627,36 +717,139 @@ class WorkspaceTools:
         return relative
 
     def run_tests(
-        self, argv: list[str], timeout: int = 120,
+        self, argv: list[str], timeout_seconds: int = 120,
         is_cancelled: Callable[[], bool] | None = None,
         tool_call_id: str | None = None,
     ) -> dict[str, object]:
         self._require_work_claim()
         if not argv or len(argv) > 16 or any(not isinstance(arg, str) or len(arg) > 500 for arg in argv):
             raise ValueError("test command must have 1 to 16 bounded arguments")
-        allowed = any(tuple(argv[:len(prefix)]) == prefix for prefix in _TEST_COMMANDS)
-        if not allowed:
+        if (not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool)
+                or not 1 <= timeout_seconds <= 300):
+            raise ValueError("test timeout must be an integer from 1 to 300 seconds")
+        if not is_approved_repository_test_command(argv):
             raise PermissionError("command is outside the approved test-command set")
+        _uv_project_directory(self.root, argv)
+        from .tool_activity import local_repository_test_argv
+
+        recognized_test_argv = local_repository_test_argv(argv, cwd=self.root)
         run_id = str(uuid.uuid4())
-        self.store.append("repo.test_run.started", self.agent_id, self.mission_id,
-                          {"runId": run_id, "argv": argv, "workItemId": self.work_item_id,
-                           "toolCallId": tool_call_id})
+        if recognized_test_argv is not None:
+            started_event, previous_completion, reserved = self.store.begin_repository_test_run(
+                self.mission_id, self.agent_id, self.store.latest_sequence(self.mission_id),
+                run_id, argv, self.work_item_id, tool_call_id, timeout_seconds,
+            )
+            run_id = started_event["payload"]["runId"]
+            if not reserved:
+                if previous_completion:
+                    prior_result = dict(previous_completion["payload"])
+                    prior_result["verificationEventId"] = previous_completion["id"]
+                    prior_result["processStarted"] = True
+                    return prior_result
+                return {
+                    "runId": run_id, "argv": started_event["payload"].get("argv", argv),
+                    "exitCode": None, "stdout": "", "stderr": (
+                        "A prior attempt has a start record but no completion result. "
+                        "Its execution status is unknown; inspect Runs before starting another test run."
+                    ), "cancelled": False, "timedOut": False, "processStarted": None,
+                    "source": "run_repository_tests", "workItemId": self.work_item_id,
+                    "toolCallId": tool_call_id, "timeoutSeconds": timeout_seconds,
+                }
         environment = {
             name: value for name, value in os.environ.items()
             if not set(name.upper().replace("-", "_").split("_")).intersection(_SENSITIVE_ENV_COMPONENTS)
         }
+        project_python_bin = _project_python_environment_bin(self.root, argv)
+        if project_python_bin is None and self.root != self.repository_root:
+            project_python_bin = _project_python_environment_bin(self.repository_root, argv)
+        if project_python_bin:
+            environment["PATH"] = os.pathsep.join(filter(None, (
+                str(project_python_bin), environment.get("PATH", ""),
+            )))
         from .commands import run_foreground_process
 
         completed = run_foreground_process(
-            argv, cwd=self.root, timeout=max(1, min(timeout, 300)), env=environment,
+            argv, cwd=self.root, timeout=timeout_seconds, env=environment,
             is_cancelled=is_cancelled,
         )
         result = {
             "runId": run_id, "argv": argv, "exitCode": completed["exit_code"],
             "stdout": completed["stdout"], "stderr": completed["stderr"],
             "cancelled": completed["cancelled"], "timedOut": completed["timed_out"],
+            "processStarted": bool(completed.get("started", False)),
+            "source": "run_repository_tests",
             "workItemId": self.work_item_id, "toolCallId": tool_call_id,
+            "timeoutSeconds": timeout_seconds,
         }
-        completion_event = self.store.append("repo.test_run.completed", self.agent_id, self.mission_id, result)
+        # A missing executable or failed Popen is not a completed test run.
+        # Keep the actionable tool result, but do not publish a trigger event.
+        if not result["processStarted"] or recognized_test_argv is None:
+            return result
+        completion_event = self.store.record_repository_test_run_result(
+            self.mission_id, self.agent_id, self.store.latest_sequence(self.mission_id),
+            tool_call_id, run_id, argv, str(self.root), completed["exit_code"],
+            completed["stdout"], completed["stderr"], self.work_item_id,
+            "run_repository_tests", cancelled=completed["cancelled"],
+            timed_out=completed["timed_out"],
+            extra_payload={"processStarted": True, "timeoutSeconds": timeout_seconds},
+        )
+        if completion_event is None:
+            return result
         result["verificationEventId"] = completion_event["id"]
         return result
+
+    def list_harness_background_commands(self, limit: int = 20) -> list[dict[str, object]]:
+        """Recover Harness Shell command IDs and status from the current repository workspace."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise ValueError("command list limit must be an integer from 1 to 100")
+        root = self.root.resolve()
+        base = root / ".pydantic-ai-harness" / "shell"
+        if base.is_symlink() or not base.is_dir():
+            return []
+        try:
+            resolved_base = base.resolve(strict=True)
+            if not resolved_base.is_relative_to(root):
+                return []
+            directories = sorted(
+                (item for item in base.iterdir() if item.is_dir() and not item.is_symlink()),
+                key=lambda item: item.stat().st_mtime_ns,
+                reverse=True,
+            )
+        except OSError:
+            return []
+
+        commands: list[dict[str, object]] = []
+        for directory in directories:
+            command_id = directory.name
+            if len(command_id) != 32 or any(char not in "0123456789abcdef" for char in command_id):
+                continue
+            try:
+                resolved_directory = directory.resolve(strict=True)
+                handle = directory / "handle"
+                if (not resolved_directory.is_relative_to(resolved_base) or handle.is_symlink()
+                        or not handle.is_file() or handle.stat().st_size > 128):
+                    continue
+                fields = handle.read_text(encoding="utf-8").split()
+                if (len(fields) != 2 or not fields[0].isdigit()
+                        or (fields[1] != "-" and not fields[1].isdigit())):
+                    continue
+                status_path = directory / "status.json"
+                status: str = "starting"
+                exit_code: int | None = None
+                if status_path.is_file() and not status_path.is_symlink():
+                    try:
+                        raw_status = json.loads(status_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        raw_status = None
+                    if isinstance(raw_status, dict):
+                        candidate = raw_status.get("exit_code")
+                        if isinstance(candidate, int) and not isinstance(candidate, bool):
+                            status, exit_code = "finished", candidate
+                        elif candidate is None:
+                            status = "running"
+                commands.append({"commandId": command_id, "status": status, "exitCode": exit_code})
+                if len(commands) >= limit:
+                    break
+            except (OSError, RuntimeError, ValueError):
+                continue
+        return commands

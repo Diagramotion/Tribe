@@ -4,6 +4,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 import { isSupportedGitRemote } from "../src/domain/project-setup.js";
+import { formatAccessGrant } from "../src/domain/access-grants.js";
 
 let vite;
 const hmrPort = 40_000 + (process.pid % 5_000) * 3 + 2;
@@ -88,6 +89,37 @@ test("project cloning accepts supported HTTPS and SSH remotes only", () => {
     "https://user:password@github.com/owner/repository.git",
     "ssh://root@github.com/owner/repository.git",
   ]) assert.equal(isSupportedGitRemote(remote), false, remote);
+});
+
+test("remembered approvals identify exact HMAC tool actions and their scope", () => {
+  assert.deepEqual(formatAccessGrant({
+    capability: "tool_action_hmac:sonar_list_issues:opaque-digest",
+    scope: "project",
+    project_name: "Tribe",
+  }), {
+    subject: "Exact sonar list issues request",
+    scope: "Project · Tribe",
+  });
+  assert.deepEqual(formatAccessGrant({
+    capability: "tool_action:run_command:legacy-fingerprint",
+    scope: "chat",
+    mission_title: "Review quality gate",
+  }), {
+    subject: "Exact run command request",
+    scope: "Chat · Review quality gate",
+  });
+  assert.deepEqual(formatAccessGrant({ capability: "public_web_read", scope: "workspace" }), {
+    subject: "Public web access",
+    scope: "Workspace access",
+  });
+  assert.deepEqual(formatAccessGrant({
+    capability: "tool_action_hmac:repository_file_changes:opaque-digest",
+    scope: "project",
+    project_name: "Tribe",
+  }), {
+    subject: "In-project file changes",
+    scope: "Project · Tribe",
+  });
 });
 
 test("usage settings show month-to-date spend and disclose unpriced runs", () => {

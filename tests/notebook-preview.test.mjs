@@ -92,6 +92,16 @@ test("notebook review groups source, output, added and removed changes by cell",
   ]);
   assert.ok(changes[0].lines.some((line) => line.kind === "removed" && line.text === "value = 1"));
   assert.ok(changes[0].lines.some((line) => line.kind === "added" && line.text === "value = 2"));
+
+  const multilineChanges = notebookCellDiff(
+    JSON.stringify({ cells: [{ id: "line", cell_type: "code", source: ["first\n", "last"] }] }),
+    JSON.stringify({ cells: [{ id: "line", cell_type: "code", source: ["updated\n", "last"] }] }),
+  );
+  assert.deepEqual(multilineChanges[0].lines.map(({ kind, text }) => [kind, text]), [
+    ["removed", "first"],
+    ["added", "updated"],
+    ["context", "last"],
+  ]);
 });
 
 test("notebook preview fails closed on invalid notebook JSON", () => {

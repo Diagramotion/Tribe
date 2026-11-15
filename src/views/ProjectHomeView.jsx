@@ -122,22 +122,19 @@ export function ProjectHomeView({ project, missions, skills = [], recipes = [], 
   const effectiveModel = modelPreference || workspaceModel || catalogDefaultModel;
   const modelChoices = sortModelCatalog(modelCatalog.filter((model) => model.allowed !== false && model.providerEnabled !== false && model.toolCalling !== false), catalogDefaultModel);
   const selectedModelMetadata = modelCatalog.find((model) => model.id === effectiveModel);
-  const initialAgent = agents.find((agent) => agent.id === "planner" || agent.name?.toLowerCase() === "planner" || agent.role?.toLowerCase() === "planner") ?? null;
-  const initialRunModel = initialAgent?.model || effectiveModel;
+  const initialRunModel = effectiveModel;
+  const rolesWithOwnModelSettings = agents.some((agent) => agent.model || agent.effort);
   const initialRunModelMetadata = modelCatalog.find((model) => model.id === initialRunModel);
   const visibleModelChoices = modelListSearch.trim()
     ? modelChoices.filter((model) => (modelDisplayName(model) + " " + model.name + " " + model.id + " " + model.provider).toLocaleLowerCase().includes(modelListSearch.trim().toLocaleLowerCase()))
     : modelChoices;
   const supportedEfforts = Array.isArray(initialRunModelMetadata?.reasoningEfforts) ? [...initialRunModelMetadata.reasoningEfforts] : [];
-  if (initialAgent?.effort && !supportedEfforts.includes(initialAgent.effort)) supportedEfforts.push(initialAgent.effort);
-  const effectiveEffortPreference = initialAgent?.effort || effortPreference;
+  const effectiveEffortPreference = effortPreference;
   const effortSliderValue = effectiveEffortPreference ? Math.max(0, supportedEfforts.indexOf(effectiveEffortPreference) + 1) : 0;
   const effortLabel = effortSliderValue === 0 ? "Auto" : supportedEfforts[effortSliderValue - 1] === "xhigh"
     ? "Extra high" : supportedEfforts[effortSliderValue - 1]?.replace(/^./, (letter) => letter.toUpperCase()) ?? "Auto";
   const currentModelLabel = selectedModelMetadata ? modelDisplayName(selectedModelMetadata) : effectiveModel?.split(":").slice(1).join(":") ?? "Auto";
-  const triggerModelLabel = initialAgent?.model
-    ? initialRunModelMetadata ? modelDisplayName(initialRunModelMetadata) : initialAgent.model.split(":").slice(1).join(":")
-    : currentModelLabel;
+  const triggerModelLabel = currentModelLabel;
   const supportedEffortLabel = (effort) => effort === "xhigh" ? "Extra high" : effort.replace(/^./, (letter) => letter.toUpperCase());
   const providerLabel = (provider) => ({ openai: "OpenAI", anthropic: "Anthropic", google: "Google", azure: "Azure", ollama: "Ollama", xai: "xAI", mistral: "Mistral", meta: "Meta", cohere: "Cohere" }[provider?.toLowerCase()] ?? provider?.replace(/^./, (letter) => letter.toUpperCase()) ?? "Model");
   function modelCapabilitySummary(model) {
@@ -191,16 +188,16 @@ export function ProjectHomeView({ project, missions, skills = [], recipes = [], 
           <textarea aria-activedescendant={slashOptions.length ? activeSlashOptionId : undefined} aria-autocomplete="list" aria-controls="mission-slash-commands" aria-expanded={slashOptions.length > 0} autoComplete="off" autoFocus id="new-mission-prompt" maxLength={20000} onChange={(event) => { setPrompt(event.target.value); setActiveSlashOption(0); event.currentTarget.style.height = "55px"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 280)}px`; }} onKeyDown={handleComposerKeyDown} placeholder="Ask a question or describe a task…" ref={promptRef} role="combobox" rows={2} value={prompt} />
           <div className="project-home-composer-footer">
             <div className="project-home-composer-context"><span className="project-context-chip"><FolderSimple size={14} />{project?.name || "Project"}</span><span className="project-home-composer-hint">Type <kbd>/</kbd> for commands</span></div>
-            <button aria-pressed={deepResearch} className={`research-mode-toggle${deepResearch ? " research-mode-toggle--active" : ""}`} disabled={submitting} onClick={() => setDeepResearch((value) => !value)} title="The Planner leads the investigation and assigns focused work to selected project roles with web access." type="button"><GlobeSimple aria-hidden="true" size={15} /><span>Deep Research</span></button>
+            <button aria-pressed={deepResearch} className={`research-mode-toggle${deepResearch ? " research-mode-toggle--active" : ""}`} disabled={submitting} onClick={() => setDeepResearch((value) => !value)} title="The selected team investigates distinct questions, checks sources and synthesises the findings." type="button"><GlobeSimple aria-hidden="true" size={15} /><span>Deep Research</span></button>
             <div className="composer-model-menu-wrap" ref={modelMenuRef}>
-              <button aria-expanded={modelMenuOpen} aria-haspopup="dialog" aria-label={`Model ${triggerModelLabel}${initialAgent?.model ? `, pinned for ${initialAgent.name}` : ""}, effort ${effortLabel}`} className={"composer-model-trigger" + (modelMenuOpen ? " composer-model-trigger--open" : "")} onClick={() => { setModelListOpen(false); setModelListSearch(""); setModelMenuOpen((open) => !open); }} type="button">
+              <button aria-expanded={modelMenuOpen} aria-haspopup="dialog" aria-label={`Model ${triggerModelLabel}, effort ${effortLabel}`} className={"composer-model-trigger" + (modelMenuOpen ? " composer-model-trigger--open" : "")} onClick={() => { setModelListOpen(false); setModelListSearch(""); setModelMenuOpen((open) => !open); }} type="button">
                 <Sparkle aria-hidden="true" className="composer-model-trigger-icon" size={15} weight="fill" />
                 <span className="composer-model-trigger-copy"><strong>{triggerModelLabel}</strong><small>{effortLabel}</small></span>
                 <CaretDown aria-hidden="true" size={12} />
               </button>
               {modelMenuOpen && <section aria-label="Model and effort settings" className="composer-model-popover" role="dialog">
                 <div className="composer-model-picker">
-                  <span className="composer-model-field-label">{initialAgent?.model ? "Chat model" : "Model"}</span>
+                  <span className="composer-model-field-label">Model</span>
                   <button aria-expanded={modelListOpen} aria-haspopup="listbox" className="composer-model-select" disabled={modelChoices.length === 0} onClick={() => { setModelListSearch(""); setModelListOpen((open) => !open); }} type="button">
                     <Sparkle aria-hidden="true" size={15} weight="fill" />
                     <span><strong>{currentModelLabel}</strong><small>{modelPreference ? providerLabel(selectedModelMetadata?.provider) : "Workspace default"}</small></span>
@@ -221,11 +218,11 @@ export function ProjectHomeView({ project, missions, skills = [], recipes = [], 
                     {visibleModelChoices.length === 0 && modelListSearch.trim() && <p className="composer-model-no-results">No models match “{modelListSearch.trim()}”.</p>}
                   </div>}
                   {modelChoices.length === 0 && <div className="composer-model-empty"><span>{modelCatalogLoading ? "Loading models…" : "No models enabled."}</span><button onClick={() => { setModelMenuOpen(false); onConnectModel?.(); }} type="button">Open model settings <CaretRight size={12} /></button></div>}
-                  {initialAgent?.model && <p className="composer-model-override-note">Planner is pinned to {triggerModelLabel}. This chat choice applies to other roles.</p>}
+                  {rolesWithOwnModelSettings && <p className="composer-model-override-note">A role’s own model or effort settings take precedence over this chat choice.</p>}
                 </div>
                 <div className={"composer-model-effort" + (supportedEfforts.length === 0 ? " composer-model-effort--unavailable" : "")}>
                   <div className="composer-model-effort-heading"><span>Reasoning effort</span><strong>{effortLabel}</strong></div>
-                  <div className="composer-model-slider-wrap"><input aria-label="Reasoning effort" aria-valuetext={effortLabel} disabled={Boolean(initialAgent?.effort) || !initialRunModel || supportedEfforts.length === 0} max={supportedEfforts.length} min="0" onChange={(event) => changeEffort(Number(event.target.value))} step="1" style={{ "--effort-progress": (supportedEfforts.length ? (effortSliderValue / supportedEfforts.length) * 100 : 0) + "%" }} type="range" value={effortSliderValue} />{supportedEfforts.length > 0 && <div aria-hidden="true" className="composer-model-slider-marks">{Array.from({ length: supportedEfforts.length + 1 }, (_, index) => <i key={index} style={{ left: (index / supportedEfforts.length) * 100 + "%" }} />)}</div>}</div>
+                  <div className="composer-model-slider-wrap"><input aria-label="Reasoning effort" aria-valuetext={effortLabel} disabled={!initialRunModel || supportedEfforts.length === 0} max={supportedEfforts.length} min="0" onChange={(event) => changeEffort(Number(event.target.value))} step="1" style={{ "--effort-progress": (supportedEfforts.length ? (effortSliderValue / supportedEfforts.length) * 100 : 0) + "%" }} type="range" value={effortSliderValue} />{supportedEfforts.length > 0 && <div aria-hidden="true" className="composer-model-slider-marks">{Array.from({ length: supportedEfforts.length + 1 }, (_, index) => <i key={index} style={{ left: (index / supportedEfforts.length) * 100 + "%" }} />)}</div>}</div>
                   {supportedEfforts.length === 0 && <div className="composer-model-effort-unset"><span>{initialRunModelMetadata ? "Effort levels not set for this model" : "Effort capabilities unavailable"}</span>{initialRunModel && <button onClick={() => { setModelMenuOpen(false); onManageModelMetadata?.(initialRunModel); }} type="button">Set options <CaretRight size={12} /></button>}</div>}
                 </div>
               </section>}

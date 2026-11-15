@@ -4,7 +4,7 @@ import { getLinkPreview } from "../domain/link-preview.js";
 
 const rawLinkPattern = /https?:\/\/[^\s<>"']+/gi;
 
-function extractPreviewUrls(source) {
+export function extractPreviewUrls(source) {
   const withoutCode = source
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/~~~[\s\S]*?~~~/g, " ")

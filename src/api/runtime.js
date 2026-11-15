@@ -191,6 +191,9 @@ export const runtime = {
   updateProjectTeam: (projectId, agentIds) => request(`/api/projects/${encodeURIComponent(projectId)}/team`, {
     method: "PUT", body: JSON.stringify({ agentIds }),
   }),
+  updateMissionTeam: (missionId, agentIds, leadAgentId = null) => request(`/api/missions/${encodeURIComponent(missionId)}/team`, {
+    method: "PUT", body: JSON.stringify({ agentIds, leadAgentId }),
+  }),
   activateMission: (missionId) => request(`/api/missions/${encodeURIComponent(missionId)}/resume`, {
     method: "POST", body: JSON.stringify({}),
   }),
@@ -396,7 +399,7 @@ export const runtime = {
     method: "POST", body: JSON.stringify({ missionId }),
   }),
   sendMessage: (missionId, text, recipient = null, canvasDocument = null, attachments = [], options = {}) => request("/api/messages", {
-    method: "POST", body: JSON.stringify({ missionId, text, recipient, canvasDocument, attachments, deepResearch: Boolean(options.deepResearch) }),
+    method: "POST", body: JSON.stringify({ missionId, text, recipient, mentions: options.mentions ?? [], canvasDocument, attachments, deepResearch: Boolean(options.deepResearch) }),
   }),
   uploadArtifact: (missionId, name, mediaType, contentBase64) => request("/api/artifacts", {
     method: "POST", body: JSON.stringify({ missionId, name, mediaType, contentBase64, createdBy: "user" }),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import subprocess
 import tempfile
@@ -27,7 +28,7 @@ from pydantic_ai.usage import RunUsage
 from pydantic_ai_harness.step_persistence import SqliteStepStore
 
 from tribe_runtime.harness_capabilities import build_capabilities
-from tribe_runtime.mcp_registry import MCPRegistry
+from tribe_runtime.mcp_registry import MCPRegistry, bound_mcp_tool_result
 from tribe_runtime.oauth_store import OAuthKeyringStore
 from tribe_runtime.store import MissionStore
 from tribe_runtime.workspace import WorkspaceTools
@@ -46,6 +47,22 @@ class _TokenVerifier:
 
 
 class OAuthMcpRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_large_mcp_results_are_bounded_with_a_clear_truncation_notice(self) -> None:
+        result = {"issues": [{"message": "quality issue" * 200} for _ in range(20)]}
+
+        bounded = bound_mcp_tool_result(result, limit=400)
+
+        self.assertIsInstance(bounded, dict)
+        self.assertLessEqual(len(json.dumps(bounded, ensure_ascii=False, separators=(",", ":"))), 400)
+        self.assertIn("_tribe_truncated", bounded)
+        self.assertIn("narrower result", bounded["_tribe_truncated"])
+        self.assertIsInstance(bounded["issues"], list)
+        self.assertEqual(bound_mcp_tool_result({"ok": True}), {"ok": True})
+
+        long_text = bound_mcp_tool_result("x" * 400, limit=400)
+        self.assertIsInstance(long_text, str)
+        self.assertLessEqual(len(json.dumps(long_text, ensure_ascii=False)), 400)
+
     async def test_registry_builds_authenticated_pydantic_toolset_and_read_only_filter(self) -> None:
         with tempfile.TemporaryDirectory(prefix="tribe-mcp-oauth-runtime-") as directory:
             root = Path(directory)
@@ -201,7 +218,9 @@ class OAuthMcpRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(tool_calls[-1][0], "publish_document")
                 approval = store.deferred_tool_approvals(_mission["id"], "tester")[-1]
                 self.assertEqual(approval["status"], "consumed")
-                self.assertEqual(approval["tool_arguments"], tool_calls[-1][1])
+                self.assertEqual(
+                    approval["tool_arguments"], {"path": "[text omitted · 1 characters]"},
+                )
 
 
 if __name__ == "__main__":

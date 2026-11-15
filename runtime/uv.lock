@@ -4139,6 +4139,7 @@ name = "tribe-runtime"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "defusedxml" },
     { name = "keyring" },
     { name = "onnxruntime" },
@@ -4171,6 +4172,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "coverage", marker = "extra == 'test'", specifier = ">=7.15,<8" },
+    { name = "cryptography", specifier = ">=45,<51" },
     { name = "defusedxml", specifier = ">=0.7.1,<0.8" },
     { name = "keyring", specifier = ">=25.6" },
     { name = "onnxruntime", specifier = ">=1.23.1,<1.24" },

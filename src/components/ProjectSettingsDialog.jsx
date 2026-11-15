@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { FileText, SquaresFour, UsersThree, ClockCounterClockwise, Sparkle, ShieldCheck, ChartLineUp, Plug, X } from "@phosphor-icons/react";
+import { FileText, SquaresFour, UsersThree, ClockCounterClockwise, Sparkle, ShieldCheck, ChartLineUp, Plug, Globe, X } from "@phosphor-icons/react";
 import { IconButton } from "./WorkspaceSidebar.jsx";
 import { useDialogFocus } from "../hooks/useDialogFocus.js";
 
 const sections = [
   { id: "team", label: "Team", icon: UsersThree, description: "Review roles available to this project. Custom role definitions are shared across projects." },
   { id: "mcp", label: "MCP access", icon: Plug, description: "Choose which workspace connections agents can use in this project." },
+  { id: "web", label: "Web access", icon: Globe, description: "Choose which websites agents can use in this project." },
   { id: "approvals", label: "Approvals", icon: ShieldCheck, description: "Choose when agents need your approval before acting." },
   { id: "guidance", label: "Guidance", icon: FileText, description: "Set the project goal and the repository files agents should read." },
   { id: "datasets", label: "Datasets", icon: ChartLineUp, description: "Choose which local tables agents with Data analysis access may inspect." },

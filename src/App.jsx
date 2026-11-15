@@ -54,6 +54,7 @@ import {
 } from "./api/desktop-notifications.js";
 import { inlineImagePreview, playableMediaKind } from "./domain/artifact-preview.js";
 import { scheduleRunNotifications } from "./domain/schedules.js";
+import { sortMcpServerNames } from "./domain/mcp-config.js";
 import { chatTitleFromPrompt, compactChatTitle } from "./domain/chat-title.js";
 import { captureSelectedWindow } from "./domain/computerCapture.js";
 import {
@@ -99,6 +100,7 @@ const ProjectHomeView = lazy(() => import("./views/ProjectHomeView.jsx").then((m
 const ProjectKnowledgeView = lazy(() => import("./views/ProjectKnowledgeView.jsx").then((module) => ({ default: module.ProjectKnowledgeView })));
 const ProjectDatasetsView = lazy(() => import("./components/ProjectDatasetsView.jsx").then((module) => ({ default: module.ProjectDatasetsView })));
 const InteractiveAccessView = lazy(() => import("./views/InteractiveAccessView.jsx").then((module) => ({ default: module.InteractiveAccessView })));
+const ProjectWebAccessView = lazy(() => import("./views/ProjectWebAccessView.jsx").then((module) => ({ default: module.ProjectWebAccessView })));
 const ApprovalSettingsView = lazy(() => import("./views/ApprovalSettingsView.jsx").then((module) => ({ default: module.ApprovalSettingsView })));
 const TestRunsView = lazy(() => import("./views/TestRunsView.jsx").then((module) => ({ default: module.TestRunsView })));
 const WorkflowsView = lazy(() => import("./views/WorkflowsView.jsx").then((module) => ({ default: module.WorkflowsView })));
@@ -127,9 +129,9 @@ function MissionWorkflowProgress({ stages, currentStageId, currentTitle, title, 
     ? `${completedCount} of ${stages.length} stages complete`
     : "Stage completion not recorded";
   const statusLabel = completed
-    ? currentStageId ? `Chat complete · last stage: ${currentTitle}` : "Chat complete · no stage recorded"
+    ? currentStageId ? `Latest run finished · last stage: ${currentTitle}` : "Latest run finished"
     : currentTitle;
-  return <section aria-label={`${title} workflow · ${completed ? "Chat complete" : currentTitle}`} className="mission-workflow-progress">
+  return <section aria-label={`${title} workflow · ${completed ? "Latest run finished" : currentTitle}`} className="mission-workflow-progress">
     <div className="mission-workflow-progress-heading">
       <span className="mission-workflow-name"><GitBranch size={14} />{title}</span>
       <strong aria-atomic="true" aria-live="polite">{statusLabel}</strong>
@@ -148,7 +150,7 @@ function MissionWorkflowProgress({ stages, currentStageId, currentTitle, title, 
   </section>;
 }
 
-function ProjectMcpAccess({ projectId, onManage }) {
+export function ProjectMcpAccess({ projectId, onManage }) {
   const [servers, setServers] = useState([]);
   const [excluded, setExcluded] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -160,7 +162,7 @@ function ProjectMcpAccess({ projectId, onManage }) {
     Promise.all([runtime.getMcpConfig(), runtime.getProjectMcpExclusions(projectId)])
       .then(([workspace, project]) => {
         if (!current) return;
-        setServers(Object.keys(workspace.config?.mcpServers ?? {}).sort());
+        setServers(sortMcpServerNames(workspace.config?.mcpServers));
         setExcluded(project.excluded ?? []);
       })
       .catch((cause) => { if (current) setError(cause.message); })
@@ -998,7 +1000,7 @@ export function App() {
       missionCompletedRef.current = true;
       setMission((current) => current?.id === event.missionId ? { ...current, status: "completed" } : current);
       setMissions((current) => current.map((item) => item.id === event.missionId ? { ...item, status: "completed" } : item));
-      setAgents((current) => current.map((agent) => ({ ...agent, status: "Complete", next: "Chat completed" })));
+      setAgents((current) => current.map((agent) => ({ ...agent, status: "Ready", next: "Ready for your next message" })));
     }
     if (event.type === "mission.blocked") {
       setMission((current) => current?.id === event.missionId
@@ -1188,9 +1190,9 @@ export function App() {
         pendingInteractionAgentsRef.current = pendingByAgent;
         const initialAgents = data.agents.map((agent) => ({
           ...agent,
-          status: data.agentRuntime.agentErrors?.[agent.id] ? "Provider setup failed" : data.mission?.status === "completed" ? "Complete" : pendingByAgent.has(agent.id) ? "Waiting for you" : data.mission?.status === "paused" ? "Paused" : data.workItems.some((item) => item.owner === agent.id && item.status === "claimed") ? "Working" : data.agentRuntime.enabled ? "Ready" : "Not configured",
+          status: data.agentRuntime.agentErrors?.[agent.id] ? "Provider setup failed" : data.mission?.status === "completed" ? "Ready" : pendingByAgent.has(agent.id) ? "Waiting for you" : data.mission?.status === "paused" ? "Paused" : data.workItems.some((item) => item.owner === agent.id && item.status === "claimed") ? "Working" : data.agentRuntime.enabled ? "Ready" : "Not configured",
           activity: data.workItems.find((item) => item.owner === agent.id && item.status === "claimed")?.title ?? agent.role,
-          next: data.agentRuntime.agentErrors?.[agent.id] ?? (agent.model ? `Using ${agent.model}` : data.mission?.status === "completed" ? "Mission completed" : pendingByAgent.has(agent.id) ? "Waiting for your response" : data.mission?.status === "paused" ? "Mission paused by you" : data.agentRuntime.enabled ? "Ready for the next task" : "Connect a model to start this agent"),
+          next: data.agentRuntime.agentErrors?.[agent.id] ?? (agent.model ? `Using ${agent.model}` : data.mission?.status === "completed" ? "Ready for your next message" : pendingByAgent.has(agent.id) ? "Waiting for your response" : data.mission?.status === "paused" ? "Mission paused by you" : data.agentRuntime.enabled ? "Ready for the next task" : "Connect a model to start this agent"),
           color: agentColours[agent.id] ?? "blue",
         }));
         setAgents(restoreAgentActivity(
@@ -1418,11 +1420,18 @@ export function App() {
       return false;
     }
     try {
-      const { event } = await runtime.sendMessage(mission.id, text, recipient, canvasContext ? {
+      const { event, mission: updatedMission } = await runtime.sendMessage(mission.id, text, recipient, canvasContext ? {
         artifactId: canvasContext.artifactId, revision: canvasContext.revision,
         selectedText: canvasContext.selectedText ?? "",
       } : null, attachments.map(({ id }) => id), options);
       applyEvent(event);
+      if (updatedMission && updatedMission.id === mission.id) {
+        missionCompletedRef.current = false;
+        missionPausedRef.current = updatedMission.status === "paused";
+        setMission(updatedMission);
+        setMissions((current) => current.map((item) => item.id === updatedMission.id ? updatedMission
+          : updatedMission.background || item.background ? item : { ...item, status: "paused" }));
+      }
       notify(agentRuntime.enabled
         ? "Message sent to the team."
         : "Message saved. Connect a model for the team to respond.");
@@ -1449,6 +1458,21 @@ export function App() {
       })[error.message] ?? error.message;
       notify(`Model preference could not be saved: ${message}`);
       throw new Error(message);
+    }
+  }
+
+  async function updateMissionTeam(agentIds, leadAgentId = null) {
+    if (!mission?.id) return false;
+    try {
+      const { agentIds: selected, leadAgentId: lead } = await runtime.updateMissionTeam(mission.id, agentIds, leadAgentId);
+      const updated = { ...mission, agentIds: selected, leadAgentId: lead };
+      setMission((current) => current?.id === updated.id ? { ...current, agentIds: selected, leadAgentId: lead } : current);
+      setMissions((current) => current.map((item) => item.id === updated.id ? { ...item, agentIds: selected, leadAgentId: lead } : item));
+      notify("Chat team updated.");
+      return true;
+    } catch (error) {
+      notify(`Chat team could not be updated: ${error.message}`);
+      return false;
     }
   }
 
@@ -2564,26 +2588,13 @@ export function App() {
       void refreshPendingRequests();
       notify(activeInteraction.type === "approval"
         ? resolution === "denied" ? "Action declined."
-          : accessScope === "chat" ? "Public web access allowed for this chat."
-            : accessScope === "project" ? "Public web access allowed for this project."
+          : accessScope === "chat" ? (activeInteraction.toolName === "duckduckgo_search" || activeInteraction.toolName === "web_fetch" ? "Public web access allowed for this chat." : "Exact action allowed for this chat.")
+            : accessScope === "project" ? (activeInteraction.toolName === "duckduckgo_search" || activeInteraction.toolName === "web_fetch" ? "Public web access allowed for this project." : "Exact action allowed for this project.")
               : accessScope === "workspace" ? "Public web access allowed across this workspace."
                 : "Action approved once."
         : `Answer sent to ${activeInteraction.agent}.`);
     } catch (error) {
       notify(`Decision was not saved: ${error.message}`);
-    }
-  }
-
-  async function reviewMissionOutcome(outcome, notes) {
-    if (!mission?.id) return false;
-    try {
-      const { event } = await runtime.reviewMissionOutcome(mission.id, outcome, notes);
-      applyEvent(event);
-      notify("Chat outcome saved.");
-      return true;
-    } catch (error) {
-      notify(`Outcome was not saved: ${error.message}`);
-      return false;
     }
   }
 
@@ -2915,6 +2926,8 @@ export function App() {
   function renderMissionView() {
     if (selectedGeneralChat) return <GeneralChatView chat={selectedGeneralChat} getModelCatalog={runtime.getModelCatalog} onModelPreferenceChange={setGeneralChatModelPreference} onSend={sendGeneralChatMessage} onConnectModel={() => openWorkspaceSettings("models")} onOpenWebSearch={() => openWorkspaceSettings("web-search")} />;
     if (!mission) return <ProjectHomeView agentConfigured={agentRuntime.enabled} agents={projectAgents} workspaceModel={agentRuntime.model} onConnectModel={() => openWorkspaceSettings("models")} onCreateMission={createMission} onEditProjectGoal={openProjectGoalEditor} onManageModelMetadata={(modelId) => openWorkspaceSettings("models", modelId)} onManageTeam={() => openProjectSettings(project, "team")} onSelectMission={selectMission} project={project} missions={missions} recipes={recipes} skills={skills} />;
+    const selectedAgentIds = new Set(mission.agentIds ?? projectAgents.map((agent) => agent.id));
+    const chatAgents = projectAgents.filter((agent) => selectedAgentIds.has(agent.id));
     return <MissionView
       mission={mission}
       interactiveResponsesEnabled={interactiveAccess.enabled}
@@ -2922,7 +2935,8 @@ export function App() {
       activeInteraction={activeInteraction}
       runtimeStatus={runtimeStatus}
       workspaceModel={agentRuntime.model}
-      agents={projectAgents}
+      agents={chatAgents}
+      teamAgents={projectAgents}
       agentDefinitions={agents}
       artifacts={artifacts}
       messages={conversationMessages}
@@ -2946,13 +2960,13 @@ export function App() {
       onConnectModel={() => openWorkspaceSettings("models")}
       onManageModelMetadata={(modelId) => openWorkspaceSettings("models", modelId)}
       onManageTeam={() => openProjectSettings(project, "team")}
+      onUpdateMissionTeam={updateMissionTeam}
       onOpenUsageSettings={() => openWorkspaceSettings("data")}
       onRecoverAgent={recoverAgentRun}
       onStopAgentRun={stopAgentRun}
       queuedInteractions={queuedInteractions}
       isolatedWorkspaces={isolatedWorkspaces}
       onDiscardIsolation={discardIsolation}
-      onReviewOutcome={reviewMissionOutcome}
       workItems={workItemsState}
     />;
   }
@@ -3023,7 +3037,8 @@ export function App() {
 
   function renderProjectSettingsSection(section) {
     if (section === "team") return <AgentRolesView agents={agents} capabilityCatalog={capabilityCatalog} projectAgentIds={project.agentIds ?? agents.map((agent) => agent.id)} agentConfigured={agentRuntime.enabled} onCreate={(definition) => createAgentDefinition(definition, project.id)} onUpdate={updateAgentDefinition} onArchive={archiveAgentDefinition} onUpdateProjectTeam={updateProjectTeam} onConnectModel={() => openAgentSettings("model")} onManageModels={() => { setProjectSettingsOpen(false); openWorkspaceSettings("models"); }} />;
-    if (section === "mcp") return <ProjectMcpAccess projectId={project.id} onManage={() => { setProjectSettingsOpen(false); openAgentSettings("mcp"); }} />;
+    if (section === "mcp") return <ProjectMcpAccess projectId={project.id} onManage={() => { setProjectSettingsOpen(false); void openAgentSettings("mcp"); }} />;
+    if (section === "web") return <ProjectWebAccessView onSave={saveWebAccess} policy={webAccess} projectName={project.name} />;
     if (section === "datasets") return <ProjectDatasetsView projectId={project.id} />;
     if (section === "approvals") return <ApprovalSettingsView projectId={project.id} />;
     if (section === "interactive") return <InteractiveAccessView onSave={saveInteractiveAccess} policy={interactiveAccess} projectName={project.name} />;
@@ -3183,7 +3198,7 @@ export function App() {
               {!headerSearchOpen && <IconButton aria-label="Search channel" className="search-box-trigger" label="Search channel" onClick={() => setHeaderSearchOpen(true)}><MagnifyingGlass size={16} /></IconButton>}
             </>}
             {isMissionTab && mission && <div className="mission-header-controls">
-              {mission.status === "completed" && !mission.archived_at && <span className="mission-status mission-status--completed" role="status"><i className="status-pulse" />Completed</span>}
+              {mission.status === "completed" && !mission.archived_at && <span className="mission-status mission-status--completed" role="status"><i className="status-pulse" />Ready for more</span>}
               {noAgentsReady && <IconButton className="mission-control-button mission-control-button--setup" label={`Connect a model · ${readyAgentCount} of ${agents.length} agents ready`} onClick={() => openAgentSettings("model")}><WarningCircle size={16} /></IconButton>}
               {!mission.archived_at && mission.status !== "completed" && <IconButton className="mission-control-button" disabled={missionControlPending} label={missionControlPending ? "Updating chat" : mission.status === "paused" ? "Resume chat" : "Pause agents"} onClick={mission.status === "paused" ? resumeCurrentMission : pauseCurrentMission}>
                 {missionControlPending ? <CircleNotch className="spin" size={16} /> : mission.status === "paused" ? <Play size={16} weight="fill" /> : <Pause size={16} weight="fill" />}

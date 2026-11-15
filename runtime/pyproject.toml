@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Local-first event and agent runtime for Tribe"
 requires-python = ">=3.11"
 dependencies = [
+    "cryptography>=45,<51",
     "keyring>=25.6",
     "openpyxl>=3.1.5,<4",
     "defusedxml>=0.7.1,<0.8",

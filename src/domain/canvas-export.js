@@ -37,6 +37,10 @@ export function downloadCanvasDocument(document, filename) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+export function makeCanvasDiagramResponsive(svg) {
+  return svg.replace(/style="max-width:[^"]*"/, 'style="max-width: 100%"');
+}
+
 export async function renderCanvasDiagramSvg(document) {
   if (document.kind !== "diagram" || !document.body?.trim()) {
     throw new Error("Only a non-empty diagram can be exported as SVG.");
@@ -71,7 +75,7 @@ export async function renderCanvasDiagramSvg(document) {
   const { svg } = await mermaid.render(id, document.body);
   // Mermaid embeds the diagram's intrinsic width as a max-width, which prevents
   // responsive chat previews and expanded previews from using their viewport.
-  return svg.replace(/style="max-width:\s*[^\"]+"/, 'style="max-width: 100%"');
+  return makeCanvasDiagramResponsive(svg);
 }
 
 export function downloadCanvasSvg(svg, filename) {

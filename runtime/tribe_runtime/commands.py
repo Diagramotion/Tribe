@@ -42,10 +42,11 @@ def run_foreground_process(
     env: dict[str, str] | None = None, is_cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, object]:
     """Run a bounded foreground command and stop its process tree on timeout or cancellation."""
-    executable = shutil.which(argv[0])
+    environment = os.environ if env is None else env
+    executable = shutil.which(argv[0], path=environment.get("PATH", ""))
     if not executable:
         return {"exit_code": 127, "stdout": "", "stderr": f"executable not found: {argv[0]}",
-                "timed_out": False, "cancelled": False}
+                "timed_out": False, "cancelled": False, "started": False}
     launch_argv = build_launch_argv([executable, *argv[1:]], executable)
     timed_out = False
     cancelled = False
@@ -58,7 +59,7 @@ def run_foreground_process(
             )
         except OSError as error:
             return {"exit_code": 127, "stdout": "", "stderr": str(error),
-                    "timed_out": False, "cancelled": False}
+                    "timed_out": False, "cancelled": False, "started": False}
         job = BackgroundCommandRunner._create_process_job(process)
         try:
             deadline = time.monotonic() + max(0.01, timeout)
@@ -114,7 +115,7 @@ def run_foreground_process(
         if cancelled and not stderr:
             stderr = "test command cancelled"
         return {"exit_code": exit_code, "stdout": tail(stdout_file), "stderr": stderr,
-                "timed_out": timed_out, "cancelled": cancelled}
+                "timed_out": timed_out, "cancelled": cancelled, "started": True}
 
 
 class BackgroundCommandRunner:
@@ -203,6 +204,8 @@ class BackgroundCommandRunner:
                 process_environment["PIPENV_VENV_IN_PROJECT"] = "1"
             elif notebook_setup_manager == "poetry":
                 process_environment["POETRY_VIRTUALENVS_IN_PROJECT"] = "1"
+        run = self.store.create_background_run(mission_id, argv, str(root))
+        run_id = run["id"]
         try:
             process = subprocess.Popen(
                 launch_argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -211,10 +214,14 @@ class BackgroundCommandRunner:
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             )
         except OSError as error:
+            self.store.finish_background_run(run["id"], "failed", None)
             raise ValueError(f"command_could_not_start:{error.strerror or 'process launch failed'}") from error
-        job = self._create_process_job(process)
+        job = None
         try:
-            run = self.store.create_background_run(mission_id, argv, str(root), process.pid)
+            job = self._create_process_job(process)
+            run = self.store.mark_background_run_running(run_id, process.pid)
+            if run is None:
+                raise RuntimeError("command_run_no_longer_starting")
         except Exception:
             self._terminate(process, job)
             try:
@@ -224,6 +231,7 @@ class BackgroundCommandRunner:
                 process.wait(timeout=2)
             if job:
                 job.close()
+            self.store.finish_background_run(run_id, "failed", process.returncode)
             raise
         with self._lock:
             if self._closed:

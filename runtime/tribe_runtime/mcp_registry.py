@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -26,6 +25,8 @@ _KEYRING_SERVICE = "Tribe MCP server"
 PLAYWRIGHT_MCP_VERSION = "0.0.83"
 # Keep in sync with the `playwright` dependency declared by this pinned MCP release.
 PLAYWRIGHT_CLI_VERSION = "1.64.0-alpha-1790635538000"
+MCP_SERVER_INIT_TIMEOUT = 60
+MCP_DISCOVERY_TIMEOUT = 90
 PLAYWRIGHT_READ_ONLY_TOOLS = (
     "browser_console_messages",
     "browser_find",
@@ -39,14 +40,135 @@ def _mcp_tool_allowed(tool_definition: Any) -> bool:
     return not tool_definition.name.endswith("_browser_run_code_unsafe")
 
 
-def _write_temporary_config(root: Path, config: dict[str, Any]) -> Path:
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=root, prefix="check-", suffix=".json", delete=False,
-    ) as temporary:
-        temporary_path = Path(temporary.name)
-        os.chmod(temporary_path, 0o600)
-        json.dump(config, temporary)
-    return temporary_path
+MCP_TOOL_RESULT_LIMIT = 6_000
+_MCP_TRUNCATION_MARKER = {
+    "_tribe_truncated": "Result shortened; request a narrower result for more detail.",
+}
+
+
+def _json_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str))
+
+
+def _bounded_json_value(value: Any, limit: int) -> Any:
+    """Keep JSON-shaped results valid while retaining complete fields and list items."""
+    if _json_size(value) <= limit:
+        return value
+    if limit < 24:
+        return None
+    if isinstance(value, str):
+        suffix = "… truncated"
+        low, high = 0, len(value)
+        best = suffix
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = value[:middle] + suffix
+            if _json_size(candidate) <= limit:
+                best = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best
+
+    marker = _MCP_TRUNCATION_MARKER
+    marker_size = _json_size(marker)
+    if isinstance(value, list):
+        result: list[Any] = []
+        truncated = False
+        for item in value:
+            separator_size = 1 if result else 0
+            remaining = limit - _json_size(result) - separator_size - marker_size - 1
+            if remaining < 24:
+                truncated = True
+                break
+            bounded = _bounded_json_value(item, remaining)
+            if _json_size([*result, bounded, marker]) > limit:
+                truncated = True
+                break
+            result.append(bounded)
+            if bounded != item:
+                truncated = True
+                break
+        if truncated and _json_size([*result, marker]) <= limit:
+            result.append(marker)
+        return result
+
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        truncated = False
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text == "_tribe_truncated":
+                truncated = True
+                continue
+            base_size = _json_size(result)
+            key_size = _json_size(key_text)
+            separator_size = 1 if result else 0
+            remaining = limit - base_size - key_size - separator_size - 2 - marker_size - 1
+            if remaining < 24:
+                truncated = True
+                break
+            bounded = _bounded_json_value(item, remaining)
+            candidate = {**result, key_text: bounded}
+            if _json_size({**candidate, **marker}) > limit:
+                truncated = True
+                break
+            result[key_text] = bounded
+            if bounded != item:
+                truncated = True
+                break
+        if truncated and _json_size({**result, **marker}) <= limit:
+            result.update(marker)
+        return result
+    return None
+
+
+def bound_mcp_tool_result(value: Any, *, limit: int = MCP_TOOL_RESULT_LIMIT) -> Any:
+    """Keep a large connected-service response from exhausting the model context."""
+    if not isinstance(value, (str, dict, list)):
+        return value
+    if _json_size(value) <= limit:
+        return value
+    bounded = _bounded_json_value(value, limit)
+    if _json_size(bounded) <= limit:
+        return bounded
+    return _MCP_TRUNCATION_MARKER if _json_size(_MCP_TRUNCATION_MARKER) <= limit else None
+
+
+def bounded_mcp_toolset(toolset: Any) -> Any:
+    """Wrap an MCP toolset with a response-size limit while preserving its tool catalogue."""
+    from pydantic_ai.toolsets.wrapper import WrapperToolset
+
+    class BoundedResultToolset(WrapperToolset):
+        async def call_tool(self, name: str, tool_args: dict[str, Any], ctx: Any, tool: Any) -> Any:
+            result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
+            return bound_mcp_tool_result(result)
+
+    return BoundedResultToolset(wrapped=toolset)
+
+
+def _load_mcp_toolsets(config: dict[str, Any]) -> list[object]:
+    """Build Pydantic AI MCP toolsets with enough time for real servers to start."""
+    from fastmcp.client.transports import StdioTransport
+    from pydantic_ai.mcp import MCPToolset
+
+    toolsets = []
+    for name, server in config["mcpServers"].items():
+        if "command" in server:
+            transport = StdioTransport(
+                command=server["command"],
+                args=server.get("args", []),
+                env=server.get("env"),
+                cwd=server.get("cwd"),
+            )
+            toolset = MCPToolset(transport, id=name, init_timeout=MCP_SERVER_INIT_TIMEOUT)
+        else:
+            toolset = MCPToolset(
+                server["url"], id=name, headers=server.get("headers"),
+                init_timeout=MCP_SERVER_INIT_TIMEOUT,
+            )
+        toolsets.append(toolset.prefixed(name))
+    return toolsets
 
 
 class MCPRegistry:
@@ -513,8 +635,6 @@ class MCPRegistry:
         source_config = self.get_config(project_id)
         if not source_config["mcpServers"]:
             return []
-        from pydantic_ai.mcp import load_mcp_toolsets
-
         disabled_tools = {
             name: set(definition.get("disabledTools", []))
             for name, definition in source_config["mcpServers"].items()
@@ -531,37 +651,31 @@ class MCPRegistry:
             name: definition for name, definition in config["mcpServers"].items()
             if name not in oauth_servers
         }
-        temporary_path = None
+        toolsets_by_server = {
+            name: toolset for name, toolset in zip(
+                config["mcpServers"], _load_mcp_toolsets(config), strict=True,
+            )
+        }
+        for name, definition in oauth_servers.items():
+            toolsets_by_server[name] = self._oauth_toolset(project_id, name, definition)
         try:
-            standard_toolsets = []
-            if config["mcpServers"]:
-                temporary_path = _write_temporary_config(self.root, config)
-                standard_toolsets = load_mcp_toolsets(temporary_path)
-
-            toolsets_by_server = dict(zip(config["mcpServers"], standard_toolsets, strict=True))
-            for name, definition in oauth_servers.items():
-                toolsets_by_server[name] = self._oauth_toolset(project_id, name, definition)
-            try:
-                legacy_names = json.loads(self.aliases_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                legacy_names = {}
-            return [
-                toolsets_by_server[name].filtered(
-                    lambda _ctx, tool, server_name=name, grant_server=legacy_names.get(name, name), disabled=disabled_tools.get(name, set()):
-                        _mcp_tool_allowed(tool)
-                        and tool.name.removeprefix(f"{server_name}_") not in disabled
-                        and ("mcp:*" in granted_tools
-                             or f"mcp:{grant_server}.*" in granted_tools
-                             or f"mcp:{grant_server}.{tool.name.removeprefix(f'{server_name}_')}" in granted_tools
-                             or ("workflow:*" in granted_tools
-                                 and tool.name.removeprefix(f"{server_name}_") in WORKFLOW_OPERATION_NAMES))
-                        and (server_name != "playwright" or self._browser_access_enabled(project_id))
-                )
-                for name in source_config["mcpServers"] if name in toolsets_by_server
-            ]
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+            legacy_names = json.loads(self.aliases_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            legacy_names = {}
+        return [
+            toolsets_by_server[name].filtered(
+                lambda _ctx, tool, server_name=name, grant_server=legacy_names.get(name, name), disabled=disabled_tools.get(name, set()):
+                    _mcp_tool_allowed(tool)
+                    and tool.name.removeprefix(f"{server_name}_") not in disabled
+                    and ("mcp:*" in granted_tools
+                         or f"mcp:{grant_server}.*" in granted_tools
+                         or f"mcp:{grant_server}.{tool.name.removeprefix(f'{server_name}_')}" in granted_tools
+                         or ("workflow:*" in granted_tools
+                             and tool.name.removeprefix(f"{server_name}_") in WORKFLOW_OPERATION_NAMES))
+                    and (server_name != "playwright" or self._browser_access_enabled(project_id))
+            )
+            for name in source_config["mcpServers"] if name in toolsets_by_server
+        ]
 
     def _browser_access_enabled(self, project_id: str) -> bool:
         policy = self.store.project_web_access(project_id)
@@ -575,8 +689,6 @@ class MCPRegistry:
         if server_name not in source["mcpServers"]:
             raise ValueError("mcp_server_not_found")
         config = self._runtime_config(project_id, include_disabled=True, only_server=server_name)
-        from pydantic_ai.mcp import load_mcp_toolsets
-
         definition = source["mcpServers"][server_name]
         if definition.get("oauth") is not None:
             toolset = self._oauth_toolset(project_id, server_name, definition, allow_interactive=True)
@@ -592,31 +704,25 @@ class MCPRegistry:
                 "enabled": tool.name.removeprefix(f"{server_name}_") not in disabled,
             } for tool in tools]
 
-        temporary_path = None
-        try:
-            temporary_path = await asyncio.to_thread(_write_temporary_config, self.root, config)
-            toolsets = load_mcp_toolsets(temporary_path)
-            async with asyncio.timeout(45 if verify_browser_launch else 20):
-                toolset = toolsets[0]
-                async with toolset:
-                    tools = await toolset.wrapped.list_tools()
-                    if verify_browser_launch:
-                        if server_name != "playwright" or not any(
-                            tool.name == "browser_snapshot" for tool in tools
-                        ):
-                            raise RuntimeError("Playwright did not provide its read-only page snapshot tool")
-                        await toolset.wrapped.direct_call_tool("browser_snapshot", {})
-            read_only = set(source["mcpServers"][server_name].get("readOnlyTools", []))
-            disabled = set(source["mcpServers"][server_name].get("disabledTools", []))
-            return [{
-                "name": tool.name,
-                "description": (tool.description or "")[:240],
-                "readOnly": tool.name in read_only,
-                "enabled": tool.name not in disabled,
-            } for tool in tools]
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+        toolsets = _load_mcp_toolsets(config)
+        async with asyncio.timeout(MCP_DISCOVERY_TIMEOUT):
+            toolset = toolsets[0]
+            async with toolset:
+                tools = await toolset.wrapped.list_tools()
+                if verify_browser_launch:
+                    if server_name != "playwright" or not any(
+                        tool.name == "browser_snapshot" for tool in tools
+                    ):
+                        raise RuntimeError("Playwright did not provide its read-only page snapshot tool")
+                    await toolset.wrapped.direct_call_tool("browser_snapshot", {})
+        read_only = set(source["mcpServers"][server_name].get("readOnlyTools", []))
+        disabled = set(source["mcpServers"][server_name].get("disabledTools", []))
+        return [{
+            "name": tool.name,
+            "description": (tool.description or "")[:240],
+            "readOnly": tool.name in read_only,
+            "enabled": tool.name not in disabled,
+        } for tool in tools]
 
     def _oauth_lease(self, project_id: str, server_name: str, endpoint: str):
         from .oauth_lock import OAuthConnectionLease

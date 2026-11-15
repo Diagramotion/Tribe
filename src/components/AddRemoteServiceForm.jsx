@@ -24,6 +24,12 @@ export function credentialReference(serviceKey, existing = []) {
   throw new Error("Could not create a unique credential name.");
 }
 
+export function formatAccessHeader(headerName, value) {
+  const token = value.trim();
+  if (headerName.trim().toLowerCase() !== "authorization" || !token) return value;
+  return /^(?:bearer|basic|digest|token)\s/i.test(token) ? token : `Bearer ${token}`;
+}
+
 function parseCommandLine(value) {
   const characters = Array.from(value.trim());
   const tokens = [];
@@ -108,7 +114,7 @@ export function AddRemoteServiceForm({ serverNames = [], secretNames = [], savin
         authMode,
         oauthScopes: scopes,
         headerName: headerName.trim(),
-        headerValue: authMode === "token" ? headerValue : "",
+        headerValue: authMode === "token" ? formatAccessHeader(headerName, headerValue) : "",
         credentialName,
       });
       if (!saved) return;
@@ -129,7 +135,7 @@ export function AddRemoteServiceForm({ serverNames = [], secretNames = [], savin
       <label>Service address<input autoComplete="url" onChange={(event) => setEndpoint(event.target.value)} placeholder="https://tools.example.com/mcp" required type="url" value={endpoint} /></label>
     </div>
     <label>Sign-in<SelectControl aria-label="Sign-in" onChange={setAuthMode} options={[{ value: "none", label: "No sign-in" }, { value: "token", label: "Access token" }, { value: "oauth", label: "Sign in with browser" }]} size="full" value={authMode} /></label>
-    {authMode === "token" && <div className="mcp-token-fields"><label>Header<input autoComplete="off" maxLength={128} onChange={(event) => setHeaderName(event.target.value)} required value={headerName} /></label><label>Token<input autoComplete="new-password" onChange={(event) => setHeaderValue(event.target.value)} placeholder="Access token" required type="password" value={headerValue} /></label></div>}
+    {authMode === "token" && <div className="mcp-token-fields"><label>Header<input autoComplete="off" maxLength={128} onChange={(event) => setHeaderName(event.target.value)} required value={headerName} /></label><label>{headerName.trim().toLowerCase() === "authorization" ? "Access token" : "Header value"}<input autoComplete="new-password" onChange={(event) => setHeaderValue(event.target.value)} placeholder={headerName.trim().toLowerCase() === "authorization" ? "Access token" : "Header value"} required type="password" value={headerValue} />{headerName.trim().toLowerCase() === "authorization" && <small>Authorization tokens are sent as Bearer credentials.</small>}</label></div>}
     {authMode === "oauth" && <details className="mcp-auth-advanced"><summary>OAuth scopes</summary><input aria-label="OAuth scopes" autoComplete="off" onChange={(event) => setOauthScopes(event.target.value)} placeholder="Optional · profile, projects:read" value={oauthScopes} /></details>}
     <div className="mcp-add-service-footer"><button className="button button--primary" disabled={saving || !name.trim() || !endpoint.trim() || (authMode === "token" && !headerValue)} type="submit">{saving ? "Adding…" : "Add remote server"}</button></div>
     {error && <p className="settings-error" role="alert">{error}</p>}

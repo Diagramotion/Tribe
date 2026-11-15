@@ -141,6 +141,11 @@ test("editing package tokens updates the canonical stylesheet used by previews",
   assert.match(synced[0].content, /--surface-warm: var\(--surface\)/);
 });
 
+test("package token extraction avoids backtracking on an unterminated whitespace value", { timeout: 5000 }, () => {
+  const css = `:root { --accent:${" ".repeat(100_000)} } :root { --accent: #123456; }`;
+  assert.equal(packageTokensFromCss(css, DESIGN_SYSTEM_PRESETS[0].tokens).accent, "#123456");
+});
+
 test("semantic edits update DTCG literal colours and dimensions while preserving aliases", () => {
   const files = [
     { path: "tokens.css", content: ":root { --bg: #101010; --accent: #abcdef; --space-4: 12px; }" },
@@ -223,6 +228,11 @@ test("standalone CSS export preserves packaged tokens and safely attributes the 
   assert.match(exported, /Licence: MIT/);
   assert.match(exported, /Attribution: Studio \* \/ name/);
   assert.ok(exported.endsWith(stylesheet));
+});
+
+test("project extraction ignores indented line comments without consuming adjacent declarations", () => {
+  const source = `\n\u00a0// { primary: "#000000" }\r\n  export default { theme: { colors: { primary: "#2563eb" } } };`;
+  assert.deepEqual(extractStaticThemeDeclarations(source), [{ name: "primary", value: "#2563eb" }]);
 });
 
 test("project extraction reads literal theme values from JS and TS without executing code", () => {

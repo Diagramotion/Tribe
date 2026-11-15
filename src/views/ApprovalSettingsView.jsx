@@ -9,14 +9,19 @@ const approvalModes = [
     description: "Routine project edits and commands can proceed. Tribe still asks before risky or external actions.",
   },
   {
+    id: "auto_review",
+    title: "Auto-review",
+    description: "A model reviews project file changes and simple local commands against your request unless a saved approval applies. Risky or unclear actions return to you.",
+  },
+  {
     id: "review_changes",
     title: "Confirm changes",
-    description: "Ask before agents edit project files or run commands. Existing safeguards still apply.",
+    description: "Ask before agents edit project files or run commands unless you have saved an approval for that scope. Existing safeguards still apply.",
   },
   {
     id: "confirm_every_call",
     title: "Confirm every tool call",
-    description: "Ask before each agent tool call, including reads and team actions. Approvals apply once.",
+    description: "Ask before each agent tool call, including reads and team actions, unless a saved approval applies to that action.",
   },
 ];
 
@@ -72,6 +77,7 @@ export function ApprovalSettingsView({ projectId }) {
         </label>)}
       </div>
       <p className="settings-note">Exact approvals for destructive changes and external actions remain in place in every mode.</p>
+      {mode === "auto_review" && <p className="settings-note">Auto-review uses the agent’s configured model for a separate, brief assessment. Its usage is included in the run. If review is unavailable or inconclusive, Tribe asks you.</p>}
       {error && <p className="settings-error" role="alert">{error}</p>}
       {notice && <p className="settings-note" role="status">{notice}</p>}
       <div className="approval-settings-footer"><span>Applies to new agent runs in this project.</span><button className="button button--primary" disabled={loading || saving} type="submit">{loading ? "Loading…" : saving ? "Saving…" : "Save approval mode"}</button></div>

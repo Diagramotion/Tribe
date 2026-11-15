@@ -138,15 +138,6 @@ def _workspace_agent_ids() -> list[str]:
         return [agent.id for agent in AGENT_DEFINITIONS]
 
 
-def _planner_agent_id() -> str:
-    with AGENT_REGISTRY_LOCK:
-        planner = next((agent.id for agent in AGENT_DEFINITIONS
-                        if agent.id == "planner" or agent.role.strip().lower() == "planner"), None)
-    if planner is None:
-        raise ValueError("project_team_planner_unavailable")
-    return planner
-
-
 class LocalHTTPServer(ThreadingHTTPServer):
     """Bind loopback without a reverse DNS lookup of 127.0.0.1."""
 
@@ -857,6 +848,16 @@ class Handler(BaseHTTPRequestHandler):
             for project in data.get("projects", []):
                 project["designSystem"] = _design_system_summary(project.get("designSystem"))
                 project["agentIds"] = STORE.project_agent_ids(project["id"], available_agent_ids)
+                for project_mission in project.get("missions", []):
+                    project_mission["agentIds"] = STORE.mission_agent_ids(
+                        project_mission["id"], available_agent_ids,
+                    )
+                    project_mission["leadAgentId"] = STORE.mission_lead_agent_id(project_mission["id"])
+            if data.get("mission"):
+                data["mission"]["agentIds"] = STORE.mission_agent_ids(
+                    data["mission"]["id"], available_agent_ids,
+                )
+                data["mission"]["leadAgentId"] = STORE.mission_lead_agent_id(data["mission"]["id"])
             data["agentDirectory"] = str(USER_AGENT_DIRECTORY)
             data["agentRuntime"] = SUPERVISOR.status
             data["generalChats"] = STORE.general_chats()
@@ -1378,7 +1379,6 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/agents":
                 try:
                     project_id = str(body.get("projectId") or "").strip() or None
-                    required_planner_id = _planner_agent_id() if project_id else None
                     with AGENT_REGISTRY_LOCK:
                         agent_id = str(body.get("id", "")).strip()
                         if any(agent.id == agent_id for agent in AGENT_DEFINITIONS):
@@ -1409,7 +1409,7 @@ class Handler(BaseHTTPRequestHandler):
                                     project_id,
                                     [*previous_project_agent_ids, definition.id],
                                     [agent.id for agent in AGENT_DEFINITIONS] + [definition.id],
-                                    required_planner_id or "planner",
+                                    "",
                                 )
                             except Exception:
                                 (USER_AGENT_DIRECTORY / f"{definition.id}.md").unlink(missing_ok=True)
@@ -1421,7 +1421,7 @@ class Handler(BaseHTTPRequestHandler):
                             if project_id and previous_project_agent_ids is not None:
                                 STORE.set_project_agent_ids(
                                     project_id, previous_project_agent_ids,
-                                    [agent.id for agent in AGENT_DEFINITIONS], required_planner_id or "planner",
+                                    [agent.id for agent in AGENT_DEFINITIONS], "",
                                 )
                             raise RuntimeError("agent role could not be registered") from error
                         AGENT_DEFINITIONS.append(definition)
@@ -1469,7 +1469,7 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         project = STORE.register_project(fields[0], fields[1])
                         STORE.set_project_agent_ids(
-                            project["id"], _workspace_agent_ids(), _workspace_agent_ids(), _planner_agent_id(),
+                            project["id"], _workspace_agent_ids(), _workspace_agent_ids(), "",
                         )
                         project["agentIds"] = STORE.project_agent_ids(project["id"], _workspace_agent_ids())
                         return self._json(201, {"project": project, "mission": None})
@@ -1495,9 +1495,13 @@ class Handler(BaseHTTPRequestHandler):
                     *fields, project_goal=project_goal, workflow=workflow, reference_files=reference_files,
                 )
                 STORE.set_project_agent_ids(
-                    project["id"], _workspace_agent_ids(), _workspace_agent_ids(), _planner_agent_id(),
+                    project["id"], _workspace_agent_ids(), _workspace_agent_ids(), "",
                 )
                 project["agentIds"] = STORE.project_agent_ids(project["id"], _workspace_agent_ids())
+                mission["agentIds"] = STORE.set_mission_agent_ids(
+                    mission["id"], project["agentIds"], _workspace_agent_ids(), "", None,
+                )
+                mission["leadAgentId"] = None
                 SUPERVISOR.start_mission(mission["id"], initial_launch=True)
                 return self._json(201, {"project": project, "mission": mission})
             if self.path == "/api/projects/clone":
@@ -1507,7 +1511,7 @@ class Handler(BaseHTTPRequestHandler):
                         str(body.get("name", "")),
                     )
                     STORE.set_project_agent_ids(
-                        project["id"], _workspace_agent_ids(), _workspace_agent_ids(), _planner_agent_id(),
+                        project["id"], _workspace_agent_ids(), _workspace_agent_ids(), "",
                     )
                     project["agentIds"] = STORE.project_agent_ids(project["id"], _workspace_agent_ids())
                     return self._json(201, {"project": project, "mission": None})
@@ -1573,6 +1577,9 @@ class Handler(BaseHTTPRequestHandler):
                 mission = STORE.mission(mission_id)
                 if not mission:
                     return self._json(404, {"error": "mission_not_found"})
+                if mission.get("archived_at"):
+                    return self._json(409, {"error": "mission_archived"})
+                reopen_completed = mission["status"] == "completed"
                 recipient_value = body.get("recipient")
                 if recipient_value is not None and not isinstance(recipient_value, str):
                     return self._json(422, {"error": "message_recipient_invalid"})
@@ -1581,16 +1588,32 @@ class Handler(BaseHTTPRequestHandler):
                 if body.get("deepResearch") is True:
                     recipient = None
                 if recipient:
-                    project_agent_ids = STORE.project_agent_ids(
-                        mission["project_id"], _workspace_agent_ids(),
+                    project_agent_ids = STORE.mission_agent_ids(
+                        mission_id, _workspace_agent_ids(),
                     )
                     if recipient not in project_agent_ids:
-                        return self._json(422, {"error": "message_recipient_not_in_project_team"})
+                        return self._json(422, {"error": "message_recipient_not_in_chat_team"})
+                mentions = body.get("mentions", [])
+                if (not isinstance(mentions, list) or len(mentions) > 20
+                        or any(not isinstance(item, str) for item in mentions)):
+                    return self._json(422, {"error": "message_mentions_invalid"})
+                project_agent_ids = STORE.project_agent_ids(
+                    mission["project_id"], _workspace_agent_ids(),
+                )
+                mentions = list(dict.fromkeys(item.strip() for item in mentions if item.strip()))
+                if any(agent_id not in project_agent_ids for agent_id in mentions):
+                    return self._json(422, {"error": "message_mention_not_in_project_roster"})
+                deep_research = body.get("deepResearch") is True
+                lead_agent_id = STORE.mission_lead_agent_id(mission_id)
+                if deep_research and not lead_agent_id:
+                    lead_agent_id = SUPERVISOR.research_lead_for_mission(mission_id)
                 payload = {
                     "text": text,
                     "recipient": recipient,
+                    "mentions": mentions,
+                    "leadAgentId": lead_agent_id,
                 }
-                if body.get("deepResearch") is True:
+                if deep_research:
                     payload["researchMode"] = "deep_research"
                 attachment_ids = body.get("attachments", [])
                 if (not isinstance(attachment_ids, list) or len(attachment_ids) > 10
@@ -1630,8 +1653,18 @@ class Handler(BaseHTTPRequestHandler):
                         "artifactId": artifact_id, "revision": revision,
                         "title": version["title"], "selectedText": selected_text,
                     }
+                if reopen_completed:
+                    mission = STORE.activate_mission(mission_id)
+                    if not mission:
+                        return self._json(409, {"error": "mission_could_not_be_reopened"})
                 event = STORE.append("message.created", "user", mission_id, payload)
-                return self._json(201, {"event": event})
+                if mission.get("status") == "active":
+                    if reopen_completed and not mission.get("background"):
+                        SUPERVISOR.pause_other_missions(mission_id)
+                    SUPERVISOR.resume_after_user_message(mission_id, event["sequence"], mentions)
+                mission["agentIds"] = STORE.mission_agent_ids(mission_id, _workspace_agent_ids())
+                mission["leadAgentId"] = STORE.mission_lead_agent_id(mission_id)
+                return self._json(201, {"event": event, "mission": mission})
             if self.path == "/api/commands":
                 mission_id = str(body.get("missionId", ""))
                 command_line = str(body.get("command", "")).strip()
@@ -1737,6 +1770,12 @@ class Handler(BaseHTTPRequestHandler):
                                                model_preference=model_preference,
                                                effort_preference=effort_preference,
                                                deep_research=body.get("deepResearch") is True)
+                mission["agentIds"] = STORE.set_mission_agent_ids(
+                    mission["id"],
+                    STORE.project_agent_ids(mission["project_id"], _workspace_agent_ids()),
+                    _workspace_agent_ids(), "", None,
+                )
+                mission["leadAgentId"] = None
                 SUPERVISOR.pause_other_missions(mission["id"])
                 SUPERVISOR.start_mission(mission["id"], initial_launch=True)
                 return self._json(201, {"mission": mission})
@@ -1832,7 +1871,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     result = STORE.record_interactive_artifact_action(
                         interactive_action_match.group(1), interactive_action_match.group(2),
-                        body.get("recipient", "planner"), body.get("action", "submit"), body.get("data"),
+                        body.get("recipient"), body.get("action", "submit"), body.get("data"),
                     )
                     return self._json(201, result)
                 except PermissionError as error:
@@ -2227,7 +2266,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._body()
                 project_id = team_match.group(1)
                 selected = STORE.set_project_agent_ids(
-                    project_id, body.get("agentIds"), _workspace_agent_ids(), _planner_agent_id(),
+                    project_id, body.get("agentIds"), _workspace_agent_ids(), "",
                 )
                 SUPERVISOR.update_project_team(project_id)
                 return self._json(200, {"projectId": project_id, "agentIds": selected})
@@ -2235,6 +2274,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(413, {"error": "request_too_large"})
             except ValueError as error:
                 status = 404 if str(error) == "project_not_found" else 422
+                return self._json(status, {"error": str(error) or "invalid_request"})
+
+        mission_team_match = re.fullmatch(r"/api/missions/([0-9a-f-]{36})/team", self.path)
+        if mission_team_match:
+            try:
+                mission_id = mission_team_match.group(1)
+                team_body = self._body()
+                selected = STORE.set_mission_agent_ids(
+                    mission_id, team_body.get("agentIds"), _workspace_agent_ids(), "",
+                    team_body.get("leadAgentId"),
+                )
+                SUPERVISOR.update_mission_team(mission_id)
+                return self._json(200, {
+                    "missionId": mission_id, "agentIds": selected,
+                    "leadAgentId": STORE.mission_lead_agent_id(mission_id),
+                })
+            except OverflowError:
+                return self._json(413, {"error": "request_too_large"})
+            except ValueError as error:
+                status = 404 if str(error) == "mission_not_found" else 422
                 return self._json(status, {"error": str(error) or "invalid_request"})
 
         project_match = re.fullmatch(r"/api/projects/([0-9a-f-]{36})/goal", self.path)

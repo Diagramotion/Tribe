@@ -14,6 +14,8 @@ npm run dev
 
 For the Electron desktop shell and managed Browser, use `npm run desktop:dev`. The legacy Tauri shell is available separately through `npm run desktop:tauri:dev`.
 
+The Electron development shell keeps its data in `~/.tribe-dev` between runs, separate from the installed app. Set `TRIBE_DATA_DIR=/path/to/data` before `npm run desktop:dev` to use another workspace. The browser profile is stored in an `electron-user-data` subfolder. Provider keys use the operating system credential store.
+
 ## Checks
 
 Run the checks relevant to your change before opening a pull request:

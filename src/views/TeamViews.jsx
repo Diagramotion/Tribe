@@ -234,7 +234,7 @@ export function AgentRolesView({ agents, capabilityCatalog = [], agentConfigured
   return (
     <section className="tab-panel detail-view">
       <div className="detail-heading">
-        <div><span className="eyebrow">{projectScoped ? "Project team" : "Workspace roles"}</span><h2>{projectScoped ? "Project team" : "Agent roles"}</h2><p>{projectScoped ? "Choose which reusable roles can work in this project. The Planner leads Deep Research; add focused researchers to the selected team below." : "Create reusable roles with a clear responsibility and the right level of repository access."}</p></div>
+        <div><span className="eyebrow">{projectScoped ? "Project team" : "Workspace roles"}</span><h2>{projectScoped ? "Project team" : "Agent roles"}</h2><p>{projectScoped ? "Choose which reusable roles are available to chats in this project. Each chat can choose its own participants." : "Create reusable roles with a clear responsibility and the right level of repository access."}</p></div>
         <div className="agent-role-heading-actions"><span className="artifact-count">{projectScoped ? `${projectAgentIds.length} of ${agents.length} in team` : `${agents.length} roles`}</span>{!formOpen && !agentConfigured && <button className="button button--quiet" onClick={onConnectModel} type="button"><Plug size={15} /> Connect model</button>}{!formOpen && <IconButton className="agent-role-add" label="Add role" onClick={() => { setCapabilities([]); setFormOpen(true); }}><Plus size={17} /></IconButton>}</div>
       </div>
       {formOpen && <form className="knowledge-form agent-role-form" id="agent-role-form" onSubmit={submit}>
@@ -297,10 +297,9 @@ export function AgentRolesView({ agents, capabilityCatalog = [], agentConfigured
               <details><summary>Capabilities ({agent.capabilities?.length ?? 0})</summary><p>{(agent.capabilities ?? []).map((capabilityId) => capabilityCatalog.find((item) => item.id === capabilityId)?.name ?? capabilityId).join(", ") || "No capabilities are enabled for this role."}</p></details>
             </div>
             {projectScoped && (() => {
-              const required = agent.id === "planner" || agent.role.trim().toLowerCase() === "planner";
               const included = projectAgentIds.includes(agent.id);
-              return <label className="computer-access-toggle agent-role-team-toggle" title={required ? "The Planner is required for every project" : undefined}>
-                <input aria-label={required ? `${agent.name} is required for this project team` : `${included ? "Remove" : "Add"} ${agent.name} ${included ? "from" : "to"} this project team`} checked={included} disabled={required || updatingAgentId === agent.id} onChange={async () => {
+              return <label className="computer-access-toggle agent-role-team-toggle">
+                <input aria-label={`${included ? "Remove" : "Add"} ${agent.name} ${included ? "from" : "to"} this project team`} checked={included} disabled={updatingAgentId === agent.id || (included && projectAgentIds.length <= 1)} onChange={async () => {
                   if (updatingAgentId) return;
                   setUpdatingAgentId(agent.id);
                   const next = included ? projectAgentIds.filter((id) => id !== agent.id) : [...projectAgentIds, agent.id];
@@ -308,7 +307,7 @@ export function AgentRolesView({ agents, capabilityCatalog = [], agentConfigured
                   finally { setUpdatingAgentId(null); }
                 }} role="switch" type="checkbox" />
                 <span aria-hidden="true" className="computer-access-switch" />
-                <span className="agent-role-team-label">{required ? "Required" : "In team"}</span>
+                <span className="agent-role-team-label">{included ? "In team" : "Available"}</span>
               </label>;
             })()}
             <span className={`agent-role-status agent-role-status--${agentStatusTone(agent.status)}`}><i aria-hidden="true" />{agentStatusLabel(agent.status)}</span>

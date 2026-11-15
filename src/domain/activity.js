@@ -47,6 +47,8 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
       ? agentDefinitions.find((agent) => agent.id === recipientId || agent.role === recipientId)?.name ?? recipientId
       : null;
     return { id: event.id, kind: "message", actor, actorId: event.actorId, actorType, isScheduled, recipient, recipientId,
+      mentionedAgentIds: event.payload.mentions ?? [],
+      leadAgentId: event.payload.leadAgentId ?? null,
       channelAudience: event.payload.channelAudience,
       researchMode: event.payload.researchMode ?? null,
       workItemId: event.payload.workItemId, triggerSequence: event.payload.triggerSequence,
@@ -76,6 +78,14 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
       const scope = { chat: "this chat", project: "this project", workspace: "the workspace" }[item.access_grant.scope];
       return { id: event.id, kind: "change", actor, time: formatTime(event.createdAt),
         text: `You allowed read-only public web access for ${scope} · ${item.title}` };
+    }
+    const actionCapability = item.access_grant?.capability ?? "";
+    if (/^tool_action(?:_hmac)?:/.test(actionCapability)) {
+      const scope = { chat: "this chat", project: "this project" }[item.access_grant.scope];
+      const toolName = actionCapability.split(":", 2)[1];
+      const action = toolName === "repository_file_changes" ? "in-project file changes" : "this exact action";
+      return { id: event.id, kind: "change", actor, time: formatTime(event.createdAt),
+        text: `You allowed ${action} for ${scope} · ${item.title}` };
     }
     const resolution = { "Approved once": "approved this action once", Denied: "declined this action" }[item.resolution] ?? item.resolution.toLowerCase();
     return { id: event.id, kind: "change", actor, time: formatTime(event.createdAt), text: `You ${resolution} · ${item.title}` };
@@ -159,7 +169,7 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
     return { id: event.id, kind: "change", actor, actorId: event.actorId,
       text: `Verification ${outcome} · ${command}` };
   }
-  if (["agent.tool.started", "agent.tool.waiting_for_user", "agent.tool.completed", "agent.tool.interrupted"].includes(event.type)) {
+  if (["agent.tool.started", "agent.tool.waiting_for_user", "agent.tool.completed", "agent.tool.interrupted", "agent.tool.auto_reviewed"].includes(event.type)) {
     const tool = event.payload.toolName;
     const actionLabels = {
       write_file: { working: "writing a file", finished: "wrote a file" },
@@ -188,15 +198,21 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
       ?? Object.entries(actionLabels).find(([name]) => normalizedTool.endsWith(name))?.[1];
     const labels = knownLabels ?? event.payload.activityLabels
       ?? { working: `Using ${genericTool}`, finished: `Finished ${genericTool}` };
-    const toolState = event.type === "agent.tool.started" ? "working"
+    const automaticReview = event.type === "agent.tool.auto_reviewed";
+    const toolState = automaticReview ? (event.payload.decision === "approved" ? "approved"
+      : event.payload.decision === "needs_user" ? "needs_user" : "denied")
+      : event.type === "agent.tool.started" ? "working"
       : event.type === "agent.tool.waiting_for_user" ? "waiting"
         : event.type === "agent.tool.interrupted" ? "unknown"
           : event.payload.outcome === "denied" ? "denied" : "finished";
-    const activityTitle = toolState === "unknown" ? `Interrupted · ${labels.working}`
+    const activityTitle = automaticReview ? `${toolState === "needs_user" ? "Auto-review referred" : `Auto-review ${toolState}`} · ${labels.working}`
+      : toolState === "unknown" ? `Interrupted · ${labels.working}`
       : toolState === "waiting" ? `Waiting for approval · ${labels.working}`
         : toolState === "denied" ? `Declined · ${labels.working}` : labels[toolState];
     const detail = event.payload.summary ? ` · ${event.payload.summary}` : "";
-    const text = toolState === "unknown"
+    const text = automaticReview
+      ? `${toolState === "needs_user" ? "Auto-review referred this action for your decision" : `Auto-review ${toolState} ${labels.working}`}${detail} · ${event.payload.reason ?? "No additional detail"}`
+      : toolState === "unknown"
       ? `${actor} was interrupted while ${labels.working}${detail} · outcome unknown`
       : toolState === "waiting"
         ? `${actor} is waiting for your approval · ${labels.working}${detail}`
@@ -205,9 +221,11 @@ export function timelineMessage(event, agentDefinitions = initialAgents) {
           : `${actor} ${labels[toolState]}${detail}`;
     return { id: event.id, kind: "change", actor, workItemId: event.payload.workItemId,
       actorId: event.actorId, groupable: Boolean(event.payload.workItemId),
-      toolCallId: event.payload.toolCallId, toolState,
+      toolCallId: automaticReview ? null : event.payload.toolCallId,
+      toolState: automaticReview ? null : toolState,
       activityTitle: activityTitle.replace(/^./, (first) => first.toLocaleUpperCase()),
       activityDetail: userFacingAgentText(event.payload.summary),
+      detail: automaticReview ? event.payload.reason : undefined,
       time: formatTime(event.createdAt), text };
   }
   if (event.type === "agent.activity") {
@@ -670,6 +688,7 @@ export function mapInteraction(item) {
     detail: item.details, agent: item.requested_by,
     missionId: item.mission_id, missionTitle: item.mission_title,
     missionGoal: item.mission_goal, missionStatus: item.mission_status, toolName,
+    persistentAccessAvailable: publicWebRead || Boolean(item.persistent_access_available),
     projectId: item.project_id, projectName: item.project_name };
 }
 
