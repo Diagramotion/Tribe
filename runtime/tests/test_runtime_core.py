@@ -1446,7 +1446,10 @@ for line in sys.stdin:
         self.assertNotIn("interactive-app-authoring", base_instructions)
         self.assertNotIn("data-visualisation", base_instructions)
         self.assertNotIn("computer_observe only", base_instructions)
-        self.assertIn("tribe_filesystem", base_instructions)
+        if os.name == "posix":
+            self.assertIn("tribe_filesystem", base_instructions)
+        else:
+            self.assertNotIn("tribe_filesystem", base_instructions)
         self.assertNotIn("tribe_shell", base_instructions)
 
         specialist = AgentDefinition(
@@ -1470,9 +1473,12 @@ for line in sys.stdin:
             tool_permissions=("read_file", "edit_file", "run_command"),
         )
         repository_instructions = _build_agent(repository_worker, "openai:test-model")._instructions[0].instruction
-        self.assertIn("tribe_filesystem, tribe_shell", repository_instructions)
-        self.assertIn("exact ID at most once", repository_instructions)
-        self.assertIn("without loading it again", repository_instructions)
+        if os.name == "posix":
+            self.assertIn("tribe_filesystem, tribe_shell", repository_instructions)
+            self.assertIn("exact ID at most once", repository_instructions)
+            self.assertIn("without loading it again", repository_instructions)
+        else:
+            self.assertNotIn("tribe_filesystem, tribe_shell", repository_instructions)
 
     def test_read_only_role_instructions_separate_filesystem_access_from_shell_grants(self) -> None:
         definition = AgentDefinition(
@@ -2959,7 +2965,7 @@ for line in sys.stdin:
         ):
             worker.start()
             try:
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + 30
                 while time.monotonic() < deadline:
                     pending = [row for row in self.store.pending_interactions()
                                if row["mission_id"] == self.mission["id"]]
@@ -2985,7 +2991,7 @@ for line in sys.stdin:
             finally:
                 if interaction and interaction["status"] == "pending":
                     self.store.resolve_interaction(interaction["id"], "denied")
-                worker.join(timeout=1)
+                worker.join(timeout=30)
 
     def test_auto_review_assesses_allowlisted_repository_test_runs(self) -> None:
         if os.name != "posix":

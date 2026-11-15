@@ -3,6 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from tribe_runtime.harness_capabilities import (
+    _sed_script_has_external_effects,
     command_is_auto_review_candidate,
     command_is_reviewable,
     command_needs_approval,
@@ -11,6 +12,10 @@ from tribe_runtime.harness_capabilities import (
 
 
 class AutoReviewCommandPolicyTests(unittest.TestCase):
+    def test_sed_external_effects_detected_when_windows_shell_keeps_script_quotes(self):
+        self.assertTrue(_sed_script_has_external_effects("'r /etc/passwd'"))
+        self.assertTrue(_sed_script_has_external_effects('"s/a/b/e"'))
+
     def test_auto_review_accepts_read_only_inspection_with_stderr_suppression(self):
         command = (
             "ls -d runtime/.venv/lib/python*/site-packages/pydantic_ai_harness* 2>/dev/null "

@@ -356,6 +356,9 @@ def _read_only_command_paths(executable: str, arguments: list[str]) -> list[str]
 
 def _sed_script_has_external_effects(script: str) -> bool:
     """Reject sed file I/O and execution commands from automatic command review."""
+    script = script.strip()
+    if len(script) >= 2 and script[0] in {"'", '"'} and script[-1] == script[0]:
+        script = script[1:-1]
     if re.search(r"(?:^|[;{}])\s*(?:\d+(?:,\d+)?\s*)?[rRwWeE](?=\s|$)", script):
         return True
     index = 0
