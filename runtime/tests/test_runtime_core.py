@@ -58,6 +58,9 @@ from tribe_runtime.agent_runtime import (
     _provider_retry_delay,
     _provider_result_usage_values,
     _requires_initial_repository_tool_call,
+    _repository_evidence_requirement,
+    _command_is_git_status,
+    _repository_tool_result_succeeded,
     _run_model_settings,
     _validate_repository_tool_call,
     _reject_text_encoded_tool_call,
@@ -254,15 +257,15 @@ class RuntimeCase(unittest.TestCase):
         self.assertTrue(_requires_initial_repository_tool_call("Can you check it?"))
         self.assertFalse(_requires_initial_repository_tool_call("What is a Python closure?"))
 
-    def test_repository_tool_requirement_clears_after_first_call(self) -> None:
-        context = SimpleNamespace(deps=SimpleNamespace(repository_tool_call_count=0))
+    def test_repository_tool_requirement_clears_after_successful_evidence(self) -> None:
+        context = SimpleNamespace(deps=SimpleNamespace(repository_evidence_count=0))
         settings = _run_model_settings(
             {"max_tokens": 512, "thinking": "low"}, require_initial_tool_call=True,
         )
         self.assertEqual(settings(context), {
             "max_tokens": 512, "thinking": "low", "tool_choice": "required",
         })
-        context.deps.repository_tool_call_count = 1
+        context.deps.repository_evidence_count = 1
         self.assertEqual(settings(context), {
             "max_tokens": 512, "thinking": "low", "tool_choice": "auto",
         })
@@ -275,15 +278,39 @@ class RuntimeCase(unittest.TestCase):
         from pydantic_ai.exceptions import ModelRetry
 
         context = SimpleNamespace(deps=SimpleNamespace(
-            require_repository_tool_call=True, repository_tool_call_count=0,
+            require_repository_tool_call=True, repository_evidence_count=0,
+            repository_evidence_requirement="git_status",
         ))
         with self.assertRaises(ModelRetry):
             _validate_repository_tool_call(context, "The repository is clean.")
-        context.deps.repository_tool_call_count = 1
+        context.deps.repository_evidence_count = 1
         self.assertEqual(
             _validate_repository_tool_call(context, "The repository is clean."),
             "The repository is clean.",
         )
+
+    def test_git_status_requests_require_a_matching_successful_command(self) -> None:
+        self.assertEqual(_repository_evidence_requirement("what is the git status"), "git_status")
+        self.assertEqual(_repository_evidence_requirement("check the working-tree status"), "git_status")
+        self.assertIsNone(_repository_evidence_requirement("explain this project"))
+        self.assertTrue(_command_is_git_status("git status --short"))
+        self.assertTrue(_command_is_git_status("rtk proxy git status --short"))
+        self.assertTrue(_command_is_git_status("cd repo && git status"))
+        self.assertFalse(_command_is_git_status("git rev-parse --is-inside-work-tree"))
+        self.assertFalse(_command_is_git_status("echo 'git status'"))
+        self.assertTrue(_repository_tool_result_succeeded(
+            "run_command", "success", "On branch main\n M file.py",
+        ))
+        self.assertTrue(_repository_tool_result_succeeded("run_command", "success", ""))
+        self.assertFalse(_repository_tool_result_succeeded(
+            "run_command", "success", "[stdout]\n[stderr]\n[exit code: 1]",
+        ))
+        self.assertFalse(_repository_tool_result_succeeded(
+            "run_command", "success", "fatal: not a git repository",
+        ))
+        self.assertFalse(_repository_tool_result_succeeded(
+            "run_command", "failure", "[stdout]\n[stderr]\n[exit code: 0]",
+        ))
 
     def test_compaction_retained_context_scales_with_harness_model_windows(self) -> None:
         self.assertEqual(_compaction_keep_tokens(16_000), 3_200)
@@ -477,6 +504,17 @@ class RuntimeCase(unittest.TestCase):
         self.assertTrue(tools.root.samefile(workspace_root))
         if os.name == "posix":
             self.assertTrue({"LocalWorkspace", "FileSystem", "Shell"}.issubset(capability_names))
+            task_capabilities = build_capabilities(
+                tools, SkillCatalog(workspace_root),
+                tool_permissions=("read_file", "run_command", "check_command"),
+                eager_shell_tools=("run_command",),
+            )
+            shell_capabilities = [item for item in task_capabilities if type(item).__name__ == "Shell"]
+            eager_shell = next(item for item in shell_capabilities if "run_command" in item.tools)
+            deferred_shell = next(item for item in shell_capabilities if "check_command" in item.tools)
+            self.assertFalse(eager_shell.defer_loading)
+            self.assertEqual(eager_shell.tools, ["run_command"])
+            self.assertTrue(deferred_shell.defer_loading)
         else:
             self.assertTrue({"LocalWorkspace", "FileSystem", "Shell"}.isdisjoint(capability_names))
 

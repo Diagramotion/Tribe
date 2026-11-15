@@ -7,6 +7,7 @@ import json
 import os
 import random
 import re
+import shlex
 import threading
 import time
 import uuid
@@ -908,14 +909,15 @@ class AgentDependencies:
     context_pruning_metrics: dict[str, int] = field(default_factory=dict)
     reply_root_sequence: int | None = None
     tool_call_count: int = 0
-    repository_tool_call_count: int = 0
+    repository_evidence_count: int = 0
     require_repository_tool_call: bool = False
+    repository_evidence_requirement: str | None = None
 
 
 _REPOSITORY_EVIDENCE_TOOL_NAMES = frozenset({
     "read_repository_file", "search_repository", "run_repository_tests",
     "read_file", "list_directory", "search_files", "find_files", "file_info",
-    "run_command", "start_command", "check_command", "wait_background_command",
+    "run_command", "wait_background_command",
 })
 
 
@@ -931,6 +933,47 @@ def _requires_initial_repository_tool_call(request: str) -> bool:
     return any(reference in text for reference in repository_references)
 
 
+def _repository_evidence_requirement(request: str) -> str | None:
+    """Identify repository questions that require a particular command result."""
+    text = request.casefold()
+    if re.search(r"\bgit\s+status\b|\bworking[- ]tree\s+status\b", text):
+        return "git_status"
+    return None
+
+
+def _command_is_git_status(command: Any) -> bool:
+    if not isinstance(command, str):
+        return False
+    try:
+        tokens = shlex.shlex(command, punctuation_chars=";&|")
+        tokens.whitespace_split = True
+        tokens.commenters = ""
+        parts = list(tokens)
+    except ValueError:
+        return False
+    for index, (part, next_part) in enumerate(zip(parts, parts[1:])):
+        if part != "git" or next_part != "status":
+            continue
+        prefix = parts[:index]
+        if not prefix or prefix[-1] in {"&&", ";", "|", "||"}:
+            return True
+        if prefix == ["rtk"] or prefix == ["rtk", "proxy"]:
+            return True
+    return False
+
+
+def _repository_tool_result_succeeded(tool_name: str, outcome: Any, content: Any) -> bool:
+    if str(outcome) != "success" or content is None:
+        return False
+    if tool_name in {"run_command", "wait_background_command"} and isinstance(content, str):
+        exit_code = re.search(r"(?m)^\[exit code:\s*(-?\d+)\]\s*$", content)
+        if exit_code and int(exit_code.group(1)) != 0:
+            return False
+        if re.search(r"(?m)^\s*(?:\[Error:|fatal:)\s*", content, re.IGNORECASE):
+            return False
+    return True
+
+
 def _run_model_settings(
     base_settings: dict[str, Any], *, require_initial_tool_call: bool,
 ) -> Any:
@@ -940,7 +983,7 @@ def _run_model_settings(
 
     def settings_for_step(ctx: Any) -> dict[str, Any]:
         settings = dict(base_settings)
-        settings["tool_choice"] = "required" if ctx.deps.repository_tool_call_count == 0 else "auto"
+        settings["tool_choice"] = "required" if ctx.deps.repository_evidence_count == 0 else "auto"
         return settings
 
     return settings_for_step
@@ -949,12 +992,19 @@ def _run_model_settings(
 def _validate_repository_tool_call(ctx: Any, output: str) -> str:
     """Reject repository claims until an actual repository or read-only service tool ran."""
     deps = ctx.deps
-    if deps.require_repository_tool_call and deps.repository_tool_call_count == 0:
+    if deps.require_repository_tool_call and deps.repository_evidence_count == 0:
         from pydantic_ai.exceptions import ModelRetry
 
+        instruction = (
+            "Use the `run_command` tool with `command` set to `git status --short` on the project repository, "
+            "then report the command output."
+            if deps.repository_evidence_requirement == "git_status"
+            else "Use a successful repository or read-only connected-service tool before answering. "
+                 "For Shell access, load the granted Shell capability and call `run_command`."
+        )
         raise ModelRetry(
-            "This request asks about the live project or repository. Use an available repository, shell, "
-            "or read-only connected-service tool before answering. Do not claim an inspection unless a tool ran."
+            "This request asks about the live project or repository. " + instruction
+            + " Do not claim an inspection unless the tool returns successfully."
         )
     return output
 
@@ -1429,11 +1479,6 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
     async def record_tool_start(ctx: RunContext[AgentDependencies], event) -> None:
         ctx.deps.tool_call_count += 1
         tool_name = event.part.tool_name
-        if event.args_valid and (
-            tool_name in _REPOSITORY_EVIDENCE_TOOL_NAMES
-            or tool_name in ctx.deps.mcp_read_only_tool_names
-        ):
-            ctx.deps.repository_tool_call_count += 1
         if ctx.deps.tool_call_summaries is None:
             ctx.deps.tool_call_summaries = {}
         activity_labels = browser_activity_labels(event.part.tool_name)
@@ -1442,6 +1487,9 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
         call_summary = {
             "toolName": event.part.tool_name, "summary": summary,
             "activityLabels": activity_labels, "mcpReadOnly": mcp_read_only,
+            "repositoryEvidence": event.args_valid and (
+                tool_name in _REPOSITORY_EVIDENCE_TOOL_NAMES or mcp_read_only
+            ),
         }
         if event.part.tool_name in {"run_command", "start_command"}:
             arguments = event.part.args
@@ -1451,6 +1499,8 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
                 except (TypeError, ValueError):
                     arguments = None
             command = arguments.get("command") if isinstance(arguments, dict) else None
+            if isinstance(command, str):
+                call_summary["command"] = command
             try:
                 execution_cwd = await ctx.workspace.working_dir()
             except (AttributeError, OSError, RuntimeError):
@@ -1495,6 +1545,13 @@ def _build_agent(definition: AgentDefinition, model: str, api_key: str | None = 
         call = (ctx.deps.tool_call_summaries or {}).pop(event.part.tool_call_id, {})
         tool_name = call.get("toolName", event.part.tool_name)
         raw_content = event.part.content
+        if (call.get("repositoryEvidence")
+                and _repository_tool_result_succeeded(tool_name, event.part.outcome, raw_content)):
+            requirement = ctx.deps.repository_evidence_requirement
+            if requirement != "git_status" or (
+                tool_name == "run_command" and _command_is_git_status(call.get("command"))
+            ):
+                ctx.deps.repository_evidence_count += 1
         approval_review = call.get("approvalReview")
         if isinstance(raw_content, str) and isinstance(approval_review, dict):
             if (approval_review.get("source") == "automatic"
@@ -3351,6 +3408,10 @@ class PydanticAIProvider:
             and event.get("actorId") == "user"
             and _requires_initial_repository_tool_call(current_user_request)
         )
+        repository_evidence_requirement = (
+            _repository_evidence_requirement(current_user_request)
+            if require_repository_tool_call else None
+        )
         verification_context = store.agent_verification_context(mission_id)
         initial_events, _ = store.events_after_page(mission_id, 0, limit=1)
         mission_created = next(
@@ -3502,6 +3563,7 @@ class PydanticAIProvider:
             project_team=event.get("projectTeam") or [],
             deep_research=deep_research,
             require_repository_tool_call=require_repository_tool_call,
+            repository_evidence_requirement=repository_evidence_requirement,
         )
         trigger_sequence = event["sequence"]
         resume_saved_frontier = bool(event.get("resumeCheckpoint"))
@@ -3780,6 +3842,12 @@ class PydanticAIProvider:
                     model_context_window=model_context_window,
                     model_max_output_tokens=model_output_limit,
                     tool_permissions=self.definition.tool_permissions,
+                    eager_shell_tools=(
+                        ("run_command",)
+                        if repository_evidence_requirement == "git_status"
+                        and self.definition.tool_permissions is not None
+                        and "run_command" in self.definition.tool_permissions else ()
+                    ),
                     approval_mode=approval_mode,
                     approval_reviewer=approval_reviewer,
                     image_generator=_image_generator_for_workspace(store),

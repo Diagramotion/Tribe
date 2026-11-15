@@ -708,6 +708,7 @@ def build_capabilities(
     model_context_window: int | None = None,
     model_max_output_tokens: int | None = None,
     tool_permissions: tuple[str, ...] | None = None,
+    eager_shell_tools: tuple[str, ...] = (),
     approval_mode: str | None = None,
     approval_reviewer=None,
     image_generator=None,
@@ -1193,10 +1194,18 @@ def build_capabilities(
             # Shell access is granted by the reusable role profile. Do not maintain an
             # executable-name allowlist here; Tribe's hook applies approval policy to each
             # command, and Harness runs it in the selected project workspace.
-            capabilities.append(Shell(
-                denied_commands=[],
-                id="tribe_shell", tools=shell_tools, defer_loading=True,
-            ))
+            eager_tools = sorted(set(shell_tools) & set(eager_shell_tools))
+            deferred_tools = sorted(set(shell_tools) - set(eager_tools))
+            if eager_tools:
+                capabilities.append(Shell(
+                    denied_commands=[], id="tribe_shell_eager", tools=eager_tools,
+                    defer_loading=False,
+                ))
+            if deferred_tools:
+                capabilities.append(Shell(
+                    denied_commands=[], id="tribe_shell", tools=deferred_tools,
+                    defer_loading=True,
+                ))
     capabilities.extend([
         StepPersistence(
             # Harness owns its run/checkpoint schema; keep it in a sibling database so
